@@ -255,9 +255,21 @@ active, it picks randomly from the matches. From there the viewer's arrow keys
 pull further random items (with back-history), so it doubles as a lean-back
 shuffle. Endpoint: `GET /api/random?q=<optional search>`.
 
-**More like this** appears in every item's viewer panel: items that share the
-most tags with the current one, most-overlapping first (manual + AI tags both
-count). Click one to open that whole set as an arrow-navigable queue — so
-following related items chains naturally. Recommendations are only as good as
-your tags, so they fill in as you tag things. Endpoint:
-`GET /api/recommend?path=<relpath>&limit=<n>`.
+**More like this** appears in every item's viewer panel. Ranking blends two
+signals: **tag overlap** (manual + AI tags both count) and **popularity** — how
+often items get opened. Each shared tag is worth 1 point; an item's view count
+adds up to ~3 more (capped), so a frequently-opened item can edge ahead of one
+with a couple more tags, without letting popularity override a much stronger tag
+match. Click a result to open that whole set as an arrow-navigable queue, so
+following related items chains naturally.
+
+Views are recorded when an item stays open in the viewer for ~1s (flipping past
+with the arrows doesn't count), and the count shows in the metadata panel. If an
+item has no tags (or nothing overlaps), the strip falls back to your
+most-viewed items, so it's useful even before you've tagged much. Endpoints:
+`GET /api/recommend?path=<relpath>&limit=<n>` and `POST /api/view?path=<relpath>`.
+
+View counts live in the cache DB (added by a non-destructive migration, so your
+existing thumbnails/index are preserved on upgrade). They persist across
+restarts but, unlike tags, are not written to sidecars — so a deliberate full DB
+wipe resets them. Tell me if you'd rather they be durable and I'll sidecar them.

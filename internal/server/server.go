@@ -48,6 +48,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/random", s.handleRandom)
 	mux.HandleFunc("GET /api/recommend", s.handleRecommend)
+	mux.HandleFunc("POST /api/view", s.handleView)
 	mux.HandleFunc("GET /api/item", s.handleItemDetail)
 	mux.HandleFunc("PUT /api/tags", s.handleSetTags)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
@@ -78,6 +79,7 @@ type itemDTO struct {
 	Height     int     `json:"height"`
 	Duration   float64 `json:"duration,omitempty"`
 	ThumbReady bool    `json:"thumb_ready"`
+	Views      int     `json:"views"`
 	ThumbURL   string  `json:"thumb_url"`
 	RawURL     string  `json:"raw_url"`
 }
@@ -109,6 +111,7 @@ func toDTO(it model.Item) itemDTO {
 		Height:     it.Height,
 		Duration:   it.Duration,
 		ThumbReady: it.ThumbReady,
+		Views:      it.Views,
 		ThumbURL:   "/api/thumb/" + enc,
 		RawURL:     "/api/raw/" + enc,
 	}
@@ -187,7 +190,30 @@ func (s *Server) handleRecommend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if len(items) == 0 {
+		// No tag-based matches (untagged seed, or no overlap): fall back to the
+		// most-opened items so the strip is still useful before things are tagged.
+		if items, err = s.store.MostViewed(r.Context(), rel, limit); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 	writeItems(w, items)
+}
+
+// handleView records that an item was opened in the viewer (a popularity signal
+// for recommendations). Fire-and-forget from the client.
+func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	if rel == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.IncrementViews(r.Context(), rel); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleItemDetail returns one item plus its tags, for the viewer's catalog card.

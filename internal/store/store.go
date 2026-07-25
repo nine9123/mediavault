@@ -28,7 +28,7 @@ const schemaVersion = "1"
 
 // itemCols is the canonical column order for every items SELECT, so a single
 // scanItem helper can decode any of them.
-const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,indexed_at,seen_at,missing_since"
+const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,views,indexed_at,seen_at,missing_since"
 
 type Store struct{ db *sql.DB }
 
@@ -78,7 +78,7 @@ func (s *Store) ensureSchema() error {
 	err := s.db.QueryRow(`SELECT value FROM meta WHERE key='schema_version'`).Scan(&got)
 	switch {
 	case err == nil && got == schemaVersion:
-		return nil // cache is current
+		return s.ensureColumns() // current, but still apply additive column migrations
 	case err == nil && got != schemaVersion:
 		if derr := s.dropAll(); derr != nil { // stale cache -> rebuild
 			return derr
@@ -89,10 +89,52 @@ func (s *Store) ensureSchema() error {
 	if _, err := s.db.Exec(schemaSQL); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
 	}
-	_, err = s.db.Exec(
+	if _, err = s.db.Exec(
 		`INSERT INTO meta(key,value) VALUES('schema_version',?)
-		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, schemaVersion)
-	return err
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, schemaVersion); err != nil {
+		return err
+	}
+	return s.ensureColumns()
+}
+
+// ensureColumns applies additive, non-destructive column migrations so an
+// existing (version-matched) cache can gain new optional columns without a full
+// drop-and-rescan. Each step must be idempotent.
+func (s *Store) ensureColumns() error {
+	has, err := s.hasColumn("items", "views")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN views INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add items.views: %w", err)
+		}
+	}
+	return nil
+}
+
+// hasColumn reports whether table has a column named col. table is an internal
+// constant, never user input.
+func (s *Store) hasColumn(table, col string) (bool, error) {
+	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, ctype      string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == col {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) dropAll() error {
@@ -344,11 +386,12 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 			width, height            sql.NullInt64
 			dur                      sql.NullFloat64
 			thumb                    int64
+			views                    int64
 			missing                  sql.NullInt64
 		)
 		if err := rows.Scan(
 			&it.ID, &it.Relpath, &it.Size, &mtime, &hash, &it.Type, &mime,
-			&width, &height, &dur, &thumb, &indexedAt, &seenAt, &missing,
+			&width, &height, &dur, &thumb, &views, &indexedAt, &seenAt, &missing,
 		); err != nil {
 			return nil, err
 		}
@@ -361,6 +404,7 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 		it.Height = int(height.Int64)
 		it.Duration = dur.Float64
 		it.ThumbReady = thumb != 0
+		it.Views = int(views)
 		if missing.Valid {
 			t := time.Unix(missing.Int64, 0)
 			it.MissingSince = &t
@@ -646,11 +690,14 @@ func (s *Store) RandomItem(ctx context.Context, q string) (item model.Item, foun
 	return items[0], true, nil
 }
 
-// RecommendByTags returns items that share the most tags with the seed item
-// (identified by relpath), most-overlapping first. Both manual and AI tags
-// count; a shared tag counts once regardless of source. Returns nothing when
-// the seed has no tags. The overlap count drives ORDER BY but isn't selected,
-// so the row shape stays exactly itemCols.
+// RecommendByTags returns items related to the seed (identified by relpath),
+// best first. The rank blends tag overlap with popularity: each shared tag is
+// worth 1, and an item's view count adds up to ~3 more (capped), so a
+// frequently-opened item can edge ahead of one with a couple more tags without
+// letting popularity override a much stronger tag match. Both manual and AI
+// tags count; a shared tag counts once regardless of source. Returns nothing
+// when the seed has no tags. The score drives ORDER BY but isn't selected, so
+// the row shape stays exactly itemCols.
 func (s *Store) RecommendByTags(ctx context.Context, relpath string, limit int) ([]model.Item, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+prefixCols("it")+`
@@ -664,8 +711,35 @@ func (s *Store) RecommendByTags(ctx context.Context, relpath string, limit int) 
 		AND it.relpath != ?
 		AND it.missing_since IS NULL
 		GROUP BY it.id
-		ORDER BY COUNT(DISTINCT t.tag_id) DESC, it.indexed_at DESC
+		ORDER BY (COUNT(DISTINCT t.tag_id) + MIN(it.views, 60) * 0.05) DESC,
+		         COUNT(DISTINCT t.tag_id) DESC,
+		         it.views DESC,
+		         it.indexed_at DESC
 		LIMIT ?`, relpath, relpath, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanItems(rows)
+}
+
+// IncrementViews bumps an item's view counter (called when it's opened in the
+// viewer). The counter feeds recommendation ranking.
+func (s *Store) IncrementViews(ctx context.Context, relpath string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE items SET views = views + 1 WHERE relpath = ? AND missing_since IS NULL`, relpath)
+	return err
+}
+
+// MostViewed returns the most-opened items (excluding excludeRelpath), used as a
+// popularity fallback when tag-based recommendations come up empty. Only items
+// that have actually been viewed qualify.
+func (s *Store) MostViewed(ctx context.Context, excludeRelpath string, limit int) ([]model.Item, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+itemCols+` FROM items
+		WHERE missing_since IS NULL AND views > 0 AND relpath != ?
+		ORDER BY views DESC, indexed_at DESC
+		LIMIT ?`, excludeRelpath, limit)
 	if err != nil {
 		return nil, err
 	}

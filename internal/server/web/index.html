@@ -660,11 +660,24 @@
     document.body.style.overflow = "hidden";
   }
 
+  var viewTimer = null;
+  // Record a "view" only after the item has been on screen ~1s, so flipping
+  // past items with the arrows doesn't inflate the popularity counts.
+  function scheduleView(item) {
+    clearTimeout(viewTimer);
+    viewTimer = setTimeout(function () {
+      if (S.viewerOpen && S.viewList[S.viewIndex] === item) {
+        fetch("/api/view?path=" + encodeURIComponent(item.relpath), { method: "POST" }).catch(function () {});
+      }
+    }, 1000);
+  }
+
   function showAt(i) {
     if (i < 0 || i >= S.viewList.length) return;
     S.viewIndex = i;
     renderStage();
     renderCard();
+    scheduleView(S.viewList[i]);
   }
 
   // Open from the grid: the viewer pages through the live grid array, extending
@@ -788,6 +801,7 @@
     el.card.appendChild(row("Type", item.type + (item.mime ? "  \u00b7  " + item.mime : "")));
     if (item.width && item.height && item.type !== "audio") el.card.appendChild(row("Dimensions", item.width + " \u00d7 " + item.height));
     if ((item.type === "video" || item.type === "audio") && item.duration) el.card.appendChild(row("Duration", fmtDuration(item.duration)));
+    el.card.appendChild(row("Views", String(item.views || 0)));
 
     var tagRow = document.createElement("div");
     tagRow.className = "row";
@@ -934,6 +948,7 @@
   }
 
   function closeViewer() {
+    clearTimeout(viewTimer);
     clearStage();
     el.viewer.classList.remove("open");
     el.viewer.setAttribute("aria-hidden", "true");

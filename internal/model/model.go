@@ -29,6 +29,7 @@ type Item struct {
 	Height       int
 	Duration     float64 // seconds; video + audio
 	ThumbReady   bool
+	Views        int // times opened in the viewer (popularity signal)
 	IndexedAt    time.Time
 	SeenAt       time.Time
 	MissingSince *time.Time // set when a scan stops seeing the file (soft delete)
