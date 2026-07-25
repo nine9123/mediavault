@@ -63,10 +63,11 @@ type job struct {
 
 // result is what a worker produces for the writer.
 type result struct {
-	relpath string
-	updated bool
-	write   store.ItemWrite
-	err     error
+	relpath  string
+	updated  bool
+	write    store.ItemWrite
+	err      error
+	thumbErr string // non-empty if a thumbnail was attempted and failed
 }
 
 // Scan runs one full pass. Overlapping calls are skipped (the periodic ticker
@@ -87,6 +88,8 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	}()
 
 	stats := model.ScanStats{Started: time.Now()}
+	var thumbFails int
+	var thumbSample string
 
 	// 1. Snapshot the present index up front so change-detection is pure map
 	//    lookups — no per-file DB round-trips during the walk.
@@ -159,6 +162,12 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 					stats.Updated++
 				} else {
 					stats.Added++
+				}
+				if r.thumbErr != "" {
+					thumbFails++
+					if thumbSample == "" {
+						thumbSample = r.relpath + " (" + r.thumbErr + ")"
+					}
 				}
 				batch = append(batch, r.write)
 				if len(batch) >= maxBatch {
@@ -273,6 +282,9 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	}
 
 	stats.Ended = time.Now()
+	if thumbFails > 0 {
+		log.Printf("scan: %d file(s) had no thumbnail (unreadable frame / no cover art); e.g. %s", thumbFails, thumbSample)
+	}
 	if err := s.store.RecordScanRun(ctx, stats); err != nil {
 		log.Printf("scan: record run: %v", err)
 	}
@@ -303,11 +315,18 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 		item.Width, item.Height, item.Duration, item.MIME = meta.Width, meta.Height, meta.Duration, meta.MIME
 	}
 
-	// Thumbnail failure is non-fatal — we still index the item.
-	if err := media.Thumbnail(ctx, s.cfg, j.abs, j.typ, media.ThumbPath(s.cfg.ThumbDir(), j.relpath)); err != nil {
-		log.Printf("scan: thumbnail %s: %v", j.relpath, err)
-	} else {
-		item.ThumbReady = true
+	// Thumbnail only when probing found a visual stream (width > 0). No width
+	// means there's nothing to render a frame from — audio with no embedded
+	// cover art, an animated webp this ffmpeg can't decode, or an unreadable
+	// file — so ffmpeg would just fail. Skipping avoids a guaranteed error per
+	// such file. (Cover-less audio shows a ♪; animated webp is rendered directly
+	// in the grid.) Thumbnail failure is non-fatal regardless — we still index.
+	if item.Width > 0 {
+		if err := media.Thumbnail(ctx, s.cfg, j.abs, j.typ, media.ThumbPath(s.cfg.ThumbDir(), j.relpath)); err != nil {
+			res.thumbErr = err.Error()
+		} else {
+			item.ThumbReady = true
+		}
 	}
 
 	// Content hash: dedup + move-detection only, NEVER change-detection
