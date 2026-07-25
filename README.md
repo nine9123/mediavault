@@ -302,3 +302,19 @@ your browser. So a mixed sequence plays each video to its end and lingers N
 seconds on each still, and `type:video` + Random + Autoplay is continuous random
 video. Note: browsers may require a video be muted to auto-start without a fresh
 click.
+
+## Troubleshooting playback
+
+- **Animated WebP shows no cover.** ffmpeg can't decode animated WebP, so no
+  thumbnail is generated — the grid instead renders the WebP itself as its cover
+  (browsers handle animated WebP natively). Nothing to do.
+- **`.m4a` won't play.** It's probably Apple Lossless (ALAC), which browsers
+  can't decode (plain AAC `.m4a` plays fine). `transcode` now checks the audio
+  *codec*, not the extension, and converts ALAC/WMA/PCM audio to mp3 in
+  `DERIVED_DIR`. Run `docker compose exec mediavault transcode`.
+- **`.avi` / `.wmv` won't play.** They need a derived MP4. Check the startup log
+  (`docker compose logs mediavault | grep "derived dir"`): if it says *(unset)*,
+  your compose is missing `DERIVED_DIR` and the `mediavault-derived` volume — add
+  them (see docker-compose.yml). Then run `docker compose exec mediavault
+  transcode` and confirm the file appears, e.g. `docker compose exec mediavault
+  ls /derived/<path>.mp4`.

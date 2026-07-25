@@ -455,6 +455,17 @@
     return d;
   }
 
+  function makeImg(src, alt, cell) {
+    var img = document.createElement("img");
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.alt = alt;
+    img.addEventListener("load", function () { img.classList.add("ok"); });
+    img.addEventListener("error", function () { img.remove(); cell.appendChild(noPreview()); });
+    img.src = src;
+    return img;
+  }
+
   function makeCell(item) {
     var cell = document.createElement("div");
     cell.className = "cell";
@@ -465,14 +476,11 @@
     });
 
     if (item.thumb_ready) {
-      var img = document.createElement("img");
-      img.loading = "lazy";
-      img.decoding = "async";
-      img.alt = baseName(item.relpath);
-      img.addEventListener("load", function () { img.classList.add("ok"); });
-      img.addEventListener("error", function () { img.remove(); cell.appendChild(noPreview()); });
-      img.src = item.thumb_url;
-      cell.appendChild(img);
+      cell.appendChild(makeImg(item.thumb_url, baseName(item.relpath), cell));
+    } else if (item.type === "animated") {
+      // ffmpeg can't thumbnail animated webp, but browsers render it — show the
+      // file itself as the cover (also covers any gif that failed to thumbnail).
+      cell.appendChild(makeImg(item.raw_url, baseName(item.relpath), cell));
     } else if (item.type === "audio") {
       cell.appendChild(noteGlyph());
     } else {

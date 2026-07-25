@@ -22,6 +22,11 @@ func main() {
 	cfg := config.Load()
 	log.Printf("media root: %s (read-only)", cfg.MediaRoot)
 	log.Printf("data dir:   %s (disposable cache: db + thumbnails)", cfg.DataDir)
+	if cfg.DerivedDir != "" {
+		log.Printf("derived dir: %s (serving browser-friendly transcodes when present)", cfg.DerivedDir)
+	} else {
+		log.Printf("derived dir: (unset) — WMV/AVI/HEVC/ALAC won't play until DERIVED_DIR is set and `transcode` has run")
+	}
 
 	if err := os.MkdirAll(cfg.ThumbDir(), 0o755); err != nil {
 		log.Fatalf("prepare data dir: %v", err)
