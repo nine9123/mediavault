@@ -282,24 +282,63 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 // handleRaw serves the original file. http.ServeFile handles Range requests, so
 // video seeking works out of the box. The path is contained within MediaRoot.
 func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request) {
-	abs, ok := s.resolve(r.PathValue("path"))
+	rel := r.PathValue("path")
+	// Prefer a browser-friendly derived copy when one exists (transcoded video
+	// or image preview written by scripts/transcode.sh).
+	if p, ok := s.derivedFor(rel); ok {
+		setContentType(w, p)
+		http.ServeFile(w, r, p)
+		return
+	}
+	abs, ok := s.resolve(rel)
 	if !ok {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
+	setContentType(w, abs)
 	http.ServeFile(w, r, abs)
+}
+
+// setContentType sets an explicit type for known extensions, since the slim
+// runtime image ships no /etc/mime.types; unknown types fall back to
+// ServeFile's content sniffing. Range/seek handling is unaffected.
+func setContentType(w http.ResponseWriter, path string) {
+	if ct := media.MimeFor(path); ct != "application/octet-stream" {
+		w.Header().Set("Content-Type", ct)
+	}
 }
 
 // resolve maps a request path to an absolute path and verifies it stays inside
 // MediaRoot (defence against ../ traversal).
-func (s *Server) resolve(rel string) (string, bool) {
+func (s *Server) resolve(rel string) (string, bool) { return contain(s.cfg.MediaRoot, rel) }
+
+// contain joins rel under root, refusing any path that escapes root.
+func contain(root, rel string) (string, bool) {
 	clean := filepath.Clean("/" + strings.TrimPrefix(rel, "/"))
-	abs := filepath.Join(s.cfg.MediaRoot, clean)
-	root := filepath.Clean(s.cfg.MediaRoot)
-	if abs != root && !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
+	abs := filepath.Join(root, clean)
+	r := filepath.Clean(root)
+	if abs != r && !strings.HasPrefix(abs, r+string(os.PathSeparator)) {
 		return "", false
 	}
 	return abs, true
+}
+
+// derivedFor returns a browser-friendly derived file for rel if DerivedDir is
+// configured and one exists there (named "<rel>.<ext>").
+func (s *Server) derivedFor(rel string) (string, bool) {
+	if s.cfg.DerivedDir == "" {
+		return "", false
+	}
+	base, ok := contain(s.cfg.DerivedDir, rel)
+	if !ok {
+		return "", false
+	}
+	for _, suf := range []string{".mp4", ".webm", ".m4v", ".jpg", ".jpeg", ".webp", ".png"} {
+		if fi, err := os.Stat(base + suf); err == nil && !fi.IsDir() {
+			return base + suf, true
+		}
+	}
+	return "", false
 }
 
 // ---- helpers ----

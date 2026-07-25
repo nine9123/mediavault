@@ -20,6 +20,11 @@ services:
       # below) so your media mount can stay read-only. Leave empty to write
       # sidecars next to each media file instead (needs a writable media mount).
       SIDECAR_DIR: "/meta"
+      # Browser-friendly transcodes/previews for formats a browser can't play
+      # (HEVC mp4, avi, mkv, HEIC, RAW, ...). Populate it with
+      # scripts/transcode.sh; mediavault serves a derived file when one exists.
+      # Leave empty to disable. Expensive to regenerate, so it's its own volume.
+      DERIVED_DIR: "/derived"
     volumes:
       # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
       - /mnt/nas/media:/media:ro
@@ -28,7 +33,12 @@ services:
       # Your tags/ratings live here — the durable source of truth. Keep this
       # separate from the disposable cache above, and back it up.
       - mediavault-metadata:/meta
+      # Browser-friendly derived copies (see DERIVED_DIR). Written by
+      # scripts/transcode.sh, read by mediavault. Persist it so you don't
+      # re-transcode after clearing the cache.
+      - mediavault-derived:/derived
 
 volumes:
   mediavault-data:
   mediavault-metadata:
+  mediavault-derived:

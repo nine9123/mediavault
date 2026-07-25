@@ -178,3 +178,59 @@ it was **not** fully compiled in the environment it was written in (no Go
 toolchain, and the module proxy was blocked, so the SQLite driver couldn't be
 fetched). Run `go mod tidy && go build ./...` to finish wiring it up. The only
 external dependency is `modernc.org/sqlite`.
+
+## Making everything playable in the browser
+
+The built-in `<video>`/`<img>` viewer can only show what the browser itself
+decodes: **MP4/H.264, WebM (VP8/VP9/AV1), Ogg, and common still images
+(JPEG/PNG/GIF/WebP/AVIF/SVG)**. Anything else — an **HEVC/H.265** `.mp4`, an
+`.avi` (DivX/Xvid), `.mkv`, `.wmv`, `.flv`, or a still like **HEIC**, **TIFF**,
+**JPEG-2000**, or camera **RAW** — is still indexed and thumbnailed, but the
+viewer will show a fallback with an *"open / download original"* link instead of
+playing it.
+
+To make those play/show in-browser, generate browser-friendly copies into a
+separate writable directory (`DERIVED_DIR`) and mediavault will serve the derived
+file whenever one exists. Your original archive is never touched.
+
+```bash
+# from the repo, pointing at your real media + a writable output dir
+MEDIA_ROOT=/mnt/nas/media DERIVED_DIR=/mnt/nas/derived ./scripts/transcode.sh
+```
+
+Or run it against the same volumes the container uses, e.g. a throwaway ffmpeg
+container mounting media read-only and the derived volume read-write.
+
+What the script does, cheaply:
+
+- **Skips** files already playable (mp4/webm with a web codec) — no copy made.
+- **Remuxes** (`-c copy`, fast + lossless) when the streams are web-safe but the
+  container isn't — e.g. H.264 + AAC inside an `.mkv`/`.mov`/`.avi`.
+- **Re-encodes** to H.264/AAC only when the codec itself isn't web-playable
+  (HEVC, DivX, VC-1, ...).
+- Writes a downscaled **JPEG preview** for non-web still formats (HEIC, TIFF,
+  JP2, ...). Most camera **RAW** needs external tooling (ffmpeg can't decode it),
+  so those may remain preview-less.
+
+Re-running is safe — up-to-date outputs are skipped.
+
+### Which format to keep?
+
+Keep your **originals** as the archive (they're the source of truth; don't
+re-encode them and lose quality). For the *derived* playback copies, **MP4 /
+H.264 (High, 8-bit yuv420p) + AAC** is the best default: it plays in every
+browser, seeks well, and encodes fast. WebM (VP9/AV1) compresses smaller but
+encodes much slower; prefer it only if disk space matters more than CPU time.
+
+### Config for playback
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `DERIVED_DIR` | `""` (off) | Directory of derived copies (`<relpath>.mp4` / `.jpg`). When set, the raw endpoint serves a derived file if present. |
+
+Supported extensions were also widened to cover many more still-image formats
+(HEIC/HEIF, JFIF, JPEG-2000, TGA/EXR/HDR/DDS/PNM, SVG, and common camera RAW).
+If part of your collection wasn't showing up before, a rescan will now pick it
+up. Note: HEIC decoding depends on your ffmpeg build, and most RAW won't
+thumbnail without external tooling — such files are still indexed, searchable,
+and downloadable.

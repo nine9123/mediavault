@@ -39,11 +39,17 @@ type Scanner struct {
 
 	mu      sync.Mutex // guards running
 	running bool
+
+	// thumbRetried remembers thumbless files already re-attempted this process
+	// run, so files that simply can't be thumbnailed (e.g. RAW) aren't re-probed
+	// on every periodic scan. Scans are single-flight, so the walk goroutine is
+	// the only accessor at a time.
+	thumbRetried map[string]struct{}
 }
 
 // New creates a Scanner.
 func New(cfg config.Config, st *store.Store) *Scanner {
-	return &Scanner{cfg: cfg, store: st}
+	return &Scanner{cfg: cfg, store: st, thumbRetried: make(map[string]struct{})}
 }
 
 // job is one file that needs (re)processing.
@@ -208,11 +214,19 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 
 		// Cheap change-detection: (size, mtime). No bytes read.
 		cur, existed := index[rel]
-		if existed && cur.Size == info.Size() && cur.MTime == info.ModTime().Unix() && cur.ThumbReady {
-			return nil // unchanged and already thumbnailed -> skip the whole expensive path
+		if existed && cur.Size == info.Size() && cur.MTime == info.ModTime().Unix() {
+			// Unchanged. Skip unless it still lacks a thumbnail AND we haven't
+			// already retried it this run — this backfills thumbnails missed by
+			// an older bug without re-probing un-thumbnailable files every scan.
+			if cur.ThumbReady {
+				return nil
+			}
+			if _, tried := s.thumbRetried[rel]; tried {
+				return nil
+			}
+			s.thumbRetried[rel] = struct{}{}
+			// fall through: reprocess once to try to backfill the thumbnail
 		}
-		// Files that changed, or that were indexed before but never got a
-		// thumbnail (e.g. an older short-clip bug), fall through and reprocess.
 
 		select {
 		case jobs <- job{abs: abs, relpath: rel, info: info, typ: typ, updated: existed}:

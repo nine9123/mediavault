@@ -38,6 +38,13 @@ type Config struct {
 	// then mirrored there by relative path.
 	SidecarDir string
 
+	// DerivedDir is an optional writable directory of browser-friendly copies
+	// (transcoded video / image previews) mirroring the media tree by relpath,
+	// e.g. "<rel>.mp4" or "<rel>.jpg". When set, the raw endpoint serves the
+	// derived file if one exists, so otherwise-unplayable formats work in the
+	// browser. Empty disables it. Populate it with scripts/transcode.sh.
+	DerivedDir string
+
 	FFmpeg  string // ffmpeg binary (on PATH by default)
 	FFprobe string // ffprobe binary
 
@@ -78,6 +85,7 @@ func Load() Config {
 		ThumbPx:    envInt("THUMB_PX", 400),
 		HashMode:   hashMode(env("HASH_MODE", "partial")),
 		SidecarDir: env("SIDECAR_DIR", ""),
+		DerivedDir: env("DERIVED_DIR", ""),
 		FFmpeg:     env("FFMPEG", "ffmpeg"),
 		FFprobe:    env("FFPROBE", "ffprobe"),
 		Exts:       defaultExts(),
@@ -89,6 +97,19 @@ func defaultExts() map[string]model.MediaType {
 		".jpg": model.MediaImage, ".jpeg": model.MediaImage, ".png": model.MediaImage,
 		".bmp": model.MediaImage, ".tif": model.MediaImage, ".tiff": model.MediaImage,
 		".avif": model.MediaImage, ".jxl": model.MediaImage,
+		// less-common stills. ffmpeg thumbnails most of these; a browser can't
+		// display them all, so the viewer falls back to a derived preview.
+		".heic": model.MediaImage, ".heif": model.MediaImage,
+		".jfif": model.MediaImage, ".jpe": model.MediaImage,
+		".jp2": model.MediaImage, ".j2k": model.MediaImage, ".jpf": model.MediaImage,
+		".tga": model.MediaImage, ".exr": model.MediaImage, ".hdr": model.MediaImage,
+		".dds": model.MediaImage, ".ppm": model.MediaImage, ".pgm": model.MediaImage,
+		".pbm": model.MediaImage, ".pnm": model.MediaImage, ".svg": model.MediaImage,
+		// camera RAW: indexed + searchable, but ffmpeg can't decode most RAW, so
+		// they often show no thumbnail until you generate previews externally.
+		".cr2": model.MediaImage, ".cr3": model.MediaImage, ".nef": model.MediaImage,
+		".arw": model.MediaImage, ".dng": model.MediaImage, ".raf": model.MediaImage,
+		".orf": model.MediaImage, ".rw2": model.MediaImage, ".pef": model.MediaImage,
 		".gif": model.MediaAnimated, ".webp": model.MediaAnimated, // webp may be still or animated; treat as animated
 		".mp4": model.MediaVideo, ".m4v": model.MediaVideo, ".webm": model.MediaVideo,
 		".mkv": model.MediaVideo, ".mov": model.MediaVideo, ".avi": model.MediaVideo,

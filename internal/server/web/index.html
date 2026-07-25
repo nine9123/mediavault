@@ -617,7 +617,9 @@
     var box = document.createElement("div");
     box.className = "unplayable";
     var p = document.createElement("p");
-    p.textContent = "This format won\u2019t play in the browser.";
+    p.textContent = item.type === "video"
+      ? "This format won\u2019t play in the browser."
+      : "This format can\u2019t be shown in the browser.";
     var sub = document.createElement("p");
     sub.className = "sub";
     sub.textContent = baseName(item.relpath);
@@ -648,6 +650,7 @@
       media = document.createElement("img");
       media.src = item.raw_url;
       media.alt = baseName(item.relpath);
+      media.addEventListener("error", function () { showUnplayable(item, media); });
     }
     el.stage.insertBefore(media, el.stage.firstChild);
 
