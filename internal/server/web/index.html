@@ -461,13 +461,19 @@
     el.sentinel.textContent = "loading";
     return api("/api/items?limit=" + PAGE).then(function (d) {
       var batch = d.items || [];
+      if (batch.length === 0) {
+        // Nothing indexed yet. Leave maxId/minId null so pollStats keeps
+        // retrying loadInitial (not loadNewer) until the scan commits its first
+        // items; then normal newest-first paging + live prepend take over. (If
+        // we primed a cursor here, the whole library would instead arrive via
+        // slow top-prepends and scrolling down would never load anything.)
+        emptyBrowse();
+        el.sentinel.classList.add("hidden");
+        return;
+      }
       batch.forEach(appendItem);
       if (batch.length < PAGE) S.doneOlder = true;
-      if (S.items.length === 0) {
-        S.maxId = 0;        // prime the live cursor so items stream in from empty
-        S.doneOlder = true;
-        emptyBrowse();
-      }
+      clearState();
       el.sentinel.classList.toggle("hidden", S.doneOlder);
     }).catch(function (e) {
       S.doneOlder = true;
@@ -531,6 +537,15 @@
     if (entries[0].isIntersecting) loadOlder();
   }, { rootMargin: "800px" });
   io.observe(el.sentinel);
+
+  // Backstop for the observer: also load older items when scrolled near the
+  // bottom, in case a hidden-at-observe-time sentinel is missed. loadOlder's own
+  // guards (busy/done/mode/cursor) prevent any double-loading.
+  function nearBottomLoad() {
+    if ((window.innerHeight + (window.scrollY || 0)) >= document.body.scrollHeight - 900) loadOlder();
+  }
+  window.addEventListener("scroll", nearBottomLoad, { passive: true });
+  window.addEventListener("resize", nearBottomLoad);
 
   // search (debounced)
   var searchTimer = null;
