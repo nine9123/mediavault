@@ -55,6 +55,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/transcode", s.handleTranscodeStatus)
 	mux.HandleFunc("GET /api/item", s.handleItemDetail)
 	mux.HandleFunc("PUT /api/tags", s.handleSetTags)
+	mux.HandleFunc("GET /api/tags/top", s.handleTopTags)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
 	mux.HandleFunc("GET /api/thumb/{path...}", s.handleThumb)
@@ -297,6 +298,21 @@ func (s *Server) handleItemDetail(w http.ResponseWriter, r *http.Request) {
 // handleSetTags writes an item's manual tags to its sidecar (the durable source
 // of truth) and syncs the DB immediately, so the change is visible and
 // searchable without waiting for a rescan. AI tags are left alone.
+// handleTopTags returns the most-used manual tags for the quick-add menu.
+func (s *Server) handleTopTags(w http.ResponseWriter, r *http.Request) {
+	limit := clampAtoi(r.URL.Query().Get("limit"), 12, 1, 100)
+	tags, err := s.store.TopTags(r.Context(), limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]tagDTO, 0, len(tags))
+	for _, t := range tags {
+		out = append(out, tagDTO{Namespace: t.Namespace, Name: t.Name, Source: "manual"})
+	}
+	writeJSON(w, map[string]any{"tags": out})
+}
+
 func (s *Server) handleSetTags(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string   `json:"path"`

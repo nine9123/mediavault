@@ -358,3 +358,13 @@ list form, or the quotes become part of the value:
 `- DERIVED_DIR='/derived'` makes the path literally `'/derived'`, so derived
 files/sidecars miss their mounts (and re-transcode every restart). mediavault
 now strips stray surrounding quotes defensively, but fixing the compose is best.
+
+
+## More controls
+
+- **Shuffle** (viewer toolbar, next to Autoplay) makes autoplay jump to a random
+  item instead of the next one — a continuous shuffle across videos, images, and
+  audio. Respects the active search/type filter, and is remembered in your browser.
+- **Quick-add tags:** the tag editor shows your most-used tags as one-tap `+`
+  chips (already-applied ones are hidden), so re-tagging is a click. Backed by
+  `GET /api/tags/top`.

@@ -771,3 +771,30 @@ func (s *Store) MostViewed(ctx context.Context, excludeRelpath string, limit int
 	defer rows.Close()
 	return scanItems(rows)
 }
+
+// TopTags returns the most-used manual tags across present items, most-used
+// first — the user's own tagging vocabulary, for quick re-tagging suggestions.
+func (s *Store) TopTags(ctx context.Context, limit int) ([]model.Tag, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT t.namespace, t.name
+		FROM item_tags it
+		JOIN tags t ON t.id = it.tag_id
+		JOIN items i ON i.id = it.item_id
+		WHERE it.source = 'manual' AND i.missing_since IS NULL
+		GROUP BY t.id
+		ORDER BY COUNT(*) DESC, t.name COLLATE NOCASE
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Tag
+	for rows.Next() {
+		var t model.Tag
+		if err := rows.Scan(&t.Namespace, &t.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}

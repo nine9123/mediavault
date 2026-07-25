@@ -300,6 +300,10 @@
   .recs .rec img{width:100%;height:100%;object-fit:cover;display:block}
   .recs .rec:hover{border-color:var(--brass)}
   .recs .rec.norec{display:flex;align-items:center;justify-content:center;font-size:.6rem;color:var(--bone-faint);padding:4px;text-align:center;word-break:break-all}
+  .tagsuggest{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+  .tagsuggest .sugg{font-family:var(--mono);font-size:.72rem;color:var(--bone-dim);background:var(--ink-raised);border:1px solid var(--ink-line);border-radius:2px;padding:.2rem .5rem;cursor:pointer}
+  .tagsuggest .sugg::before{content:"+ ";color:var(--brass)}
+  .tagsuggest .sugg:hover{border-color:var(--brass);color:var(--bone)}
   .vtools{position:absolute;top:12px;left:12px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;z-index:6;max-width:calc(100% - 90px)}
   .vnum{display:flex;align-items:center;gap:2px;font-family:var(--mono);font-size:.72rem;letter-spacing:.03em;color:var(--bone-dim);background:rgba(20,18,16,.72);border:1px solid var(--ink-line);border-radius:2px;padding:.3rem .55rem;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);user-select:none}
   .vnum input{width:3.2rem;background:transparent;border:none;border-bottom:1px solid var(--ink-line-2);color:var(--bone);font-family:var(--mono);font-size:.72rem;text-align:center;padding:0 2px}
@@ -361,6 +365,7 @@
         <button class="vbtn" id="vrandom" type="button">Random</button>
         <label class="vtoggle" title="When a video/track ends — or an image has shown for the set seconds — advance to the next item"><input type="checkbox" id="autonext"> Autoplay next</label>
         <label class="vnum" title="Seconds to show each image/gif before advancing">every&nbsp;<input type="number" id="autosecs" min="1" max="600" step="1">&nbsp;s</label>
+        <label class="vtoggle" title="When autoplaying, jump to a random item instead of the next one"><input type="checkbox" id="autoshuffle"> Shuffle</label>
       </div>
       <button class="close" id="close" aria-label="Close">&times;</button>
     </div>
@@ -389,6 +394,7 @@
     viewMore: null,     // for a queue: fn -> Promise<item|null> to extend on next
     autoNext: false,    // auto-advance when a video/track ends
     autoSecs: 5,        // seconds to show each image before auto-advancing
+    autoRandom: false,  // autoplay jumps to a random item instead of the next
     scanning: false
   };
 
@@ -410,6 +416,7 @@
     vrandom: document.getElementById("vrandom"),
     autonext: document.getElementById("autonext"),
     autosecs: document.getElementById("autosecs"),
+    autoshuffle: document.getElementById("autoshuffle"),
     qhelp: document.getElementById("qhelp"),
     qhint: document.getElementById("qhint")
   };
@@ -746,15 +753,19 @@
     startRandom().catch(function () {}).finally(function () { el.vrandom.disabled = false; });
   });
 
-  // auto-play-next preference + slideshow interval (persisted in the browser)
+  // auto-play-next preference + slideshow interval + shuffle (persisted)
   try { S.autoNext = localStorage.getItem("mv.autoplayNext") === "1"; } catch (e) {}
   try { var sv = parseInt(localStorage.getItem("mv.autoplaySecs"), 10); if (sv >= 1) S.autoSecs = sv; } catch (e) {}
+  try { S.autoRandom = localStorage.getItem("mv.autoplayShuffle") === "1"; } catch (e) {}
   el.autonext.checked = S.autoNext;
   el.autosecs.value = S.autoSecs;
+  el.autoshuffle.checked = S.autoRandom;
   el.autosecs.disabled = !S.autoNext;
+  el.autoshuffle.disabled = !S.autoNext;
   el.autonext.addEventListener("change", function () {
     S.autoNext = el.autonext.checked;
     el.autosecs.disabled = !S.autoNext;
+    el.autoshuffle.disabled = !S.autoNext;
     try { localStorage.setItem("mv.autoplayNext", S.autoNext ? "1" : "0"); } catch (e) {}
     armSlideshow();
   });
@@ -765,6 +776,10 @@
     S.autoSecs = v; el.autosecs.value = v;
     try { localStorage.setItem("mv.autoplaySecs", String(v)); } catch (e) {}
     armSlideshow();
+  });
+  el.autoshuffle.addEventListener("change", function () {
+    S.autoRandom = el.autoshuffle.checked;
+    try { localStorage.setItem("mv.autoplayShuffle", S.autoRandom ? "1" : "0"); } catch (e) {}
   });
 
   el.rescan.addEventListener("click", function () {
@@ -834,7 +849,7 @@
     var item = S.viewList && S.viewList[S.viewIndex];
     if (!item || (item.type !== "image" && item.type !== "animated")) return;
     slideTimer = setTimeout(function () {
-      if (S.autoNext && S.viewerOpen && S.viewList[S.viewIndex] === item) navigate(1);
+      if (S.autoNext && S.viewerOpen && S.viewList[S.viewIndex] === item) advanceAuto();
     }, Math.max(1, S.autoSecs) * 1000);
   }
 
@@ -944,7 +959,19 @@
     el.stage.insertBefore(box, el.stage.firstChild);
   }
 
-  function onMediaEnded() { if (S.autoNext) navigate(1); }
+  // Advance during autoplay: to a random item when Shuffle is on, else the next
+  // in the current sequence. The first shuffle-advance switches into a random
+  // queue, so subsequent advances keep pulling randoms via navigate().
+  function advanceAuto() {
+    if (!S.autoNext) return;
+    if (S.autoRandom) {
+      if (S.viewMore === fetchRandom) navigate(1);
+      else fetchRandom().then(function (item) { if (item) openQueue([item], 0, fetchRandom); });
+    } else {
+      navigate(1);
+    }
+  }
+  function onMediaEnded() { advanceAuto(); }
 
   function renderStage() {
     var item = S.viewList[S.viewIndex];
@@ -1037,6 +1064,8 @@
 
     var note = document.createElement("div"); note.className = "muted taghint";
     tagRow.appendChild(note);
+    var suggest = document.createElement("div"); suggest.className = "tagsuggest";
+    tagRow.appendChild(suggest);
     el.card.appendChild(tagRow);
 
     // Editable state for THIS item. Manual tags (from the sidecar) are editable;
@@ -1076,6 +1105,22 @@
       return chip;
     }
 
+    // Quick-add menu: the user's most-used tags, minus ones already applied.
+    var suggestList = [];
+    function renderSuggest() {
+      suggest.innerHTML = "";
+      var lower = manual.map(function (m) { return m.toLowerCase(); });
+      var shown = 0;
+      suggestList.forEach(function (str) {
+        if (shown >= 10 || lower.indexOf(str.toLowerCase()) >= 0) return;
+        shown++;
+        var b = document.createElement("button");
+        b.type = "button"; b.className = "sugg"; b.textContent = str; b.title = "Add this tag";
+        b.addEventListener("click", function () { manual.push(str); renderChips(); save(); });
+        suggest.appendChild(b);
+      });
+    }
+
     function renderChips() {
       wrap.innerHTML = "";
       manual.forEach(function (str, i) { wrap.appendChild(chipEl(str, false, i)); });
@@ -1084,6 +1129,7 @@
         var m = document.createElement("span"); m.className = "muted"; m.textContent = "No tags yet.";
         wrap.appendChild(m);
       }
+      renderSuggest();
     }
 
     function addFromInput() {
@@ -1132,6 +1178,12 @@
       });
       renderChips();
     }).catch(function () { note.textContent = "(couldn't load tags)"; });
+
+    api("/api/tags/top?limit=16").then(function (d) {
+      if (S.viewList[S.viewIndex] !== item) return;
+      suggestList = (d.tags || []).map(tagStr);
+      renderSuggest();
+    }).catch(function () {});
 
     // "More like this": items sharing the most tags with this one. Clicking one
     // opens the whole recommendation set as an arrow-navigable queue.
