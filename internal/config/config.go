@@ -137,9 +137,19 @@ func hashMode(v string) string {
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
-		return v
+		return unquote(v)
 	}
 	return def
+}
+
+// unquote strips one pair of matching surrounding quotes. Docker Compose's
+// list form (`- KEY='value'`) keeps the quotes as part of the value, a common
+// footgun for paths like SIDECAR_DIR/DERIVED_DIR; tolerate it.
+func unquote(s string) string {
+	if len(s) >= 2 && (s[0] == '\'' || s[0] == '"') && s[len(s)-1] == s[0] {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 func envInt(k string, def int) int {

@@ -333,3 +333,28 @@ click.
   them (see docker-compose.yml). Then run `docker compose exec mediavault
   transcode` and confirm the file appears, e.g. `docker compose exec mediavault
   ls /derived/<path>.mp4`.
+
+## URL & history
+
+The viewer is deep-linkable. Opening an item sets the URL to `#v=<relpath>`, so
+browser Back closes it (and Forward reopens), and you can bookmark or share a
+link straight to a specific item. Searches are reflected as `#q=<query>`, so a
+search is bookmarkable too and Back steps search → browse. Paging within the
+viewer updates the URL in place (one Back exits the viewer rather than stepping
+through every item).
+
+## A note on env vars in docker-compose
+
+Use the map form or unquoted list form — do **not** wrap values in quotes in the
+list form, or the quotes become part of the value:
+
+```yaml
+    environment:      # correct (list form, no quotes)
+      - DERIVED_DIR=/derived
+      - SIDECAR_DIR=/meta
+      - HASH_MODE=partial
+```
+
+`- DERIVED_DIR='/derived'` makes the path literally `'/derived'`, so derived
+files/sidecars miss their mounts (and re-transcode every restart). mediavault
+now strips stray surrounding quotes defensively, but fixing the compose is best.

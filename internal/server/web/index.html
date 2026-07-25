@@ -641,8 +641,61 @@
   window.addEventListener("resize", fillViewport);
 
   // search (debounced)
-  function applySearch(v) {
+  // ---- URL routing: browser back/forward + bookmarkable deep links ----
+  // Hash is the source of truth for history: "#v=<relpath>" = viewing an item,
+  // "#q=<query>" = a search. Opening an item pushes an entry; paging within the
+  // viewer replaces it; closing goes Back. popstate reconciles the UI.
+  function parseHash() {
+    var out = {};
+    (location.hash || "").replace(/^#/, "").split("&").forEach(function (kv) {
+      var i = kv.indexOf("=");
+      if (i < 0) return;
+      var k = kv.slice(0, i), val = kv.slice(i + 1);
+      try { val = decodeURIComponent(val); } catch (e) {}
+      if (k === "q" || k === "v") out[k] = val;
+    });
+    return out;
+  }
+  function baseURL() { return location.pathname + location.search; }
+  function pushItem(rel) { history.pushState({ mv: true }, "", "#v=" + encodeURIComponent(rel)); }
+  function replItem(rel) { history.replaceState({ mv: true }, "", "#v=" + encodeURIComponent(rel)); }
+  function replQuery(q) { history.replaceState({}, "", q ? "#q=" + encodeURIComponent(q) : baseURL()); }
+
+  // Make the UI match the current URL (on back/forward). Never changes history.
+  function render() {
+    var h = parseHash();
+    var q = h.q || "";
+    if (q !== S.query) { el.q.value = q; applySearch(q, true); }
+    if (h.v) {
+      var cur = (S.viewerOpen && S.viewList[S.viewIndex]) ? S.viewList[S.viewIndex].relpath : null;
+      if (cur !== h.v) openItemByPath(h.v);
+    } else if (S.viewerOpen) {
+      closeViewer();
+    }
+  }
+
+  function openItemByPath(rel) {
+    for (var i = 0; i < S.items.length; i++) {
+      if (S.items[i].relpath === rel) { openViewer(i, true); return; }
+    }
+    api("/api/item?path=" + encodeURIComponent(rel)).then(function (d) {
+      if (d && d.item && parseHash().v === rel) openQueue([d.item], 0, null, true);
+    }).catch(function () {});
+  }
+
+  // Close from the X / Esc / backdrop: behave like Back so the entry is popped;
+  // if we were deep-linked straight onto an item (nothing to pop), drop the hash.
+  function userClose() {
+    if (history.state && history.state.mv) history.back();
+    else { replQuery(S.query); closeViewer(); }
+  }
+
+  function applySearch(v, noHist) {
     v = (v || "").trim();
+    if (!noHist) {
+      if (v && S.mode !== "search") history.pushState({}, "", "#q=" + encodeURIComponent(v));
+      else replQuery(v);
+    }
     S.query = v;
     if (v === "") { S.mode = "browse"; reset(); loadInitial().then(fillViewport); }
     else { S.mode = "search"; reset(); runSearch(); }
@@ -747,10 +800,8 @@
   function searchTag(str) {
     closeViewer();
     el.q.value = str;
-    S.query = str;
-    S.mode = "search";
-    reset();
-    runSearch();
+    history.pushState({}, "", "#q=" + encodeURIComponent(str));
+    applySearch(str, true);
   }
 
   // ---- viewer ----
@@ -787,10 +838,11 @@
     }, Math.max(1, S.autoSecs) * 1000);
   }
 
-  function showAt(i) {
+  function showAt(i, noHist) {
     if (i < 0 || i >= S.viewList.length) return;
     stopTxPoll();
     S.viewIndex = i;
+    if (!noHist) replItem(S.viewList[i].relpath);
     renderStage();
     renderCard();
     scheduleView(S.viewList[i]);
@@ -799,18 +851,21 @@
 
   // Open from the grid: the viewer pages through the live grid array, extending
   // via loadOlder at the end.
-  function openViewer(index) {
+  function openViewer(index, noHist) {
     if (index < 0 || index >= S.items.length) return;
     S.viewKind = "grid"; S.viewList = S.items; S.viewMore = null;
-    showViewer(); showAt(index);
+    if (!noHist) pushItem(S.items[index].relpath);
+    showViewer(); showAt(index, true);
   }
 
   // Open a standalone sequence (random shuffle / recommendations). moreFn, if
   // given, is called when paging past the end to append another item.
-  function openQueue(list, index, moreFn) {
+  function openQueue(list, index, moreFn, noHist) {
     if (!list || !list.length) return;
+    var idx = index || 0;
     S.viewKind = "queue"; S.viewList = list; S.viewMore = moreFn || null;
-    showViewer(); showAt(index || 0);
+    if (!noHist) pushItem(list[idx].relpath);
+    showViewer(); showAt(idx, true);
   }
 
   function stopMedia(n) {
@@ -1147,21 +1202,27 @@
 
   el.prev.addEventListener("click", function (e) { e.stopPropagation(); navigate(-1); });
   el.next.addEventListener("click", function (e) { e.stopPropagation(); navigate(1); });
-  el.close.addEventListener("click", closeViewer);
+  el.close.addEventListener("click", userClose);
   el.viewer.addEventListener("click", function (e) {
-    if (e.target === el.viewer || e.target === el.stage) closeViewer();
+    if (e.target === el.viewer || e.target === el.stage) userClose();
   });
   document.addEventListener("keydown", function (e) {
     if (!S.viewerOpen) return;
-    if (e.key === "Escape") { closeViewer(); return; }
+    if (e.key === "Escape") { userClose(); return; }
     var tag = e.target && e.target.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
     if (e.key === "ArrowLeft") navigate(-1);
     else if (e.key === "ArrowRight") navigate(1);
   });
+  window.addEventListener("popstate", render);
 
   // ---- boot ----
-  loadInitial().then(fillViewport);
+  (function () {
+    var h = parseHash();
+    if (h.q) { el.q.value = h.q; applySearch(h.q, true); }
+    else { loadInitial().then(fillViewport); }
+    if (h.v) openItemByPath(h.v);
+  })();
   pollStats();
   setInterval(pollStats, 2000);
 })();
