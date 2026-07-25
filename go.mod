@@ -2,11 +2,11 @@ module mediavault
 
 go 1.22
 
-// The ONLY external dependency. modernc.org/sqlite is a pure-Go (cgo-free)
-// SQLite with FTS5 built in, so the server cross-compiles to a single static
-// binary with no libsqlite at runtime. ffmpeg/ffprobe are the only runtime deps.
+// This module's one external dependency is modernc.org/sqlite — a pure-Go
+// (cgo-free) SQLite with FTS5 built in, so the binary stays static with no
+// libsqlite at runtime. It is intentionally NOT pinned here: run
 //
-// This repo ships without go.sum (it can't be generated offline). Run:
 //     go mod tidy
-// once, in an environment with network access, to pin indirect deps + sums.
-require modernc.org/sqlite v1.34.4
+//
+// once (with network) and Go adds it — at a current, compatible version —
+// along with its indirect deps and go.sum. The Docker build runs tidy for you.
