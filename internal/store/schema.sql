@@ -87,4 +87,12 @@ CREATE TABLE IF NOT EXISTS scan_runs (
 -- Full-text search over path + tags. At a few thousand rows a LIKE scan is
 -- also fine; FTS5 keeps search instant as the library grows. Maintained
 -- explicitly by the app with rowid = items.id (see store.WriteBatch).
+-- Perceptual signatures for visual similarity search (color + layout). BLOB is
+-- little-endian float32s; brute-forced in memory, no external vector DB needed.
+CREATE TABLE IF NOT EXISTS item_vectors (
+    item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+    dim     INTEGER NOT NULL,
+    vec     BLOB    NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(relpath, tags);

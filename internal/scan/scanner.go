@@ -224,17 +224,17 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 		// Cheap change-detection: (size, mtime). No bytes read.
 		cur, existed := index[rel]
 		if existed && cur.Size == info.Size() && cur.MTime == info.ModTime().Unix() {
-			// Unchanged. Skip unless it still lacks a thumbnail AND we haven't
-			// already retried it this run — this backfills thumbnails missed by
-			// an older bug without re-probing un-thumbnailable files every scan.
-			if cur.ThumbReady {
+			// Unchanged. Skip once it has both a thumbnail and a signature;
+			// otherwise reprocess once this run to backfill whatever's missing
+			// (bounds pointless re-probing of files that can produce neither).
+			if cur.ThumbReady && cur.HasVector {
 				return nil
 			}
 			if _, tried := s.thumbRetried[rel]; tried {
 				return nil
 			}
 			s.thumbRetried[rel] = struct{}{}
-			// fall through: reprocess once to try to backfill the thumbnail
+			// fall through: reprocess once to backfill the thumbnail and/or vector
 		}
 
 		select {
@@ -326,6 +326,10 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 			res.thumbErr = err.Error()
 		} else {
 			item.ThumbReady = true
+		}
+		// Perceptual signature for "looks similar" search (best-effort).
+		if vec, err := media.Signature(ctx, s.cfg, j.abs, j.typ); err == nil {
+			res.write.Vector = vec
 		}
 	}
 

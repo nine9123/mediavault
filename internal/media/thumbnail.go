@@ -45,7 +45,7 @@ func Thumbnail(ctx context.Context, cfg config.Config, src string, typ model.Med
 		// A ~1s input seek is fast and skips black intro frames. Clips shorter
 		// than the seek point (common for webm loops) yield no frame there, so
 		// retry from the very start before giving up.
-		if err := runFFmpeg(ctx, cfg, frame("-ss", "1")); err == nil {
+		if err := runFFmpeg(ctx, cfg, frame("-ss", "2")); err == nil {
 			return nil
 		}
 		return runFFmpeg(ctx, cfg, frame())

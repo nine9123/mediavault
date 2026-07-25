@@ -368,3 +368,22 @@ now strips stray surrounding quotes defensively, but fixing the compose is best.
 - **Quick-add tags:** the tag editor shows your most-used tags as one-tap `+`
   chips (already-applied ones are hidden), so re-tagging is a click. Backed by
   `GET /api/tags/top`.
+
+## Visual similarity ("Looks similar")
+
+Each visual item gets a small **perceptual signature** computed with ffmpeg (no
+ML model): a per-channel mean-centered color grid (layout/composition) blended
+with a coarse color histogram (palette), L2-normalized. Videos are sampled a
+couple of seconds in to skip black fade-ins. The viewer shows a **Looks similar**
+strip — nearest neighbours by cosine similarity — great for near-duplicates,
+burst shots, and same-scene frames. Click one to browse the set.
+
+Signatures are computed during scanning and stored in SQLite; existing items are
+backfilled on the next scan (a "Looks similar" strip may say it's still computing
+until then). Search is a brute-force cosine scan in memory — fast for a personal
+library, so **no external vector database is needed**. For *semantic* similarity
+("find other photos of a dog" regardless of colour), you'd want neural (CLIP)
+embeddings, which would justify a Python embedding sidecar + a vector DB like
+Qdrant — a separate, heavier path I can add if you want that quality.
+
+`GET /api/similar?path=<relpath>&limit=<n>`

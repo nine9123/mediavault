@@ -9,13 +9,18 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"encoding/binary"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	_ "modernc.org/sqlite"
 
+	"mediavault/internal/media"
 	"mediavault/internal/model"
 )
 
@@ -30,12 +35,21 @@ const schemaVersion = "1"
 // scanItem helper can decode any of them.
 const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,views,indexed_at,seen_at,missing_since"
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db *sql.DB
+
+	// In-memory cache of perceptual signatures for brute-force similarity
+	// search (fast at personal-library scale; no external vector DB needed).
+	vecMu   sync.Mutex
+	vecs    map[int64][]float32
+	vecInit bool
+}
 
 // ItemWrite is what the scanner hands the writer for one file.
 type ItemWrite struct {
 	Item       model.Item
 	ManualTags []model.Tag // sidecar-derived; synced as this item's manual tags
+	Vector     []float32   // perceptual signature; nil to leave unchanged
 }
 
 // ChainDef is a fully-resolved chain the scanner asks us to (re)create.
@@ -50,6 +64,7 @@ type IndexRow struct {
 	Size       int64
 	MTime      int64
 	ThumbReady bool
+	HasVector  bool
 }
 
 // Open connects, sets pragmas per-connection (via DSN so every pooled conn
@@ -110,6 +125,13 @@ func (s *Store) ensureColumns() error {
 			return fmt.Errorf("add items.views: %w", err)
 		}
 	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS item_vectors (
+		item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+		dim     INTEGER NOT NULL,
+		vec     BLOB    NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create item_vectors: %w", err)
+	}
 	return nil
 }
 
@@ -140,7 +162,7 @@ func (s *Store) hasColumn(table, col string) (bool, error) {
 func (s *Store) dropAll() error {
 	for _, t := range []string{
 		"items_fts", "scan_runs", "chain_items", "chains",
-		"item_tags", "tags", "items", "meta",
+		"item_vectors", "item_tags", "tags", "items", "meta",
 	} {
 		if _, err := s.db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 			return err
@@ -155,7 +177,9 @@ func (s *Store) dropAll() error {
 // scale the whole map is tiny, so change-detection needs zero per-file DB hits.
 func (s *Store) LoadIndex(ctx context.Context) (map[string]IndexRow, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT relpath,id,size,mtime,thumb_ready FROM items WHERE missing_since IS NULL`)
+		`SELECT relpath,id,size,mtime,thumb_ready,
+		        (SELECT 1 FROM item_vectors v WHERE v.item_id=items.id)
+		 FROM items WHERE missing_since IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -165,10 +189,12 @@ func (s *Store) LoadIndex(ctx context.Context) (map[string]IndexRow, error) {
 		var rp string
 		var r IndexRow
 		var thumb int64
-		if err := rows.Scan(&rp, &r.ID, &r.Size, &r.MTime, &thumb); err != nil {
+		var hasVec sql.NullInt64
+		if err := rows.Scan(&rp, &r.ID, &r.Size, &r.MTime, &thumb, &hasVec); err != nil {
 			return nil, err
 		}
 		r.ThumbReady = thumb != 0
+		r.HasVector = hasVec.Valid
 		out[rp] = r
 	}
 	return out, rows.Err()
@@ -207,6 +233,16 @@ RETURNING id`,
 		).Scan(&id)
 		if err != nil {
 			return fmt.Errorf("upsert %s: %w", it.Relpath, err)
+		}
+
+		if w.Vector != nil {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO item_vectors(item_id,dim,vec) VALUES(?,?,?)
+				 ON CONFLICT(item_id) DO UPDATE SET dim=excluded.dim, vec=excluded.vec`,
+				id, len(w.Vector), encodeVec(w.Vector)); err != nil {
+				return err
+			}
+			s.cacheVec(id, w.Vector)
 		}
 
 		// Sidecar is the source of truth for manual tags: clear this item's
@@ -797,4 +833,154 @@ func (s *Store) TopTags(ctx context.Context, limit int) ([]model.Tag, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// ---- perceptual similarity: brute-force cosine over cached signatures ----
+// No external vector DB: at personal-library scale a full scan of a few tens of
+// thousands of small vectors is a few milliseconds. Swap in an ANN index /
+// Qdrant only if the library grows into the millions.
+
+func encodeVec(v []float32) []byte {
+	b := make([]byte, 4*len(v))
+	for i, x := range v {
+		binary.LittleEndian.PutUint32(b[i*4:], math.Float32bits(x))
+	}
+	return b
+}
+
+func decodeVec(b []byte) []float32 {
+	v := make([]float32, len(b)/4)
+	for i := range v {
+		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return v
+}
+
+func (s *Store) cacheVec(id int64, v []float32) {
+	s.vecMu.Lock()
+	if s.vecs == nil {
+		s.vecs = make(map[int64][]float32)
+	}
+	s.vecs[id] = v
+	s.vecMu.Unlock()
+}
+
+func (s *Store) loadVecs(ctx context.Context) error {
+	s.vecMu.Lock()
+	defer s.vecMu.Unlock()
+	if s.vecInit {
+		return nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT item_id, vec FROM item_vectors`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	m := make(map[int64][]float32)
+	for rows.Next() {
+		var id int64
+		var b []byte
+		if err := rows.Scan(&id, &b); err != nil {
+			return err
+		}
+		m[id] = decodeVec(b)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for id, v := range s.vecs { // keep entries written before this load
+		m[id] = v
+	}
+	s.vecs = m
+	s.vecInit = true
+	return nil
+}
+
+// SimilarItems returns items whose perceptual signature is closest to the
+// seed's (cosine), most-similar first. Empty if the seed has no signature yet.
+func (s *Store) SimilarItems(ctx context.Context, relpath string, limit int) ([]model.Item, error) {
+	seed, err := s.ItemByRelpath(ctx, relpath)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.loadVecs(ctx); err != nil {
+		return nil, err
+	}
+
+	type cand struct {
+		id  int64
+		vec []float32
+	}
+	s.vecMu.Lock()
+	sv := s.vecs[seed.ID]
+	var cands []cand
+	if sv != nil {
+		cands = make([]cand, 0, len(s.vecs))
+		for id, v := range s.vecs {
+			if id != seed.ID {
+				cands = append(cands, cand{id, v})
+			}
+		}
+	}
+	s.vecMu.Unlock()
+	if sv == nil {
+		return nil, nil
+	}
+
+	type scored struct {
+		id    int64
+		score float64
+	}
+	all := make([]scored, 0, len(cands))
+	for _, c := range cands {
+		all = append(all, scored{c.id, media.Cosine(sv, c.vec)})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].score > all[j].score })
+	if len(all) > limit {
+		all = all[:limit]
+	}
+
+	ids := make([]int64, len(all))
+	for i, a := range all {
+		ids[i] = a.id
+	}
+	byID, err := s.ItemsByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.Item, 0, len(ids))
+	for _, id := range ids { // preserve similarity order
+		if it, ok := byID[id]; ok {
+			out = append(out, it)
+		}
+	}
+	return out, nil
+}
+
+// ItemsByIDs fetches present items by id (absent/missing ids omitted).
+func (s *Store) ItemsByIDs(ctx context.Context, ids []int64) (map[int64]model.Item, error) {
+	out := make(map[int64]model.Item, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	ph := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		ph[i] = "?"
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+itemCols+` FROM items WHERE missing_since IS NULL AND id IN (`+strings.Join(ph, ",")+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items, err := scanItems(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, it := range items {
+		out[it.ID] = it
+	}
+	return out, nil
 }

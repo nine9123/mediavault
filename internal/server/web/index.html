@@ -1185,36 +1185,43 @@
       renderSuggest();
     }).catch(function () {});
 
-    // "More like this": items sharing the most tags with this one. Clicking one
-    // opens the whole recommendation set as an arrow-navigable queue.
-    var rh = document.createElement("div"); rh.className = "k"; rh.textContent = "More like this";
-    el.card.appendChild(rh);
-    var recs = document.createElement("div"); recs.className = "recs";
-    el.card.appendChild(recs);
-    api("/api/recommend?path=" + encodeURIComponent(item.relpath) + "&limit=12").then(function (d) {
-      if (S.viewList[S.viewIndex] !== item) return;
-      var list = d.items || [];
-      if (list.length === 0) {
-        recs.className = "muted";
-        recs.textContent = manual.length + ai.length ? "No tag-based matches yet." : "Add tags to get recommendations.";
-        return;
-      }
-      list.forEach(function (r, idx) {
-        var cell = document.createElement("div");
-        cell.className = "rec";
-        cell.title = baseName(r.relpath);
-        if (r.thumb_ready) {
-          var im = document.createElement("img");
-          im.loading = "lazy"; im.src = r.thumb_url; im.alt = baseName(r.relpath);
-          cell.appendChild(im);
-        } else {
-          cell.className = "rec norec";
-          cell.textContent = r.type === "audio" ? "\u266a" : baseName(r.relpath);
+    // Thumbnail strips of related items. Clicking one opens the whole set as an
+    // arrow-navigable queue.
+    function stripSection(title, url, emptyMsg) {
+      var hh = document.createElement("div"); hh.className = "k"; hh.textContent = title;
+      el.card.appendChild(hh);
+      var box = document.createElement("div"); box.className = "recs";
+      el.card.appendChild(box);
+      api(url).then(function (d) {
+        if (S.viewList[S.viewIndex] !== item) return;
+        var list = d.items || [];
+        if (list.length === 0) {
+          box.className = "muted";
+          box.textContent = (typeof emptyMsg === "function") ? emptyMsg() : emptyMsg;
+          return;
         }
-        cell.addEventListener("click", function () { openQueue(list, idx, null); });
-        recs.appendChild(cell);
-      });
-    }).catch(function () { recs.className = "muted"; recs.textContent = "(couldn't load recommendations)"; });
+        list.forEach(function (r, idx) {
+          var cell = document.createElement("div"); cell.className = "rec"; cell.title = baseName(r.relpath);
+          if (r.thumb_ready) {
+            var im = document.createElement("img");
+            im.loading = "lazy"; im.src = r.thumb_url; im.alt = baseName(r.relpath);
+            cell.appendChild(im);
+          } else {
+            cell.className = "rec norec";
+            cell.textContent = r.type === "audio" ? "\u266a" : baseName(r.relpath);
+          }
+          cell.addEventListener("click", function () { openQueue(list, idx, null); });
+          box.appendChild(cell);
+        });
+      }).catch(function () { box.className = "muted"; box.textContent = "(couldn't load)"; });
+    }
+
+    stripSection("Looks similar",
+      "/api/similar?path=" + encodeURIComponent(item.relpath) + "&limit=12",
+      "No look-alikes yet \u2014 signatures are still being computed.");
+    stripSection("More like this (tags)",
+      "/api/recommend?path=" + encodeURIComponent(item.relpath) + "&limit=12",
+      function () { return (manual.length + ai.length) ? "No tag-based matches yet." : "Add tags to get recommendations."; });
   }
 
   function closeViewer() {

@@ -50,6 +50,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/random", s.handleRandom)
 	mux.HandleFunc("GET /api/recommend", s.handleRecommend)
+	mux.HandleFunc("GET /api/similar", s.handleSimilar)
 	mux.HandleFunc("POST /api/view", s.handleView)
 	mux.HandleFunc("POST /api/transcode", s.handleTranscode)
 	mux.HandleFunc("GET /api/transcode", s.handleTranscodeStatus)
@@ -214,6 +215,22 @@ func (s *Server) handleRandom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeItems(w, []model.Item{it})
+}
+
+// handleSimilar returns items that look perceptually similar to ?path=.
+func (s *Server) handleSimilar(w http.ResponseWriter, r *http.Request) {
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	if rel == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	limit := clampAtoi(r.URL.Query().Get("limit"), 24, 1, 100)
+	items, err := s.store.SimilarItems(r.Context(), rel, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeItems(w, items)
 }
 
 // handleRecommend returns items sharing the most tags with ?path=, best first.
