@@ -692,11 +692,12 @@
     }).catch(function () {});
   }
 
-  // Close from the X / Esc / backdrop: behave like Back so the entry is popped;
-  // if we were deep-linked straight onto an item (nothing to pop), drop the hash.
+  // Close from the X / Esc / backdrop: dismiss the viewer immediately and drop
+  // the item from the URL (back to the underlying grid/search). This is a real
+  // close, not a history step — browser Back still works separately via render().
   function userClose() {
-    if (history.state && history.state.mv) history.back();
-    else { replQuery(S.query); closeViewer(); }
+    closeViewer();
+    replQuery(S.query);
   }
 
   function applySearch(v, noHist) {
@@ -876,8 +877,9 @@
   // via loadOlder at the end.
   function openViewer(index, noHist) {
     if (index < 0 || index >= S.items.length) return;
+    var wasOpen = S.viewerOpen;
     S.viewKind = "grid"; S.viewList = S.items; S.viewMore = null;
-    if (!noHist) pushItem(S.items[index].relpath);
+    if (!noHist) { if (wasOpen) replItem(S.items[index].relpath); else pushItem(S.items[index].relpath); }
     showViewer(); showAt(index, true);
   }
 
@@ -886,8 +888,9 @@
   function openQueue(list, index, moreFn, noHist) {
     if (!list || !list.length) return;
     var idx = index || 0;
+    var wasOpen = S.viewerOpen;
     S.viewKind = "queue"; S.viewList = list; S.viewMore = moreFn || null;
-    if (!noHist) pushItem(list[idx].relpath);
+    if (!noHist) { if (wasOpen) replItem(list[idx].relpath); else pushItem(list[idx].relpath); }
     showViewer(); showAt(idx, true);
   }
 
