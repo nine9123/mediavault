@@ -1174,3 +1174,18 @@ func (s *Store) SemanticSearch(ctx context.Context, qvec []float32, typ string, 
 	}
 	return out, nil
 }
+
+// CaptionCounts reports captioning/embedding progress for the status UI:
+// how many present items are visual, how many are captioned, how many embedded.
+func (s *Store) CaptionCounts(ctx context.Context) (visual, captioned, embedded int, err error) {
+	if err = s.db.QueryRowContext(ctx, `
+		SELECT
+		  COALESCE(SUM(CASE WHEN width>0 THEN 1 ELSE 0 END),0),
+		  COALESCE(SUM(CASE WHEN width>0 AND description IS NOT NULL AND description!='' THEN 1 ELSE 0 END),0)
+		FROM items WHERE missing_since IS NULL`).Scan(&visual, &captioned); err != nil {
+		return
+	}
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM item_embeddings e JOIN items i ON i.id=e.item_id WHERE i.missing_since IS NULL`).Scan(&embedded)
+	return
+}

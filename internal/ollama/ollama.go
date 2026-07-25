@@ -85,3 +85,49 @@ func post(ctx context.Context, base, path string, payload, out any) error {
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
+
+// Models lists installed model names (GET /api/tags) — used for a startup
+// health check so a missing/mistyped model is obvious.
+func Models(ctx context.Context, cfg config.Config) ([]string, error) {
+	if cfg.OllamaURL == "" {
+		return nil, fmt.Errorf("OLLAMA_URL not set")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		strings.TrimRight(cfg.OllamaURL, "/")+"/api/tags", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, bytes.TrimSpace(b))
+	}
+	var out struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(out.Models))
+	for _, m := range out.Models {
+		names = append(names, m.Name)
+	}
+	return names, nil
+}
+
+// HasModel reports whether want matches an installed model, tolerating the
+// implicit ":latest" tag (want "llava" matches "llava:latest").
+func HasModel(models []string, want string) bool {
+	for _, m := range models {
+		if m == want || m == want+":latest" || strings.HasPrefix(m, want+":") {
+			return true
+		}
+	}
+	return false
+}

@@ -466,6 +466,14 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			"errors": st.Last.Errors,
 		}
 	}
+	if s.cfg.OllamaURL != "" {
+		if visual, captioned, embedded, err := s.store.CaptionCounts(r.Context()); err == nil {
+			resp["captions"] = map[string]any{
+				"visual": visual, "captioned": captioned,
+				"embeddings": s.cfg.OllamaEmbedModel != "", "embedded": embedded,
+			}
+		}
+	}
 	writeJSON(w, resp)
 }
 

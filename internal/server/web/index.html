@@ -801,6 +801,12 @@
       var txt = "<span class=\"n\">" + n + "</span> items";
       if (S.scanning) txt += " \u00b7 scanning\u2026";
       else if (st.last && st.last.added) txt += " \u00b7 +" + st.last.added + " last scan";
+      if (st.captions) {
+        var c = st.captions;
+        if (c.captioned < c.visual) txt += " \u00b7 captioning " + c.captioned.toLocaleString() + "/" + c.visual.toLocaleString();
+        else if (c.embeddings && c.embedded < c.captioned) txt += " \u00b7 embedding " + c.embedded.toLocaleString() + "/" + c.captioned.toLocaleString();
+        else if (c.visual > 0) txt += " \u00b7 captioned";
+      }
       el.readout.innerHTML = txt;
 
       // recover if the first load failed while the server was still starting

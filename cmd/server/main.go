@@ -14,6 +14,7 @@ import (
 
 	"mediavault/internal/config"
 	"mediavault/internal/describe"
+	"mediavault/internal/ollama"
 	"mediavault/internal/scan"
 	"mediavault/internal/server"
 	"mediavault/internal/store"
@@ -35,6 +36,22 @@ func main() {
 		} else {
 			log.Printf("captions: on — %s via %s (keyword; set OLLAMA_EMBED_MODEL for semantic search)", cfg.OllamaModel, cfg.OllamaURL)
 		}
+		go func() {
+			hctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			models, err := ollama.Models(hctx, cfg)
+			if err != nil {
+				log.Printf("ollama: NOT reachable at %s: %v — captions/search will be disabled until this resolves", cfg.OllamaURL, err)
+				return
+			}
+			log.Printf("ollama: reachable (%d models installed)", len(models))
+			if !ollama.HasModel(models, cfg.OllamaModel) {
+				log.Printf("ollama: WARNING vision model %q is not installed — run `ollama pull %s` on the server", cfg.OllamaModel, cfg.OllamaModel)
+			}
+			if cfg.OllamaEmbedModel != "" && !ollama.HasModel(models, cfg.OllamaEmbedModel) {
+				log.Printf("ollama: WARNING embedding model %q is not installed — run `ollama pull %s`", cfg.OllamaEmbedModel, cfg.OllamaEmbedModel)
+			}
+		}()
 	}
 
 	if err := os.MkdirAll(cfg.ThumbDir(), 0o755); err != nil {
