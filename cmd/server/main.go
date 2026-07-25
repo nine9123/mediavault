@@ -16,6 +16,7 @@ import (
 	"mediavault/internal/scan"
 	"mediavault/internal/server"
 	"mediavault/internal/store"
+	"mediavault/internal/transcode"
 )
 
 func main() {
@@ -52,9 +53,11 @@ func main() {
 		close(scanDone)
 	}()
 
+	tx := transcode.New(ctx, cfg)
+
 	srv := &http.Server{
 		Addr:    cfg.Addr,
-		Handler: server.New(cfg, st, scanner).Routes(),
+		Handler: server.New(cfg, st, scanner, tx).Routes(),
 	}
 
 	go func() {

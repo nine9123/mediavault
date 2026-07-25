@@ -20,6 +20,7 @@ import (
 	"mediavault/internal/scan"
 	"mediavault/internal/sidecar"
 	"mediavault/internal/store"
+	"mediavault/internal/transcode"
 )
 
 // The UI is compiled into the binary, so there's still just one artifact to
@@ -33,11 +34,12 @@ type Server struct {
 	cfg     config.Config
 	store   *store.Store
 	scanner *scan.Scanner
+	tx      *transcode.Transcoder
 }
 
 // New creates a Server.
-func New(cfg config.Config, st *store.Store, sc *scan.Scanner) *Server {
-	return &Server{cfg: cfg, store: st, scanner: sc}
+func New(cfg config.Config, st *store.Store, sc *scan.Scanner, tx *transcode.Transcoder) *Server {
+	return &Server{cfg: cfg, store: st, scanner: sc, tx: tx}
 }
 
 // Routes builds the router (Go 1.22 method+pattern matching).
@@ -49,6 +51,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/random", s.handleRandom)
 	mux.HandleFunc("GET /api/recommend", s.handleRecommend)
 	mux.HandleFunc("POST /api/view", s.handleView)
+	mux.HandleFunc("POST /api/transcode", s.handleTranscode)
+	mux.HandleFunc("GET /api/transcode", s.handleTranscodeStatus)
 	mux.HandleFunc("GET /api/item", s.handleItemDetail)
 	mux.HandleFunc("PUT /api/tags", s.handleSetTags)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
@@ -250,6 +254,26 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleTranscode starts an on-demand transcode (if needed) and returns status.
+func (s *Server) handleTranscode(w http.ResponseWriter, r *http.Request) {
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	if rel == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"status": s.tx.Request(rel)})
+}
+
+// handleTranscodeStatus reports transcode progress without starting work (poll).
+func (s *Server) handleTranscodeStatus(w http.ResponseWriter, r *http.Request) {
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	if rel == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"status": s.tx.Status(rel)})
+}
+
 // handleItemDetail returns one item plus its tags, for the viewer's catalog card.
 func (s *Server) handleItemDetail(w http.ResponseWriter, r *http.Request) {
 	rel := strings.TrimSpace(r.URL.Query().Get("path"))
@@ -417,22 +441,9 @@ func contain(root, rel string) (string, bool) {
 	return abs, true
 }
 
-// derivedFor returns a browser-friendly derived file for rel if DerivedDir is
-// configured and one exists there (named "<rel>.<ext>").
+// derivedFor returns a browser-friendly derived file for rel if one exists.
 func (s *Server) derivedFor(rel string) (string, bool) {
-	if s.cfg.DerivedDir == "" {
-		return "", false
-	}
-	base, ok := contain(s.cfg.DerivedDir, rel)
-	if !ok {
-		return "", false
-	}
-	for _, suf := range []string{".mp4", ".webm", ".m4v", ".jpg", ".jpeg", ".webp", ".png", ".mp3", ".m4a", ".ogg", ".oga"} {
-		if fi, err := os.Stat(base + suf); err == nil && !fi.IsDir() {
-			return base + suf, true
-		}
-	}
-	return "", false
+	return transcode.DerivedPath(s.cfg, rel)
 }
 
 // ---- helpers ----

@@ -193,6 +193,21 @@ To make those play/show in-browser, generate browser-friendly copies into a
 separate writable directory (`DERIVED_DIR`) and mediavault will serve the derived
 file whenever one exists. Your original archive is never touched.
 
+**On-demand (automatic):** when the browser fails to play a video or audio file
+and `DERIVED_DIR` is set, mediavault transcodes it in the background (one job at
+a time) and swaps it in when ready — the viewer shows a "Converting…" spinner
+meanwhile. So opening an unplayable file just works after a short wait
+(remuxable files are near-instant; re-encodes take longer). The result is cached
+in `DERIVED_DIR`, so it's instant next time.
+
+**Batch (optional):** to convert everything up front instead of waiting on first
+open, run the bundled script (below).
+
+Note: `DERIVED_DIR` is a **named Docker volume** (`mediavault-derived`) by
+default, so derived files live in Docker's storage, not a host folder — inspect
+them with `docker compose exec mediavault ls -R /derived`. If you'd rather manage
+them on the host, change that volume to a bind mount in docker-compose.yml.
+
 ```bash
 # from the repo, pointing at your real media + a writable output dir
 MEDIA_ROOT=/mnt/nas/media DERIVED_DIR=/mnt/nas/derived ./scripts/transcode.sh

@@ -285,6 +285,11 @@
   .unplayable p.sub{color:var(--bone-faint);font-size:.8rem;word-break:break-all}
   .unplayable a{margin-top:.4rem;color:var(--brass);text-decoration:none;font-family:var(--mono);font-size:.8rem;border:1px solid var(--brass-soft);padding:.5rem .9rem;border-radius:2px}
   .unplayable a:hover{background:var(--brass);color:var(--ink)}
+  .converting{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:3rem 1.5rem;text-align:center;color:var(--bone)}
+  .converting p{margin:0;font-family:var(--mono);font-size:.9rem;letter-spacing:.02em}
+  .converting p.sub{color:var(--bone-faint);font-size:.8rem}
+  .converting .spin{width:34px;height:34px;border:3px solid var(--ink-line-2);border-top-color:var(--brass);border-radius:50%;animation:mvspin .8s linear infinite}
+  @keyframes mvspin{to{transform:rotate(360deg)}}
   .audio{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;padding:24px}
   .audio .cover{max-width:min(70vw,480px);max-height:min(60vh,480px);width:auto;height:auto;object-fit:contain;border:1px solid var(--ink-line);box-shadow:0 8px 30px rgba(0,0,0,.5)}
   .audio .cover.noart{display:flex;align-items:center;justify-content:center;width:min(60vw,320px);height:min(60vw,320px);max-height:40vh;background:var(--ink-raised);color:var(--bone-faint);font-size:5rem;line-height:1}
@@ -756,7 +761,8 @@
     document.body.style.overflow = "hidden";
   }
 
-  var viewTimer = null, slideTimer = null;
+  var viewTimer = null, slideTimer = null, txPoll = null, txTried = {};
+  function stopTxPoll() { if (txPoll) { clearInterval(txPoll); txPoll = null; } }
   // Record a "view" only after the item has been on screen ~1s, so flipping
   // past items with the arrows doesn't inflate the popularity counts.
   function scheduleView(item) {
@@ -783,6 +789,7 @@
 
   function showAt(i) {
     if (i < 0 || i >= S.viewList.length) return;
+    stopTxPoll();
     S.viewIndex = i;
     renderStage();
     renderCard();
@@ -814,10 +821,52 @@
 
   function clearStage() {
     el.stage.querySelectorAll("video, audio").forEach(stopMedia);
-    el.stage.querySelectorAll("img, video, audio, .audio, .unplayable").forEach(function (n) { n.remove(); });
+    el.stage.querySelectorAll("img, video, audio, .audio, .unplayable, .converting").forEach(function (n) { n.remove(); });
+  }
+
+  // On a playback error, ask the server to transcode this file into a
+  // browser-friendly copy, show a progress state, and swap it in when ready.
+  function tryConvert(item, node) {
+    if (txTried[item.relpath]) { showUnplayable(item, node); return; } // converted already, still failing
+    fetch("/api/transcode?path=" + encodeURIComponent(item.relpath), { method: "POST" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { handleTxStatus(item, node, d && d.status); })
+      .catch(function () { showUnplayable(item, node); });
+  }
+
+  function handleTxStatus(item, node, status) {
+    if (S.viewList[S.viewIndex] !== item) return; // navigated away
+    if (status === "ready") { txTried[item.relpath] = true; renderStage(); return; }
+    if (status !== "working") { showUnplayable(item, node); return; } // unavailable / error / none
+    showConverting(item, node);
+    stopTxPoll();
+    txPoll = setInterval(function () {
+      if (!S.viewerOpen || S.viewList[S.viewIndex] !== item) { stopTxPoll(); return; }
+      fetch("/api/transcode?path=" + encodeURIComponent(item.relpath))
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          var st = d && d.status;
+          if (st === "ready") { stopTxPoll(); txTried[item.relpath] = true; if (S.viewList[S.viewIndex] === item) renderStage(); }
+          else if (st === "error" || st === "unavailable" || st === "none") { stopTxPoll(); if (S.viewList[S.viewIndex] === item) showUnplayable(item, null); }
+        }).catch(function () {});
+    }, 2000);
+  }
+
+  function showConverting(item, node) {
+    if (node && node.parentNode) { stopMedia(node); node.remove(); }
+    clearStage();
+    var box = document.createElement("div");
+    box.className = "converting";
+    var sp = document.createElement("div"); sp.className = "spin";
+    var p = document.createElement("p"); p.textContent = "Converting for your browser\u2026";
+    var sub = document.createElement("p"); sub.className = "sub"; sub.textContent = "First time only \u2014 large videos can take a while.";
+    box.appendChild(sp); box.appendChild(p); box.appendChild(sub);
+    el.stage.insertBefore(box, el.stage.firstChild);
   }
 
   function showUnplayable(item, node) {
+    var conv = el.stage.querySelector(".converting");
+    if (conv) conv.remove();
     if (node) {
       if (node.querySelectorAll) node.querySelectorAll("video, audio").forEach(stopMedia);
       if (node.tagName === "VIDEO" || node.tagName === "AUDIO") stopMedia(node);
@@ -854,7 +903,7 @@
       media.autoplay = true;
       media.playsInline = true;
       media.preload = "metadata";
-      media.addEventListener("error", function () { showUnplayable(item, media); });
+      media.addEventListener("error", function () { tryConvert(item, media); });
       media.addEventListener("ended", onMediaEnded);
     } else if (item.type === "audio") {
       media = document.createElement("div");
@@ -876,7 +925,7 @@
       audio.controls = true;
       audio.autoplay = true;
       audio.preload = "metadata";
-      audio.addEventListener("error", function () { showUnplayable(item, media); });
+      audio.addEventListener("error", function () { tryConvert(item, media); });
       audio.addEventListener("ended", onMediaEnded);
       media.appendChild(audio);
     } else {
@@ -1064,6 +1113,7 @@
   function closeViewer() {
     clearTimeout(viewTimer);
     clearTimeout(slideTimer);
+    stopTxPoll();
     clearStage();
     el.viewer.classList.remove("open");
     el.viewer.setAttribute("aria-hidden", "true");
