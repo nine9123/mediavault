@@ -1,16 +1,19 @@
 # syntax=docker/dockerfile:1
 
 # ---- build stage ----
-# A newer toolchain than the module's `go 1.22` directive gives headroom in
-# case `go mod tidy` resolves a dependency that wants a higher Go; newer Go
-# builds older-declared modules fine.
-FROM golang:1.24-bookworm AS build
+# modernc.org/sqlite tracks recent Go releases, so its latest version can need a
+# newer Go than whatever base tag we pin. GOTOOLCHAIN=auto lets the build pull
+# the exact toolchain the resolved dependency asks for, so this won't break the
+# next time that dependency bumps its minimum Go. (golang:1.25 already satisfies
+# the current requirement; auto only kicks in if a future version needs more.)
+FROM golang:1.25-bookworm AS build
+ENV GOTOOLCHAIN=auto
 WORKDIR /src
 
-# This repo ships without go.sum. Copy the source and let `go mod tidy` resolve
-# the one dependency (modernc.org/sqlite) + its indirects from the import graph,
-# writing go.mod/go.sum inside the build. The cache mounts keep the module cache
-# and build cache warm across rebuilds, so this is only slow the first time.
+# Ships without go.sum: copy the source and let `go mod tidy` resolve the one
+# dependency (modernc.org/sqlite) + indirects from the import graph, writing
+# go.mod/go.sum inside the build. Cache mounts keep the module + build caches
+# warm across rebuilds, so this is only slow the first time.
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
