@@ -295,6 +295,19 @@
   .recs .rec img{width:100%;height:100%;object-fit:cover;display:block}
   .recs .rec:hover{border-color:var(--brass)}
   .recs .rec.norec{display:flex;align-items:center;justify-content:center;font-size:.6rem;color:var(--bone-faint);padding:4px;text-align:center;word-break:break-all}
+  .vtools{position:absolute;top:12px;left:12px;display:flex;align-items:center;gap:10px;z-index:6}
+  .vbtn{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--bone);background:rgba(20,18,16,.72);border:1px solid var(--ink-line);border-radius:2px;padding:.4rem .7rem;cursor:pointer;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+  .vbtn:hover{border-color:var(--brass);color:var(--brass)}
+  .vtoggle{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.72rem;letter-spacing:.03em;color:var(--bone-dim);background:rgba(20,18,16,.72);border:1px solid var(--ink-line);border-radius:2px;padding:.35rem .6rem;cursor:pointer;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);user-select:none}
+  .vtoggle input{accent-color:var(--brass);cursor:pointer;margin:0}
+  .btn.ghost{padding:.4rem .65rem;min-width:0;font-weight:700}
+  .qhint{position:fixed;z-index:30;top:56px;left:16px;right:16px;max-width:640px;margin:0 auto;background:var(--ink-raised);border:1px solid var(--ink-line-2);border-radius:4px;padding:14px 16px;box-shadow:0 12px 40px rgba(0,0,0,.5);font-size:.82rem;line-height:1.55;color:var(--bone-dim)}
+  .qhint p{margin:0 0 8px}
+  .qhint p:last-child{margin-bottom:0}
+  .qhint b{color:var(--bone)}
+  .qhint code{font-family:var(--mono);font-size:.78rem;color:var(--brass);background:rgba(217,164,65,.08);padding:.05rem .3rem;border-radius:2px}
+  .qhint .qex{font-family:var(--mono);font-size:.75rem;color:var(--brass);background:none;border:1px solid var(--brass-soft);border-radius:2px;padding:.15rem .45rem;margin:0 .12rem;cursor:pointer}
+  .qhint .qex:hover{background:var(--brass);color:var(--ink)}
 </style>
 </head>
 <body>
@@ -306,10 +319,22 @@
       </svg>
       <input id="q" type="search" placeholder="Search files and tags" autocomplete="off" spellcheck="false" aria-label="Search files and tags">
     </label>
+    <button class="btn ghost" id="qhelp" type="button" title="Search help" aria-label="Search help">?</button>
     <span class="readout" id="readout"><span class="n">—</span> items</span>
     <button class="btn" id="random" title="Open a random item — then arrow through more">Random</button>
     <button class="btn" id="rescan">Rescan</button>
   </header>
+
+  <div class="qhint hidden" id="qhint">
+    <p><b>Search</b> matches file names and tags. Multiple words must <b>all</b> match, and every term is a prefix — <code>land</code> finds <code>landscape</code>.</p>
+    <p>Namespaced tags: type the name, or the full <code>ns:name</code> (e.g. <code>artist:jane</code>). Click any tag in the viewer to search it.</p>
+    <p>Filter by kind, alone or with terms (e.g. <code>type:video cat</code>):
+      <button class="qex" data-q="type:image" type="button">type:image</button>
+      <button class="qex" data-q="type:video" type="button">type:video</button>
+      <button class="qex" data-q="type:audio" type="button">type:audio</button>
+      <button class="qex" data-q="type:gif" type="button">type:gif</button>
+    </p>
+  </div>
 
   <main class="sheet">
     <div class="grid" id="grid"></div>
@@ -323,6 +348,10 @@
     <div class="stage" id="stage">
       <button class="nav prev" id="prev" aria-label="Previous">&#8249;</button>
       <button class="nav next" id="next" aria-label="Next">&#8250;</button>
+      <div class="vtools">
+        <button class="vbtn" id="vrandom" type="button">Random</button>
+        <label class="vtoggle" title="When a video/track ends, advance to the next item"><input type="checkbox" id="autonext"> Autoplay next</label>
+      </div>
       <button class="close" id="close" aria-label="Close">&times;</button>
     </div>
     <aside class="card" id="card"></aside>
@@ -348,6 +377,7 @@
     viewList: null,     // items the viewer is paging through
     viewKind: "grid",   // "grid" (the loaded grid) | "queue" (random/recommend)
     viewMore: null,     // for a queue: fn -> Promise<item|null> to extend on next
+    autoNext: false,    // auto-advance when a video/track ends
     scanning: false
   };
 
@@ -365,7 +395,11 @@
     card: document.getElementById("card"),
     prev: document.getElementById("prev"),
     next: document.getElementById("next"),
-    close: document.getElementById("close")
+    close: document.getElementById("close"),
+    vrandom: document.getElementById("vrandom"),
+    autonext: document.getElementById("autonext"),
+    qhelp: document.getElementById("qhelp"),
+    qhint: document.getElementById("qhint")
   };
 
   function api(path) {
@@ -587,15 +621,36 @@
   window.addEventListener("resize", fillViewport);
 
   // search (debounced)
+  function applySearch(v) {
+    v = (v || "").trim();
+    S.query = v;
+    if (v === "") { S.mode = "browse"; reset(); loadInitial().then(fillViewport); }
+    else { S.mode = "search"; reset(); runSearch(); }
+  }
   var searchTimer = null;
   el.q.addEventListener("input", function () {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(function () {
-      var v = el.q.value.trim();
-      S.query = v;
-      if (v === "") { S.mode = "browse"; reset(); loadInitial().then(fillViewport); }
-      else { S.mode = "search"; reset(); runSearch(); }
-    }, 250);
+    searchTimer = setTimeout(function () { applySearch(el.q.value); }, 250);
+  });
+
+  // search-syntax help panel
+  el.qhelp.addEventListener("click", function (e) {
+    e.stopPropagation();
+    el.qhint.classList.toggle("hidden");
+  });
+  el.qhint.addEventListener("click", function (e) {
+    var b = e.target.closest(".qex");
+    if (!b) return;
+    var q = b.getAttribute("data-q");
+    el.q.value = q;
+    applySearch(q);
+    el.qhint.classList.add("hidden");
+    el.q.focus();
+  });
+  document.addEventListener("click", function (e) {
+    if (!el.qhint.classList.contains("hidden") && !el.qhint.contains(e.target) && e.target !== el.qhelp) {
+      el.qhint.classList.add("hidden");
+    }
   });
 
   // rescan
@@ -606,11 +661,24 @@
     var url = "/api/random" + (q ? "?q=" + encodeURIComponent(q) : "");
     return api(url).then(function (d) { return (d.items && d.items[0]) || null; });
   }
+  function startRandom() {
+    return fetchRandom().then(function (item) { if (item) openQueue([item], 0, fetchRandom); });
+  }
   el.random.addEventListener("click", function () {
     el.random.disabled = true;
-    fetchRandom().then(function (item) {
-      if (item) openQueue([item], 0, fetchRandom);
-    }).catch(function () {}).finally(function () { el.random.disabled = false; });
+    startRandom().catch(function () {}).finally(function () { el.random.disabled = false; });
+  });
+  el.vrandom.addEventListener("click", function () {
+    el.vrandom.disabled = true;
+    startRandom().catch(function () {}).finally(function () { el.vrandom.disabled = false; });
+  });
+
+  // auto-play-next preference (persisted in the browser)
+  try { S.autoNext = localStorage.getItem("mv.autoplayNext") === "1"; } catch (e) {}
+  el.autonext.checked = S.autoNext;
+  el.autonext.addEventListener("change", function () {
+    S.autoNext = el.autonext.checked;
+    try { localStorage.setItem("mv.autoplayNext", S.autoNext ? "1" : "0"); } catch (e) {}
   });
 
   el.rescan.addEventListener("click", function () {
@@ -730,6 +798,8 @@
     el.stage.insertBefore(box, el.stage.firstChild);
   }
 
+  function onMediaEnded() { if (S.autoNext) navigate(1); }
+
   function renderStage() {
     var item = S.viewList[S.viewIndex];
     clearStage();
@@ -743,6 +813,7 @@
       media.playsInline = true;
       media.preload = "metadata";
       media.addEventListener("error", function () { showUnplayable(item, media); });
+      media.addEventListener("ended", onMediaEnded);
     } else if (item.type === "audio") {
       media = document.createElement("div");
       media.className = "audio";
@@ -764,6 +835,7 @@
       audio.autoplay = true;
       audio.preload = "metadata";
       audio.addEventListener("error", function () { showUnplayable(item, media); });
+      audio.addEventListener("ended", onMediaEnded);
       media.appendChild(audio);
     } else {
       media = document.createElement("img");

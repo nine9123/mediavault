@@ -152,8 +152,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeItems(w, nil)
 		return
 	}
+	text, typ := splitTypeFilter(q)
 	limit := clampAtoi(r.URL.Query().Get("limit"), 200, 1, 500)
-	items, err := s.store.SearchItems(r.Context(), q, limit)
+	items, err := s.store.SearchItems(r.Context(), text, typ, limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -161,11 +162,44 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	writeItems(w, items)
 }
 
-// handleRandom returns a single random item (respecting the ?q= filter if
-// given), wrapped like /api/items so the client just reads items[0].
+// splitTypeFilter pulls "type:<kind>" tokens out of a search query, returning
+// the remaining text and a canonical media type ("" if none). Unrecognized
+// type words are left in the text.
+func splitTypeFilter(q string) (text, typ string) {
+	fields := strings.Fields(q)
+	kept := fields[:0]
+	for _, f := range fields {
+		low := strings.ToLower(f)
+		if strings.HasPrefix(low, "type:") {
+			if t, ok := canonType(low[len("type:"):]); ok {
+				typ = t
+				continue
+			}
+		}
+		kept = append(kept, f)
+	}
+	return strings.Join(kept, " "), typ
+}
+
+func canonType(s string) (string, bool) {
+	switch s {
+	case "image", "img", "images", "photo", "photos", "pic", "pics", "still", "stills":
+		return string(model.MediaImage), true
+	case "video", "videos", "vid", "vids", "movie", "movies":
+		return string(model.MediaVideo), true
+	case "audio", "music", "sound", "song", "songs":
+		return string(model.MediaAudio), true
+	case "gif", "gifs", "animated", "animation", "anim":
+		return string(model.MediaAnimated), true
+	}
+	return "", false
+}
+
+// handleRandom returns a single random item (respecting the ?q= filter, which
+// may include a type: token), wrapped like /api/items so the client reads items[0].
 func (s *Server) handleRandom(w http.ResponseWriter, r *http.Request) {
-	q := strings.TrimSpace(r.URL.Query().Get("q"))
-	it, ok, err := s.store.RandomItem(r.Context(), q)
+	text, typ := splitTypeFilter(strings.TrimSpace(r.URL.Query().Get("q")))
+	it, ok, err := s.store.RandomItem(r.Context(), text, typ)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

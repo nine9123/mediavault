@@ -273,3 +273,21 @@ View counts live in the cache DB (added by a non-destructive migration, so your
 existing thumbnails/index are preserved on upgrade). They persist across
 restarts but, unlike tags, are not written to sidecars — so a deliberate full DB
 wipe resets them. Tell me if you'd rather they be durable and I'll sidecar them.
+
+## Search filters & playback controls
+
+**Filter by type** from the search box with a `type:` token: `type:video`,
+`type:image`, `type:audio`, or `type:gif` (a few synonyms like `photo`/`music`
+work too). Use it alone (`type:video` → all videos) or with terms
+(`type:video beach`). The **?** button next to the search box opens a short
+syntax cheatsheet with clickable type filters.
+
+**Random** also lives inside the viewer, not just the header — and it respects
+the active search/type filter, so `type:video` + Random gives random videos.
+
+**Autoplay next** (toggle in the viewer) advances to the next item when a video
+or track finishes; the choice is remembered in your browser. Combined with a
+`type:video` Random, it becomes continuous random video playback. Note: it
+advances to the next *item* — if that's an image it just displays (images have
+no "ended" event to chain from), and browsers may require the video be muted to
+auto-start without a fresh click.

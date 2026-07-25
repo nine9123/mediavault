@@ -339,22 +339,39 @@ func (s *Store) ListItems(ctx context.Context, limit, offset int) ([]model.Item,
 }
 
 // SearchItems runs an FTS5 query over path + tags.
-func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]model.Item, error) {
-	match := ftsQuery(q)
-	if match == "" {
-		return nil, nil // nothing searchable in the query
+// SearchItems runs the tag/filename FTS search, optionally constrained to a
+// media type (typ empty = any). With empty text but a type, it lists items of
+// that type; with both empty it returns nothing.
+func (s *Store) SearchItems(ctx context.Context, text, typ string, limit int) ([]model.Item, error) {
+	if match := ftsQuery(text); match != "" {
+		q := `SELECT ` + prefixCols("i") + `
+			FROM items_fts f JOIN items i ON i.id = f.rowid
+			WHERE items_fts MATCH ? AND i.missing_since IS NULL`
+		args := []any{match}
+		if typ != "" {
+			q += ` AND i.type = ?`
+			args = append(args, typ)
+		}
+		q += ` ORDER BY f.rank LIMIT ?`
+		args = append(args, limit)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanItems(rows)
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+prefixCols("i")+`
-		FROM items_fts f JOIN items i ON i.id = f.rowid
-		WHERE items_fts MATCH ? AND i.missing_since IS NULL
-		ORDER BY f.rank
-		LIMIT ?`, match, limit)
-	if err != nil {
-		return nil, err
+	if typ != "" {
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT `+itemCols+` FROM items WHERE type = ? AND missing_since IS NULL
+			 ORDER BY indexed_at DESC, id DESC LIMIT ?`, typ, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanItems(rows)
 	}
-	defer rows.Close()
-	return scanItems(rows)
+	return nil, nil
 }
 
 // ItemByRelpath fetches a single item (used by the raw/thumb endpoints).
@@ -661,23 +678,31 @@ func (s *Store) SetManualTags(ctx context.Context, relpath string, tags []model.
 // RandomItem returns one present item at random. If q is non-empty it draws
 // only from items matching that search query (so "random" respects a filter).
 // found is false when there's nothing to pick (empty library or no matches).
-func (s *Store) RandomItem(ctx context.Context, q string) (item model.Item, found bool, err error) {
+// RandomItem returns one present item at random. text (FTS) and typ (media
+// type) optionally constrain the pool, so "random" can respect an active
+// search/type filter. found is false when nothing matches.
+func (s *Store) RandomItem(ctx context.Context, text, typ string) (item model.Item, found bool, err error) {
 	var rows *sql.Rows
-	if q != "" {
-		match := ftsQuery(q)
-		if match == "" {
-			return model.Item{}, false, nil
-		}
-		rows, err = s.db.QueryContext(ctx, `
-			SELECT `+prefixCols("i")+`
+	switch {
+	case ftsQuery(text) != "":
+		q := `SELECT ` + prefixCols("i") + `
 			FROM items_fts f JOIN items i ON i.id = f.rowid
-			WHERE items_fts MATCH ? AND i.missing_since IS NULL
-			ORDER BY RANDOM() LIMIT 1`, match)
-	} else {
-		rows, err = s.db.QueryContext(ctx, `
-			SELECT `+itemCols+` FROM items
-			WHERE missing_since IS NULL
-			ORDER BY RANDOM() LIMIT 1`)
+			WHERE items_fts MATCH ? AND i.missing_since IS NULL`
+		args := []any{ftsQuery(text)}
+		if typ != "" {
+			q += ` AND i.type = ?`
+			args = append(args, typ)
+		}
+		q += ` ORDER BY RANDOM() LIMIT 1`
+		rows, err = s.db.QueryContext(ctx, q, args...)
+	case typ != "":
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT `+itemCols+` FROM items WHERE type = ? AND missing_since IS NULL
+			 ORDER BY RANDOM() LIMIT 1`, typ)
+	default:
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT `+itemCols+` FROM items WHERE missing_since IS NULL
+			 ORDER BY RANDOM() LIMIT 1`)
 	}
 	if err != nil {
 		return model.Item{}, false, err
