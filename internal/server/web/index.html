@@ -290,6 +290,11 @@
   .audio .cover.noart{display:flex;align-items:center;justify-content:center;width:min(60vw,320px);height:min(60vw,320px);max-height:40vh;background:var(--ink-raised);color:var(--bone-faint);font-size:5rem;line-height:1}
   .audio audio{width:min(90vw,560px)}
   .noprev.note{font-size:2rem;color:var(--bone-faint)}
+  .recs{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:6px;margin-top:6px}
+  .recs .rec{position:relative;aspect-ratio:1/1;overflow:hidden;background:var(--ink-raised);border:1px solid var(--ink-line);cursor:pointer}
+  .recs .rec img{width:100%;height:100%;object-fit:cover;display:block}
+  .recs .rec:hover{border-color:var(--brass)}
+  .recs .rec.norec{display:flex;align-items:center;justify-content:center;font-size:.6rem;color:var(--bone-faint);padding:4px;text-align:center;word-break:break-all}
 </style>
 </head>
 <body>
@@ -302,6 +307,7 @@
       <input id="q" type="search" placeholder="Search files and tags" autocomplete="off" spellcheck="false" aria-label="Search files and tags">
     </label>
     <span class="readout" id="readout"><span class="n">—</span> items</span>
+    <button class="btn" id="random" title="Open a random item — then arrow through more">Random</button>
     <button class="btn" id="rescan">Rescan</button>
   </header>
 
@@ -339,6 +345,9 @@
     busyNewer: false,
     viewIndex: -1,
     viewerOpen: false,
+    viewList: null,     // items the viewer is paging through
+    viewKind: "grid",   // "grid" (the loaded grid) | "queue" (random/recommend)
+    viewMore: null,     // for a queue: fn -> Promise<item|null> to extend on next
     scanning: false
   };
 
@@ -350,6 +359,7 @@
     safelight: document.getElementById("safelight"),
     q: document.getElementById("q"),
     rescan: document.getElementById("rescan"),
+    random: document.getElementById("random"),
     viewer: document.getElementById("viewer"),
     stage: document.getElementById("stage"),
     card: document.getElementById("card"),
@@ -589,6 +599,20 @@
   });
 
   // rescan
+  // random: open a random item (respecting the active search filter), then let
+  // the viewer arrows pull further randoms — a lean-back shuffle.
+  function fetchRandom() {
+    var q = (S.mode === "search") ? S.query : "";
+    var url = "/api/random" + (q ? "?q=" + encodeURIComponent(q) : "");
+    return api(url).then(function (d) { return (d.items && d.items[0]) || null; });
+  }
+  el.random.addEventListener("click", function () {
+    el.random.disabled = true;
+    fetchRandom().then(function (item) {
+      if (item) openQueue([item], 0, fetchRandom);
+    }).catch(function () {}).finally(function () { el.random.disabled = false; });
+  });
+
   el.rescan.addEventListener("click", function () {
     el.rescan.disabled = true;
     fetch("/api/scan", { method: "POST" }).catch(function () {}).finally(function () {
@@ -629,15 +653,34 @@
   }
 
   // ---- viewer ----
-  function openViewer(index) {
-    if (index < 0 || index >= S.items.length) return;
-    S.viewIndex = index;
+  function showViewer() {
     S.viewerOpen = true;
-    renderStage();
-    renderCard();
     el.viewer.classList.add("open");
     el.viewer.setAttribute("aria-hidden", "false");
     document.body.style.overflow = "hidden";
+  }
+
+  function showAt(i) {
+    if (i < 0 || i >= S.viewList.length) return;
+    S.viewIndex = i;
+    renderStage();
+    renderCard();
+  }
+
+  // Open from the grid: the viewer pages through the live grid array, extending
+  // via loadOlder at the end.
+  function openViewer(index) {
+    if (index < 0 || index >= S.items.length) return;
+    S.viewKind = "grid"; S.viewList = S.items; S.viewMore = null;
+    showViewer(); showAt(index);
+  }
+
+  // Open a standalone sequence (random shuffle / recommendations). moreFn, if
+  // given, is called when paging past the end to append another item.
+  function openQueue(list, index, moreFn) {
+    if (!list || !list.length) return;
+    S.viewKind = "queue"; S.viewList = list; S.viewMore = moreFn || null;
+    showViewer(); showAt(index || 0);
   }
 
   function stopMedia(n) {
@@ -657,7 +700,7 @@
       if (node.tagName === "VIDEO" || node.tagName === "AUDIO") stopMedia(node);
       if (node.parentNode) node.remove();
     }
-    if (S.items[S.viewIndex] !== item || el.stage.querySelector(".unplayable")) return;
+    if (S.viewList[S.viewIndex] !== item || el.stage.querySelector(".unplayable")) return;
     var box = document.createElement("div");
     box.className = "unplayable";
     var p = document.createElement("p");
@@ -675,7 +718,7 @@
   }
 
   function renderStage() {
-    var item = S.items[S.viewIndex];
+    var item = S.viewList[S.viewIndex];
     clearStage();
 
     var media;
@@ -718,7 +761,9 @@
     el.stage.insertBefore(media, el.stage.firstChild);
 
     el.prev.style.visibility = S.viewIndex > 0 ? "visible" : "hidden";
-    var hasNext = S.viewIndex < S.items.length - 1 || !S.doneOlder;
+    var hasNext;
+    if (S.viewKind === "grid") hasNext = S.viewIndex < S.items.length - 1 || !S.doneOlder;
+    else hasNext = S.viewIndex < S.viewList.length - 1 || !!S.viewMore;
     el.next.style.visibility = hasNext ? "visible" : "hidden";
   }
 
@@ -732,7 +777,7 @@
   }
 
   function renderCard() {
-    var item = S.items[S.viewIndex];
+    var item = S.viewList[S.viewIndex];
     el.card.innerHTML = "";
     var h = document.createElement("h2");
     h.textContent = "Catalog";
@@ -826,7 +871,7 @@
 
     var saving = false, again = false;
     function save() {
-      if (S.items[S.viewIndex] !== item) return; // navigated away; don't clobber
+      if (S.viewList[S.viewIndex] !== item) return; // navigated away; don't clobber
       if (saving) { again = true; return; }       // coalesce rapid edits
       saving = true; note.textContent = "saving\u2026";
       fetch("/api/tags", {
@@ -848,13 +893,44 @@
     }
 
     api("/api/item?path=" + encodeURIComponent(item.relpath)).then(function (d) {
-      if (S.items[S.viewIndex] !== item) return; // user moved on
+      if (S.viewList[S.viewIndex] !== item) return; // user moved on
       (d.tags || []).forEach(function (t) {
         if (t.source === "ai") ai.push({ namespace: t.namespace, name: t.name });
         else manual.push(tagStr(t));
       });
       renderChips();
     }).catch(function () { note.textContent = "(couldn't load tags)"; });
+
+    // "More like this": items sharing the most tags with this one. Clicking one
+    // opens the whole recommendation set as an arrow-navigable queue.
+    var rh = document.createElement("div"); rh.className = "k"; rh.textContent = "More like this";
+    el.card.appendChild(rh);
+    var recs = document.createElement("div"); recs.className = "recs";
+    el.card.appendChild(recs);
+    api("/api/recommend?path=" + encodeURIComponent(item.relpath) + "&limit=12").then(function (d) {
+      if (S.viewList[S.viewIndex] !== item) return;
+      var list = d.items || [];
+      if (list.length === 0) {
+        recs.className = "muted";
+        recs.textContent = manual.length + ai.length ? "No tag-based matches yet." : "Add tags to get recommendations.";
+        return;
+      }
+      list.forEach(function (r, idx) {
+        var cell = document.createElement("div");
+        cell.className = "rec";
+        cell.title = baseName(r.relpath);
+        if (r.thumb_ready) {
+          var im = document.createElement("img");
+          im.loading = "lazy"; im.src = r.thumb_url; im.alt = baseName(r.relpath);
+          cell.appendChild(im);
+        } else {
+          cell.className = "rec norec";
+          cell.textContent = r.type === "audio" ? "\u266a" : baseName(r.relpath);
+        }
+        cell.addEventListener("click", function () { openQueue(list, idx, null); });
+        recs.appendChild(cell);
+      });
+    }).catch(function () { recs.className = "muted"; recs.textContent = "(couldn't load recommendations)"; });
   }
 
   function closeViewer() {
@@ -868,13 +944,25 @@
   function navigate(delta) {
     var n = S.viewIndex + delta;
     if (n < 0) return;
-    if (n >= S.items.length) {
-      if (S.mode === "search" || S.doneOlder) return;
-      var p = loadOlder();
-      if (p) p.then(function () { if (n < S.items.length) openViewer(n); });
+
+    if (S.viewKind === "grid") {
+      if (n >= S.items.length) {
+        if (S.mode === "search" || S.doneOlder) return;
+        var p = loadOlder();
+        if (p) p.then(function () { if (n < S.items.length) showAt(n); });
+        return;
+      }
+      showAt(n);
       return;
     }
-    openViewer(n);
+
+    // queue (random / recommendations)
+    if (n < S.viewList.length) { showAt(n); return; }
+    if (delta > 0 && S.viewMore) {
+      S.viewMore().then(function (item) {
+        if (item) { S.viewList.push(item); showAt(S.viewList.length - 1); }
+      });
+    }
   }
 
   el.prev.addEventListener("click", function (e) { e.stopPropagation(); navigate(-1); });

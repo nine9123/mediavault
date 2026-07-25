@@ -46,6 +46,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /{$}", s.handleIndex) // exact "/" only
 	mux.HandleFunc("GET /api/items", s.handleItems)
 	mux.HandleFunc("GET /api/search", s.handleSearch)
+	mux.HandleFunc("GET /api/random", s.handleRandom)
+	mux.HandleFunc("GET /api/recommend", s.handleRecommend)
 	mux.HandleFunc("GET /api/item", s.handleItemDetail)
 	mux.HandleFunc("PUT /api/tags", s.handleSetTags)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
@@ -149,6 +151,38 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := clampAtoi(r.URL.Query().Get("limit"), 200, 1, 500)
 	items, err := s.store.SearchItems(r.Context(), q, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeItems(w, items)
+}
+
+// handleRandom returns a single random item (respecting the ?q= filter if
+// given), wrapped like /api/items so the client just reads items[0].
+func (s *Server) handleRandom(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	it, ok, err := s.store.RandomItem(r.Context(), q)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		writeItems(w, nil)
+		return
+	}
+	writeItems(w, []model.Item{it})
+}
+
+// handleRecommend returns items sharing the most tags with ?path=, best first.
+func (s *Server) handleRecommend(w http.ResponseWriter, r *http.Request) {
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	if rel == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	limit := clampAtoi(r.URL.Query().Get("limit"), 24, 1, 100)
+	items, err := s.store.RecommendByTags(r.Context(), rel, limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

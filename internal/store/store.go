@@ -611,3 +611,64 @@ func (s *Store) SetManualTags(ctx context.Context, relpath string, tags []model.
 	}
 	return tx.Commit()
 }
+
+// ---- discovery: random + tag-based recommendations ----
+
+// RandomItem returns one present item at random. If q is non-empty it draws
+// only from items matching that search query (so "random" respects a filter).
+// found is false when there's nothing to pick (empty library or no matches).
+func (s *Store) RandomItem(ctx context.Context, q string) (item model.Item, found bool, err error) {
+	var rows *sql.Rows
+	if q != "" {
+		match := ftsQuery(q)
+		if match == "" {
+			return model.Item{}, false, nil
+		}
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+prefixCols("i")+`
+			FROM items_fts f JOIN items i ON i.id = f.rowid
+			WHERE items_fts MATCH ? AND i.missing_since IS NULL
+			ORDER BY RANDOM() LIMIT 1`, match)
+	} else {
+		rows, err = s.db.QueryContext(ctx, `
+			SELECT `+itemCols+` FROM items
+			WHERE missing_since IS NULL
+			ORDER BY RANDOM() LIMIT 1`)
+	}
+	if err != nil {
+		return model.Item{}, false, err
+	}
+	defer rows.Close()
+	items, err := scanItems(rows)
+	if err != nil || len(items) == 0 {
+		return model.Item{}, false, err
+	}
+	return items[0], true, nil
+}
+
+// RecommendByTags returns items that share the most tags with the seed item
+// (identified by relpath), most-overlapping first. Both manual and AI tags
+// count; a shared tag counts once regardless of source. Returns nothing when
+// the seed has no tags. The overlap count drives ORDER BY but isn't selected,
+// so the row shape stays exactly itemCols.
+func (s *Store) RecommendByTags(ctx context.Context, relpath string, limit int) ([]model.Item, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+prefixCols("it")+`
+		FROM item_tags t
+		JOIN items it ON it.id = t.item_id
+		WHERE t.tag_id IN (
+			SELECT it2.tag_id FROM item_tags it2
+			JOIN items seed ON seed.id = it2.item_id
+			WHERE seed.relpath = ?
+		)
+		AND it.relpath != ?
+		AND it.missing_since IS NULL
+		GROUP BY it.id
+		ORDER BY COUNT(DISTINCT t.tag_id) DESC, it.indexed_at DESC
+		LIMIT ?`, relpath, relpath, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanItems(rows)
+}

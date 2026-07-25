@@ -247,3 +247,17 @@ Most audio plays in the browser directly. `wma` (and some `aiff`) don't, so
 `scripts/transcode.sh` converts those to an mp3 in `DERIVED_DIR`, which
 mediavault then serves — same mechanism as video. Cover art is unaffected (it
 comes from the thumbnail, not the derived audio).
+
+## Discovery: Random + recommendations
+
+**Random** (header button) opens a random item in the viewer. If a search is
+active, it picks randomly from the matches. From there the viewer's arrow keys
+pull further random items (with back-history), so it doubles as a lean-back
+shuffle. Endpoint: `GET /api/random?q=<optional search>`.
+
+**More like this** appears in every item's viewer panel: items that share the
+most tags with the current one, most-overlapping first (manual + AI tags both
+count). Click one to open that whole set as an arrow-navigable queue — so
+following related items chains naturally. Recommendations are only as good as
+your tags, so they fill in as you tag things. Endpoint:
+`GET /api/recommend?path=<relpath>&limit=<n>`.
