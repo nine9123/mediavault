@@ -30,6 +30,7 @@ services:
       # empty/unset to disable. OLLAMA_MODEL must be a vision model you've pulled.
       # OLLAMA_URL: "http://your-truenas-ip:11434"
       # OLLAMA_MODEL: "llava"
+      # OLLAMA_EMBED_MODEL: "nomic-embed-text"   # enables *semantic* search (pull it on the Ollama host)
     volumes:
       # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
       - /mnt/nas/media:/media:ro

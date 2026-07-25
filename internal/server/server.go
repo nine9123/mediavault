@@ -7,16 +7,19 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"mediavault/internal/config"
 	"mediavault/internal/media"
 	"mediavault/internal/model"
+	"mediavault/internal/ollama"
 	"mediavault/internal/scan"
 	"mediavault/internal/sidecar"
 	"mediavault/internal/store"
@@ -167,7 +170,55 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Hybrid: keep keyword/tag/type hits first, then fill with semantically-close
+	// captions (so "puppy" surfaces a "dog on the beach"). Best-effort — if the
+	// embedding server is slow or down, we just return the keyword results.
+	if s.semanticEnabled() && len(text) >= 3 {
+		if sem := s.semanticSearch(r.Context(), text, typ, limit); len(sem) > 0 {
+			items = mergeItems(items, sem, limit)
+		}
+	}
 	writeItems(w, items)
+}
+
+func (s *Server) semanticEnabled() bool {
+	return s.cfg.OllamaURL != "" && s.cfg.OllamaEmbedModel != ""
+}
+
+func (s *Server) semanticSearch(ctx context.Context, text, typ string, limit int) []model.Item {
+	ectx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	vec, err := ollama.Embed(ectx, s.cfg, text)
+	if err != nil {
+		log.Printf("search: embed query: %v", err)
+		return nil
+	}
+	items, err := s.store.SemanticSearch(ctx, vec, typ, limit)
+	if err != nil {
+		log.Printf("search: semantic: %v", err)
+		return nil
+	}
+	return items
+}
+
+// mergeItems concatenates a then b, de-duplicated by relpath, capped at limit.
+func mergeItems(a, b []model.Item, limit int) []model.Item {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]model.Item, 0, limit)
+	add := func(list []model.Item) {
+		for _, it := range list {
+			if len(out) >= limit {
+				return
+			}
+			if !seen[it.Relpath] {
+				seen[it.Relpath] = true
+				out = append(out, it)
+			}
+		}
+	}
+	add(a)
+	add(b)
+	return out
 }
 
 // splitTypeFilter pulls "type:<kind>" tokens out of a search query, returning

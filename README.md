@@ -416,3 +416,28 @@ This is **keyword** matching over rich captions. For *semantic* matching (query
 step is to also embed captions + the query with an Ollama embedding model
 (e.g. `nomic-embed-text`) and rank by cosine — reusing the vector search already
 in place. Ask and I'll add it.
+
+
+## Semantic search (optional, adds to captions)
+
+With captions enabled, also set `OLLAMA_EMBED_MODEL` to a text-embedding model
+(e.g. `nomic-embed-text`) and search becomes **semantic**: each caption is
+embedded, your query is embedded, and results are ranked by meaning — so
+"puppy by the ocean" finds a caption that says "a dog on the beach", even with
+no shared words.
+
+```yaml
+    environment:
+      - OLLAMA_URL=http://your-truenas-ip:11434
+      - OLLAMA_MODEL=llava                 # captions (vision)
+      - OLLAMA_EMBED_MODEL=nomic-embed-text # semantic search (embeddings)
+```
+
+It's a **hybrid**: the search box still returns exact keyword/tag/`type:` matches
+first (fast FTS), then fills in semantically-close captions behind them — so
+precise searches keep working while vague ones find the right media anyway.
+Query embedding is best-effort with a short timeout, so if the Ollama server is
+slow or down you simply fall back to keyword results. The background worker
+embeds captions as it goes (and backfills existing captions if you turn the
+embedding model on later); matching is a brute-force cosine scan in memory,
+reusing the vector search already in place — still no external vector DB.

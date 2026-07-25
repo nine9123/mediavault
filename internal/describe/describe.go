@@ -1,25 +1,20 @@
-// Package describe captions media with a vision model served by Ollama, so the
-// captions can be searched in natural language. It runs as a slow background
-// worker (one image at a time — LLM inference is the bottleneck), backfilling
-// undescribed items over time. Entirely optional: only runs when OLLAMA_URL is
-// set. Captions are written to items.description and folded into full-text search.
+// Package describe captions media with a vision model served by Ollama and (if
+// an embedding model is configured) embeds those captions for semantic search.
+// It runs as a slow background worker — one image at a time, LLM inference is
+// the bottleneck — backfilling over time. Entirely optional: only runs when
+// OLLAMA_URL is set. Captions go to items.description (and full-text search);
+// embeddings go to item_embeddings (semantic search).
 package describe
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"mediavault/internal/config"
 	"mediavault/internal/media"
+	"mediavault/internal/ollama"
 	"mediavault/internal/store"
 )
 
@@ -28,23 +23,23 @@ const frameMaxPx = 512
 type Describer struct {
 	cfg    config.Config
 	store  *store.Store
-	hc     *http.Client
 	failed map[string]struct{} // frames we couldn't extract; skip for this run
 }
 
 func New(cfg config.Config, st *store.Store) *Describer {
-	return &Describer{
-		cfg:    cfg,
-		store:  st,
-		hc:     &http.Client{Timeout: 180 * time.Second}, // vision inference can be slow
-		failed: map[string]struct{}{},
-	}
+	return &Describer{cfg: cfg, store: st, failed: map[string]struct{}{}}
 }
 
-// Run backfills captions, then re-checks periodically (which also serves as
-// backoff if the Ollama server is unreachable).
+func (d *Describer) embedOn() bool { return d.cfg.OllamaEmbedModel != "" }
+
+// Run backfills captions (and embeddings), then re-checks periodically — which
+// doubles as backoff when the Ollama server is unreachable.
 func (d *Describer) Run(ctx context.Context) {
-	log.Printf("describe: on — %s via %s", d.cfg.OllamaModel, d.cfg.OllamaURL)
+	if d.embedOn() {
+		log.Printf("describe: on — caption %q + embed %q via %s", d.cfg.OllamaModel, d.cfg.OllamaEmbedModel, d.cfg.OllamaURL)
+	} else {
+		log.Printf("describe: on — caption %q via %s (set OLLAMA_EMBED_MODEL for semantic search)", d.cfg.OllamaModel, d.cfg.OllamaURL)
+	}
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	d.pass(ctx)
@@ -59,6 +54,14 @@ func (d *Describer) Run(ctx context.Context) {
 }
 
 func (d *Describer) pass(ctx context.Context) {
+	d.captionPass(ctx)
+	if d.embedOn() {
+		d.embedPass(ctx)
+	}
+}
+
+// captionPass captions undescribed visual items with the vision model.
+func (d *Describer) captionPass(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -79,14 +82,12 @@ func (d *Describer) pass(ctx context.Context) {
 			abs := filepath.Join(d.cfg.MediaRoot, filepath.FromSlash(it.Relpath))
 			jpeg, err := media.FrameJPEG(ctx, d.cfg, abs, it.Type, frameMaxPx)
 			if err != nil {
-				d.failed[it.Relpath] = struct{}{} // can't get a frame; don't retry this run
+				d.failed[it.Relpath] = struct{}{} // no frame; skip this run
 				continue
 			}
-			desc, err := d.caption(ctx, jpeg)
+			desc, err := ollama.Caption(ctx, d.cfg, jpeg)
 			if err != nil {
-				// Almost always the Ollama server being down/busy — back off and
-				// let the next tick retry rather than hammering it.
-				log.Printf("describe: ollama: %v", err)
+				log.Printf("describe: caption: %v", err) // server down/busy -> back off
 				return
 			}
 			if desc == "" {
@@ -100,38 +101,37 @@ func (d *Describer) pass(ctx context.Context) {
 			progressed = true
 		}
 		if !progressed {
-			return // nothing left we can caption right now
+			return
 		}
 	}
 }
 
-func (d *Describer) caption(ctx context.Context, jpeg []byte) (string, error) {
-	body, _ := json.Marshal(map[string]any{
-		"model":  d.cfg.OllamaModel,
-		"prompt": d.cfg.OllamaPrompt,
-		"images": []string{base64.StdEncoding.EncodeToString(jpeg)},
-		"stream": false,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(d.cfg.OllamaURL, "/")+"/api/generate", bytes.NewReader(body))
-	if err != nil {
-		return "", err
+// embedPass computes caption embeddings for items that don't have one yet.
+func (d *Describer) embedPass(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		items, err := d.store.CaptionedButUnembedded(ctx, 50)
+		if err != nil {
+			log.Printf("describe: embed list: %v", err)
+			return
+		}
+		if len(items) == 0 {
+			return
+		}
+		for _, it := range items {
+			if ctx.Err() != nil {
+				return
+			}
+			vec, err := ollama.Embed(ctx, d.cfg, it.Description)
+			if err != nil {
+				log.Printf("describe: embed: %v", err) // server down/busy -> back off
+				return
+			}
+			if err := d.store.SetEmbedding(ctx, it.Relpath, vec); err != nil {
+				log.Printf("describe: embed save %s: %v", it.Relpath, err)
+			}
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := d.hc.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, bytes.TrimSpace(b))
-	}
-	var out struct {
-		Response string `json:"response"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out.Response), nil
 }

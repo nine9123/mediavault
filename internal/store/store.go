@@ -43,6 +43,11 @@ type Store struct {
 	vecMu   sync.Mutex
 	vecs    map[int64][]float32
 	vecInit bool
+
+	// Caption text-embedding cache (semantic search).
+	embMu   sync.Mutex
+	embs    map[int64][]float32
+	embInit bool
 }
 
 // ItemWrite is what the scanner hands the writer for one file.
@@ -171,7 +176,7 @@ func (s *Store) hasColumn(table, col string) (bool, error) {
 func (s *Store) dropAll() error {
 	for _, t := range []string{
 		"items_fts", "scan_runs", "chain_items", "chains",
-		"item_vectors", "item_tags", "tags", "items", "meta",
+		"item_vectors", "item_embeddings", "item_tags", "tags", "items", "meta",
 	} {
 		if _, err := s.db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 			return err
@@ -1039,4 +1044,133 @@ func (s *Store) UndescribedItems(ctx context.Context, limit int) ([]model.Item, 
 	}
 	defer rows.Close()
 	return scanItems(rows)
+}
+
+// ---- caption embeddings: semantic search (brute-force cosine) ----
+
+func (s *Store) cacheEmb(id int64, v []float32) {
+	s.embMu.Lock()
+	if s.embs == nil {
+		s.embs = make(map[int64][]float32)
+	}
+	s.embs[id] = v
+	s.embMu.Unlock()
+}
+
+func (s *Store) loadEmbs(ctx context.Context) error {
+	s.embMu.Lock()
+	defer s.embMu.Unlock()
+	if s.embInit {
+		return nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT item_id, vec FROM item_embeddings`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	m := make(map[int64][]float32)
+	for rows.Next() {
+		var id int64
+		var b []byte
+		if err := rows.Scan(&id, &b); err != nil {
+			return err
+		}
+		m[id] = decodeVec(b)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for id, v := range s.embs {
+		m[id] = v
+	}
+	s.embs = m
+	s.embInit = true
+	return nil
+}
+
+// SetEmbedding stores a caption embedding for an item.
+func (s *Store) SetEmbedding(ctx context.Context, relpath string, vec []float32) error {
+	var id int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM items WHERE relpath=? AND missing_since IS NULL`, relpath).Scan(&id); err != nil {
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO item_embeddings(item_id,dim,vec) VALUES(?,?,?)
+		 ON CONFLICT(item_id) DO UPDATE SET dim=excluded.dim, vec=excluded.vec`,
+		id, len(vec), encodeVec(vec)); err != nil {
+		return err
+	}
+	s.cacheEmb(id, vec)
+	return nil
+}
+
+// CaptionedButUnembedded returns captioned items lacking a caption embedding
+// (backfill when an embedding model is enabled after captioning), newest first.
+func (s *Store) CaptionedButUnembedded(ctx context.Context, limit int) ([]model.Item, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+itemCols+` FROM items i
+		 WHERE i.missing_since IS NULL AND i.description IS NOT NULL AND i.description != ''
+		   AND NOT EXISTS (SELECT 1 FROM item_embeddings e WHERE e.item_id=i.id)
+		 ORDER BY i.indexed_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanItems(rows)
+}
+
+// SemanticSearch ranks items by cosine of their caption embedding against qvec,
+// optionally constrained to a media type. qvec must match the stored dimension.
+func (s *Store) SemanticSearch(ctx context.Context, qvec []float32, typ string, limit int) ([]model.Item, error) {
+	if err := s.loadEmbs(ctx); err != nil {
+		return nil, err
+	}
+	type sc struct {
+		id    int64
+		score float64
+	}
+	s.embMu.Lock()
+	all := make([]sc, 0, len(s.embs))
+	for id, v := range s.embs {
+		if len(v) == len(qvec) {
+			all = append(all, sc{id, media.Cosine(qvec, v)})
+		}
+	}
+	s.embMu.Unlock()
+	sort.Slice(all, func(i, j int) bool { return all[i].score > all[j].score })
+
+	take := limit
+	if typ != "" {
+		take = limit * 4 // over-fetch so type filtering can still fill `limit`
+	}
+	if len(all) > take {
+		all = all[:take]
+	}
+	ids := make([]int64, len(all))
+	for i, a := range all {
+		ids[i] = a.id
+	}
+	byID, err := s.ItemsByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.Item, 0, limit)
+	for _, a := range all {
+		it, ok := byID[a.id]
+		if !ok {
+			continue
+		}
+		if typ != "" && string(it.Type) != typ {
+			continue
+		}
+		out = append(out, it)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }

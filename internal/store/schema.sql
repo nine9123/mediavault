@@ -96,4 +96,11 @@ CREATE TABLE IF NOT EXISTS item_vectors (
     vec     BLOB    NOT NULL
 );
 
+-- Caption text embeddings for semantic natural-language search (Ollama).
+CREATE TABLE IF NOT EXISTS item_embeddings (
+    item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+    dim     INTEGER NOT NULL,
+    vec     BLOB    NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(relpath, tags);

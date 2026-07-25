@@ -30,7 +30,11 @@ func main() {
 		log.Printf("derived dir: (unset) — WMV/AVI/HEVC/ALAC won't play until DERIVED_DIR is set and `transcode` has run")
 	}
 	if cfg.OllamaURL != "" {
-		log.Printf("captions: on — %s via %s (natural-language search)", cfg.OllamaModel, cfg.OllamaURL)
+		if cfg.OllamaEmbedModel != "" {
+			log.Printf("captions: on — %s + semantic embeddings %s via %s", cfg.OllamaModel, cfg.OllamaEmbedModel, cfg.OllamaURL)
+		} else {
+			log.Printf("captions: on — %s via %s (keyword; set OLLAMA_EMBED_MODEL for semantic search)", cfg.OllamaModel, cfg.OllamaURL)
+		}
 	}
 
 	if err := os.MkdirAll(cfg.ThumbDir(), 0o755); err != nil {
