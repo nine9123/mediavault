@@ -495,6 +495,20 @@
     }).catch(function () {}).finally(function () { S.busyOlder = false; });
   }
 
+  // Load older pages until the document is tall enough to scroll. On a large or
+  // tall screen the first page may not fill the viewport, leaving nothing to
+  // scroll — so the observer/scroll triggers never fire. Stops when filled,
+  // exhausted, or a load makes no progress (e.g. a failed request), so it never
+  // busy-loops.
+  function fillViewport() {
+    if (S.mode !== "browse" || S.doneOlder) return;
+    if (document.body.scrollHeight > window.innerHeight + 1000) return;
+    var before = S.items.length;
+    var p = loadOlder();
+    if (!p || !p.then) return;
+    p.then(function () { if (S.items.length > before) fillViewport(); });
+  }
+
   // ---- newer (live stream, prepend at top) ----
   function loadNewer() {
     if (S.mode !== "browse" || S.busyNewer || S.viewerOpen || S.maxId === null) return;
@@ -545,7 +559,7 @@
     if ((window.innerHeight + (window.scrollY || 0)) >= document.body.scrollHeight - 900) loadOlder();
   }
   window.addEventListener("scroll", nearBottomLoad, { passive: true });
-  window.addEventListener("resize", nearBottomLoad);
+  window.addEventListener("resize", fillViewport);
 
   // search (debounced)
   var searchTimer = null;
@@ -554,7 +568,7 @@
     searchTimer = setTimeout(function () {
       var v = el.q.value.trim();
       S.query = v;
-      if (v === "") { S.mode = "browse"; reset(); loadInitial(); }
+      if (v === "") { S.mode = "browse"; reset(); loadInitial().then(fillViewport); }
       else { S.mode = "search"; reset(); runSearch(); }
     }, 250);
   });
@@ -581,7 +595,7 @@
 
       // recover if the first load failed while the server was still starting
       if (S.mode === "browse" && S.items.length === 0 && S.maxId === null && !S.busyOlder) {
-        loadInitial();
+        loadInitial().then(fillViewport);
         return;
       }
       // stream newly-indexed items into the grid
@@ -831,7 +845,7 @@
   });
 
   // ---- boot ----
-  loadInitial();
+  loadInitial().then(fillViewport);
   pollStats();
   setInterval(pollStats, 2000);
 })();
