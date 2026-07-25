@@ -398,3 +398,11 @@ func hashFile(path string) (string, error) {
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
+
+// Running reports whether a scan is in progress (used by the UI to show a live
+// indexing indicator).
+func (s *Scanner) Running() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running
+}

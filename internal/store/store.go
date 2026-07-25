@@ -422,3 +422,76 @@ func b2i(b bool) int {
 	}
 	return 0
 }
+
+// ---- stats + per-item tags (for the UI) ----
+
+// ScanRunInfo is a single scan_runs row, exposed for the stats endpoint.
+type ScanRunInfo struct {
+	Started int64
+	Ended   int64 // 0 if the run hasn't finished
+	Seen    int
+	Added   int
+	Updated int
+	Missing int
+	Errors  int
+}
+
+// Stats is the collection summary shown in the UI header.
+type Stats struct {
+	Items int
+	Last  *ScanRunInfo // nil if no scan has run yet
+}
+
+// Stats returns the present-item count and the most recent scan run.
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	var st Stats
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM items WHERE missing_since IS NULL`).Scan(&st.Items); err != nil {
+		return st, err
+	}
+	var r ScanRunInfo
+	var ended sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT started_at, ended_at, seen, added, updated, missing, errors
+		FROM scan_runs ORDER BY id DESC LIMIT 1`).
+		Scan(&r.Started, &ended, &r.Seen, &r.Added, &r.Updated, &r.Missing, &r.Errors)
+	if err == sql.ErrNoRows {
+		return st, nil
+	}
+	if err != nil {
+		return st, err
+	}
+	r.Ended = ended.Int64
+	st.Last = &r
+	return st, nil
+}
+
+// ItemTag is one tag applied to an item, with its source.
+type ItemTag struct {
+	Namespace  string
+	Name       string
+	Source     string // manual | ai
+	Confidence float64
+}
+
+// TagsForItem returns every tag on an item (manual and ai), ordered.
+func (s *Store) TagsForItem(ctx context.Context, itemID int64) ([]ItemTag, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT t.namespace, t.name, it.source, COALESCE(it.confidence, 0)
+		FROM item_tags it JOIN tags t ON t.id = it.tag_id
+		WHERE it.item_id = ?
+		ORDER BY t.namespace, t.name, it.source`, itemID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ItemTag
+	for rows.Next() {
+		var t ItemTag
+		if err := rows.Scan(&t.Namespace, &t.Name, &t.Source, &t.Confidence); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}

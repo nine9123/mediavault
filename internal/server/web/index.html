@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>mediavault</title>
+<style>
+  /* ------------------------------------------------------------------ *
+   * Direction: a private film/media archive as a darkroom contact sheet.
+   * Warm ink ground, bone text, a brass "safelight" accent used sparingly
+   * (it doubles as the live scan indicator), and a monospace catalog voice
+   * for filenames, counts, and the viewer's index card.
+   * ------------------------------------------------------------------ */
+  :root {
+    --ink:        #141210;  /* warm near-black ground */
+    --ink-raised: #1e1b18;  /* bars, cells */
+    --ink-line:   #2c2823;  /* hairline frames/dividers */
+    --ink-line-2: #3a352e;  /* hover frame */
+    --bone:       #ede8df;  /* primary text */
+    --bone-dim:   #9a9186;  /* metadata / secondary */
+    --bone-faint: #6a635b;  /* captions, disabled */
+    --brass:      #d9a441;  /* safelight accent — used sparingly */
+    --brass-soft: #a67f34;
+
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+    --gap: 6px;
+    --cell-min: 152px;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--ink);
+    color: var(--bone);
+    font-family: var(--sans);
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+  }
+  :focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+
+  /* ---- archive header ---- */
+  .bar {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: 18px;
+    padding: 12px 16px;
+    background: color-mix(in srgb, var(--ink-raised) 92%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--ink-line);
+    flex-wrap: wrap;
+  }
+  .mark {
+    display: flex; align-items: center; gap: 9px;
+    font-family: var(--mono);
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    font-size: 13px;
+    color: var(--bone);
+    white-space: nowrap;
+    user-select: none;
+  }
+  /* the safelight: on = amber + slow pulse while a scan runs */
+  .safelight {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--ink-line-2);
+    box-shadow: inset 0 0 0 1px var(--ink-line-2);
+    transition: background .3s ease, box-shadow .3s ease;
+  }
+  .safelight.on {
+    background: var(--brass);
+    box-shadow: 0 0 8px 1px color-mix(in srgb, var(--brass) 60%, transparent);
+    animation: pulse 1.7s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+  .search {
+    flex: 1 1 260px; min-width: 180px;
+    display: flex; align-items: center; gap: 8px;
+    background: var(--ink); color: var(--bone);
+    border: 1px solid var(--ink-line);
+    border-radius: 2px;
+    padding: 8px 11px;
+  }
+  .search:focus-within { border-color: var(--brass-soft); }
+  .search svg { flex: none; color: var(--bone-faint); }
+  .search input {
+    flex: 1; border: 0; background: transparent; color: inherit;
+    font-family: var(--mono); font-size: 13px; letter-spacing: .02em;
+  }
+  .search input::placeholder { color: var(--bone-faint); }
+  .search input:focus { outline: none; }
+
+  .readout {
+    font-family: var(--mono); font-size: 12px; color: var(--bone-dim);
+    letter-spacing: .03em; white-space: nowrap;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .readout .n { color: var(--bone); }
+
+  .btn {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--bone-dim);
+    background: transparent;
+    border: 1px solid var(--ink-line);
+    border-radius: 2px;
+    padding: 8px 13px; cursor: pointer;
+    transition: color .15s, border-color .15s;
+    white-space: nowrap;
+  }
+  .btn:hover { color: var(--brass); border-color: var(--brass-soft); }
+  .btn:disabled { color: var(--bone-faint); border-color: var(--ink-line); cursor: default; }
+
+  /* ---- contact sheet ---- */
+  .sheet { padding: var(--gap); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(var(--cell-min), 1fr));
+    gap: var(--gap);
+  }
+  .cell {
+    position: relative;
+    aspect-ratio: 1 / 1;
+    background: var(--ink-raised);
+    border: 1px solid var(--ink-line);
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .cell:hover { border-color: var(--ink-line-2); }
+  .cell:hover .name { opacity: 1; }
+  .cell img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    opacity: 0; transition: opacity .25s ease;
+  }
+  .cell img.ok { opacity: 1; }
+  .noprev {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--bone-faint);
+  }
+  .badge {
+    position: absolute; top: 6px; left: 6px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .06em;
+    color: var(--bone); background: color-mix(in srgb, var(--ink) 72%, transparent);
+    border: 1px solid var(--ink-line);
+    padding: 2px 5px; border-radius: 2px;
+    pointer-events: none;
+  }
+  .badge.vid { color: var(--brass); }
+  .name {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 16px 7px 6px;
+    font-family: var(--mono); font-size: 11px; color: var(--bone);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    background: linear-gradient(transparent, color-mix(in srgb, var(--ink) 88%, transparent));
+    opacity: 0; transition: opacity .15s ease;
+    pointer-events: none;
+  }
+
+  /* ---- states ---- */
+  .state {
+    padding: 80px 24px; text-align: center;
+    font-family: var(--mono); font-size: 13px; line-height: 1.7;
+    color: var(--bone-dim); letter-spacing: .02em;
+  }
+  .state .lead { color: var(--bone); display: block; margin-bottom: 6px; letter-spacing: .06em; }
+  .state.err .lead { color: var(--brass); }
+  .sentinel {
+    height: 48px; display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--bone-faint);
+  }
+  .hidden { display: none !important; }
+
+  /* ---- lightbox / viewer ---- */
+  .viewer {
+    position: fixed; inset: 0; z-index: 50;
+    display: none;
+    background: color-mix(in srgb, var(--ink) 94%, transparent);
+    backdrop-filter: blur(10px);
+  }
+  .viewer.open { display: grid; grid-template-columns: 1fr 300px; }
+  .stage {
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+    padding: 28px; min-width: 0; min-height: 0;
+  }
+  .stage img, .stage video {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain; display: block;
+    background: #000;
+    box-shadow: 0 24px 80px rgba(0,0,0,.6);
+  }
+  .nav {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    width: 46px; height: 72px;
+    display: flex; align-items: center; justify-content: center;
+    background: transparent; border: 0; cursor: pointer;
+    color: var(--bone-dim); font-size: 30px; line-height: 1;
+    transition: color .15s;
+  }
+  .nav:hover { color: var(--brass); }
+  .nav.prev { left: 6px; }
+  .nav.next { right: 6px; }
+  .close {
+    position: absolute; top: 12px; right: 12px;
+    width: 34px; height: 34px; padding: 0;
+    font-size: 20px; line-height: 1;
+    color: var(--bone-dim); background: transparent;
+    border: 1px solid var(--ink-line); border-radius: 2px; cursor: pointer;
+  }
+  .close:hover { color: var(--brass); border-color: var(--brass-soft); }
+
+  /* the index card */
+  .card {
+    border-left: 1px solid var(--ink-line);
+    background: var(--ink-raised);
+    padding: 22px 20px; overflow-y: auto;
+    font-family: var(--mono);
+  }
+  .card h2 {
+    margin: 0 0 16px; font-size: 11px; letter-spacing: .2em;
+    text-transform: uppercase; color: var(--brass); font-weight: 600;
+  }
+  .row { padding: 9px 0; border-top: 1px solid var(--ink-line); }
+  .row:first-of-type { border-top: 0; }
+  .k { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--bone-faint); }
+  .v { font-size: 12.5px; color: var(--bone); margin-top: 3px; word-break: break-word; line-height: 1.5; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .tag {
+    font-size: 11px; letter-spacing: .02em;
+    color: var(--bone); background: var(--ink);
+    border: 1px solid var(--ink-line); border-radius: 2px;
+    padding: 3px 7px;
+  }
+  .tag.ai { color: var(--bone-dim); border-style: dashed; }
+  .tag .ns { color: var(--brass-soft); }
+  .tag .src { color: var(--bone-faint); font-size: 9px; margin-left: 4px; }
+  .muted { color: var(--bone-faint); font-size: 12px; }
+
+  /* ---- responsive: card becomes a bottom sheet ---- */
+  @media (max-width: 720px) {
+    :root { --cell-min: 108px; }
+    .viewer.open { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+    .card { border-left: 0; border-top: 1px solid var(--ink-line); max-height: 42vh; padding: 16px; }
+    .readout { order: 3; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, .cell img, .safelight { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+  <header class="bar">
+    <div class="mark"><span class="safelight" id="safelight"></span>mediavault</div>
+    <label class="search">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+        <circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path>
+      </svg>
+      <input id="q" type="search" placeholder="Search files and tags" autocomplete="off" spellcheck="false" aria-label="Search files and tags">
+    </label>
+    <span class="readout" id="readout"><span class="n">—</span> items</span>
+    <button class="btn" id="rescan">Rescan</button>
+  </header>
+
+  <main class="sheet">
+    <div class="grid" id="grid"></div>
+    <div class="sentinel hidden" id="sentinel">loading</div>
+    <div class="state hidden" id="state"></div>
+  </main>
+
+  <div class="viewer" id="viewer" aria-hidden="true">
+    <div class="stage" id="stage">
+      <button class="nav prev" id="prev" aria-label="Previous">&#8249;</button>
+      <button class="nav next" id="next" aria-label="Next">&#8250;</button>
+      <button class="close" id="close" aria-label="Close">&times;</button>
+    </div>
+    <aside class="card" id="card"></aside>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  var PAGE = 120;
+  var S = {
+    mode: "browse",   // browse | search
+    query: "",
+    offset: 0,
+    items: [],
+    loading: false,
+    done: false,
+    viewIndex: -1,
+    viewerOpen: false
+  };
+
+  var el = {
+    grid: document.getElementById("grid"),
+    sentinel: document.getElementById("sentinel"),
+    state: document.getElementById("state"),
+    readout: document.getElementById("readout"),
+    safelight: document.getElementById("safelight"),
+    q: document.getElementById("q"),
+    rescan: document.getElementById("rescan"),
+    viewer: document.getElementById("viewer"),
+    stage: document.getElementById("stage"),
+    card: document.getElementById("card"),
+    prev: document.getElementById("prev"),
+    next: document.getElementById("next"),
+    close: document.getElementById("close")
+  };
+
+  function api(path) {
+    return fetch(path).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+  }
+
+  function showState(cls, lead, rest) {
+    el.state.className = "state" + (cls ? " " + cls : "");
+    el.state.innerHTML = "";
+    if (lead) {
+      var s = document.createElement("span");
+      s.className = "lead";
+      s.textContent = lead;
+      el.state.appendChild(s);
+    }
+    if (rest) el.state.appendChild(document.createTextNode(rest));
+    el.state.classList.remove("hidden");
+  }
+  function clearState() { el.state.classList.add("hidden"); }
+
+  function fmtDuration(sec) {
+    sec = Math.round(sec || 0);
+    var m = Math.floor(sec / 60), s = sec % 60;
+    return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+  function baseName(rel) {
+    var i = rel.lastIndexOf("/");
+    return i >= 0 ? rel.slice(i + 1) : rel;
+  }
+
+  // ---- grid ----
+  function reset() {
+    S.items = [];
+    S.offset = 0;
+    S.done = false;
+    el.grid.innerHTML = "";
+    clearState();
+  }
+
+  function makeCell(item, index) {
+    var cell = document.createElement("div");
+    cell.className = "cell";
+    cell.addEventListener("click", function () { openViewer(index); });
+
+    if (item.thumb_ready) {
+      var img = document.createElement("img");
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.alt = baseName(item.relpath);
+      img.addEventListener("load", function () { img.classList.add("ok"); });
+      img.addEventListener("error", function () {
+        img.remove();
+        cell.appendChild(noPreview());
+      });
+      img.src = item.thumb_url;
+      cell.appendChild(img);
+    } else {
+      cell.appendChild(noPreview());
+    }
+
+    var badge = document.createElement("span");
+    badge.className = "badge" + (item.type === "video" ? " vid" : "");
+    if (item.type === "video") badge.textContent = "VID " + fmtDuration(item.duration);
+    else if (item.type === "animated") badge.textContent = "GIF";
+    else badge.textContent = "IMG";
+    cell.appendChild(badge);
+
+    var name = document.createElement("div");
+    name.className = "name";
+    name.textContent = baseName(item.relpath);
+    cell.appendChild(name);
+
+    return cell;
+  }
+  function noPreview() {
+    var d = document.createElement("div");
+    d.className = "noprev";
+    d.textContent = "no preview";
+    return d;
+  }
+
+  function loadMore() {
+    if (S.loading || S.done) return Promise.resolve();
+    S.loading = true;
+    el.sentinel.classList.remove("hidden");
+    el.sentinel.textContent = "loading";
+
+    var path = S.mode === "search"
+      ? "/api/search?q=" + encodeURIComponent(S.query) + "&limit=" + 200
+      : "/api/items?limit=" + PAGE + "&offset=" + S.offset;
+
+    return api(path).then(function (data) {
+      var batch = data.items || [];
+      var start = S.items.length;
+      for (var i = 0; i < batch.length; i++) {
+        S.items.push(batch[i]);
+        el.grid.appendChild(makeCell(batch[i], start + i));
+      }
+      S.offset += batch.length;
+
+      // Search returns a single (capped) page; browse is done when short.
+      if (S.mode === "search" || batch.length < PAGE) S.done = true;
+
+      if (S.items.length === 0) {
+        if (S.mode === "search") {
+          showState("", "No matches", "for \u201c" + S.query + "\u201d.");
+        } else {
+          showState("", "Nothing indexed yet.",
+            "If a scan is running, thumbnails appear as files are processed. Otherwise add media under your media root and Rescan.");
+        }
+      }
+      el.sentinel.classList.toggle("hidden", S.done);
+      if (S.done) el.sentinel.textContent = "";
+    }).catch(function (e) {
+      S.done = true;
+      el.sentinel.classList.add("hidden");
+      if (S.items.length === 0) {
+        showState("err", "Can't reach the server.", "Is mediavault still running? (" + e.message + ")");
+      }
+    }).finally(function () {
+      S.loading = false;
+    });
+  }
+
+  // infinite scroll
+  var io = new IntersectionObserver(function (entries) {
+    if (entries[0].isIntersecting) loadMore();
+  }, { rootMargin: "600px" });
+  io.observe(el.sentinel);
+
+  // ---- search (debounced) ----
+  var searchTimer = null;
+  el.q.addEventListener("input", function () {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(function () {
+      var v = el.q.value.trim();
+      if (v === S.query && v !== "") return;
+      S.query = v;
+      S.mode = v === "" ? "browse" : "search";
+      reset();
+      loadMore();
+    }, 250);
+  });
+
+  // ---- rescan ----
+  el.rescan.addEventListener("click", function () {
+    el.rescan.disabled = true;
+    fetch("/api/scan", { method: "POST" }).catch(function () {}).finally(function () {
+      setTimeout(pollStats, 400);
+      setTimeout(function () { el.rescan.disabled = false; }, 1500);
+    });
+  });
+
+  // ---- stats (live header) ----
+  function pollStats() {
+    api("/api/stats").then(function (st) {
+      el.safelight.classList.toggle("on", !!st.scanning);
+      var n = (st.items || 0).toLocaleString();
+      var txt = "<span class=\"n\">" + n + "</span> items";
+      if (st.scanning) txt += " \u00b7 scanning\u2026";
+      else if (st.last && st.last.added) txt += " \u00b7 +" + st.last.added + " last scan";
+      el.readout.innerHTML = txt;
+    }).catch(function () { /* header stays as-is */ });
+  }
+
+  // ---- viewer ----
+  function openViewer(index) {
+    if (index < 0 || index >= S.items.length) return;
+    S.viewIndex = index;
+    S.viewerOpen = true;
+    renderStage();
+    renderCard();
+    el.viewer.classList.add("open");
+    el.viewer.setAttribute("aria-hidden", "false");
+    document.body.style.overflow = "hidden";
+  }
+
+  function renderStage() {
+    var item = S.items[S.viewIndex];
+    // drop any existing media, keep the controls
+    var old = el.stage.querySelector("img, video");
+    if (old) { if (old.tagName === "VIDEO") old.src = ""; old.remove(); }
+
+    var media;
+    if (item.type === "video") {
+      media = document.createElement("video");
+      media.src = item.raw_url;
+      media.controls = true;
+      media.autoplay = true;
+      media.playsInline = true;
+      media.preload = "metadata";
+    } else {
+      media = document.createElement("img");
+      media.src = item.raw_url;
+      media.alt = baseName(item.relpath);
+    }
+    el.stage.insertBefore(media, el.stage.firstChild);
+
+    el.prev.style.visibility = S.viewIndex > 0 ? "visible" : "hidden";
+    var hasNext = S.viewIndex < S.items.length - 1 || !S.done;
+    el.next.style.visibility = hasNext ? "visible" : "hidden";
+  }
+
+  function renderCard() {
+    var item = S.items[S.viewIndex];
+    var rows = [];
+    rows.push(row("File", baseName(item.relpath)));
+    rows.push(row("Path", item.relpath));
+    var typeStr = item.type + (item.mime ? "  \u00b7  " + item.mime : "");
+    rows.push(row("Type", typeStr));
+    if (item.width && item.height) rows.push(row("Dimensions", item.width + " \u00d7 " + item.height));
+    if (item.type === "video" && item.duration) rows.push(row("Duration", fmtDuration(item.duration)));
+
+    el.card.innerHTML = "";
+    var h = document.createElement("h2");
+    h.textContent = "Catalog";
+    el.card.appendChild(h);
+    rows.forEach(function (r) { el.card.appendChild(r); });
+
+    // tags load lazily from the detail endpoint
+    var tagRow = document.createElement("div");
+    tagRow.className = "row";
+    tagRow.innerHTML = "<div class=\"k\">Tags</div>";
+    var box = document.createElement("div");
+    box.className = "muted";
+    box.textContent = "\u2026";
+    tagRow.appendChild(box);
+    el.card.appendChild(tagRow);
+
+    api("/api/item?path=" + encodeURIComponent(item.relpath)).then(function (d) {
+      // ignore if the user already moved on
+      if (S.items[S.viewIndex] !== item) return;
+      var tags = d.tags || [];
+      box.remove();
+      if (tags.length === 0) {
+        var m = document.createElement("div");
+        m.className = "muted";
+        m.textContent = "No tags yet.";
+        tagRow.appendChild(m);
+        return;
+      }
+      var wrap = document.createElement("div");
+      wrap.className = "tags";
+      tags.forEach(function (t) {
+        var chip = document.createElement("span");
+        chip.className = "tag" + (t.source === "ai" ? " ai" : "");
+        if (t.namespace) {
+          var ns = document.createElement("span");
+          ns.className = "ns";
+          ns.textContent = t.namespace + ":";
+          chip.appendChild(ns);
+        }
+        chip.appendChild(document.createTextNode(t.name));
+        if (t.source === "ai") {
+          var src = document.createElement("span");
+          src.className = "src";
+          src.textContent = "ai";
+          chip.appendChild(src);
+        }
+        wrap.appendChild(chip);
+      });
+      tagRow.appendChild(wrap);
+    }).catch(function () {
+      box.textContent = "(couldn't load tags)";
+    });
+  }
+
+  function row(k, v) {
+    var d = document.createElement("div");
+    d.className = "row";
+    var kk = document.createElement("div"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("div"); vv.className = "v"; vv.textContent = v;
+    d.appendChild(kk); d.appendChild(vv);
+    return d;
+  }
+
+  function closeViewer() {
+    var v = el.stage.querySelector("video");
+    if (v) v.src = "";
+    var m = el.stage.querySelector("img, video");
+    if (m) m.remove();
+    el.viewer.classList.remove("open");
+    el.viewer.setAttribute("aria-hidden", "true");
+    S.viewerOpen = false;
+    document.body.style.overflow = "";
+  }
+
+  function navigate(delta) {
+    var n = S.viewIndex + delta;
+    if (n < 0) return;
+    if (n >= S.items.length) {
+      if (S.done || S.mode === "search") return;
+      loadMore().then(function () {
+        if (n < S.items.length) openViewer(n);
+      });
+      return;
+    }
+    openViewer(n);
+  }
+
+  el.prev.addEventListener("click", function (e) { e.stopPropagation(); navigate(-1); });
+  el.next.addEventListener("click", function (e) { e.stopPropagation(); navigate(1); });
+  el.close.addEventListener("click", closeViewer);
+  el.viewer.addEventListener("click", function (e) {
+    if (e.target === el.viewer || e.target === el.stage) closeViewer();
+  });
+  document.addEventListener("keydown", function (e) {
+    if (!S.viewerOpen) return;
+    if (e.key === "Escape") closeViewer();
+    else if (e.key === "ArrowLeft") navigate(-1);
+    else if (e.key === "ArrowRight") navigate(1);
+  });
+
+  // ---- boot ----
+  loadMore();
+  pollStats();
+  setInterval(pollStats, 3000);
+})();
+</script>
+</body>
+</html>
