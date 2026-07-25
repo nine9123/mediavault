@@ -240,6 +240,17 @@
   .tag .src { color: var(--bone-faint); font-size: 9px; margin-left: 4px; }
   .muted { color: var(--bone-faint); font-size: 12px; }
 
+  /* the one bold use of brass-as-fill: a safelight-bright "new items" pill */
+  .chip {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+    z-index: 40;
+    font-family: var(--mono); font-size: 12px; letter-spacing: .06em;
+    color: var(--ink); background: var(--brass);
+    border: 0; border-radius: 999px; padding: 9px 16px; cursor: pointer;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  }
+  .chip:hover { filter: brightness(1.08); }
+
   /* ---- responsive: card becomes a bottom sheet ---- */
   @media (max-width: 720px) {
     :root { --cell-min: 108px; }
@@ -271,6 +282,8 @@
     <div class="sentinel hidden" id="sentinel">loading</div>
     <div class="state hidden" id="state"></div>
   </main>
+
+  <button class="chip hidden" id="chip" aria-live="polite">&#8593; <span id="chipn">0</span> new</button>
 
   <div class="viewer" id="viewer" aria-hidden="true">
     <div class="stage" id="stage">
@@ -310,8 +323,11 @@
     card: document.getElementById("card"),
     prev: document.getElementById("prev"),
     next: document.getElementById("next"),
-    close: document.getElementById("close")
+    close: document.getElementById("close"),
+    chip: document.getElementById("chip"),
+    chipn: document.getElementById("chipn")
   };
+  var lastCount = null, newSince = 0;
 
   function api(path) {
     return fetch(path).then(function (r) {
@@ -351,6 +367,8 @@
     S.done = false;
     el.grid.innerHTML = "";
     clearState();
+    newSince = 0;
+    el.chip.classList.add("hidden");
   }
 
   function makeCell(item, index) {
@@ -476,8 +494,36 @@
       if (st.scanning) txt += " \u00b7 scanning\u2026";
       else if (st.last && st.last.added) txt += " \u00b7 +" + st.last.added + " last scan";
       el.readout.innerHTML = txt;
+      maybeLive(st.items || 0);
     }).catch(function () { /* header stays as-is */ });
   }
+
+  // ---- live populate while scanning ----
+  // The grid is newest-first, so new items land at the top. If you're sitting
+  // at the top watching, refresh the first page in place; if you've scrolled
+  // down, don't yank the view — offer a chip to jump up and pull them in.
+  function maybeLive(count) {
+    if (lastCount === null) { lastCount = count; return; }
+    if (count > lastCount && S.mode === "browse" && !S.viewerOpen) {
+      if (window.scrollY < 150 && !S.loading) {
+        refreshTop();
+      } else {
+        newSince += (count - lastCount);
+        el.chipn.textContent = newSince;
+        el.chip.classList.remove("hidden");
+      }
+    }
+    lastCount = count;
+  }
+  function refreshTop() {
+    if (S.loading) return;
+    reset();      // also hides the chip + zeroes newSince
+    loadMore();
+  }
+  el.chip.addEventListener("click", function () {
+    window.scrollTo({ top: 0 });
+    refreshTop();
+  });
 
   // ---- viewer ----
   function openViewer(index) {

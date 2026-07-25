@@ -63,11 +63,11 @@ walk (1 goroutine)                  stat only; (size,mtime) change-detection
 - **Soft delete with a mount guard.** Vanished files get a `missing_since`
   stamp (tags/associations survive a NAS blip). If a scan sees *zero* files
   while the index has some, it assumes an unmount and skips pruning.
-- **Content hashing is opt-in** (`HASH_ON_INDEX`). Honest caveat: because
-  ffmpeg does the read for the thumbnail, hashing is a *second* full read over
-  the network per new file. It's isolated in `hashFile` so you can drop in a
-  cheap head+tail+size partial hash. It's used for dedup/move-detection only —
-  change-detection never needs it.
+- **Content hashing is cheap by default** (`HASH_MODE=partial`): a
+  head+tail+size fingerprint that reads at most 128 KiB per file regardless of
+  size. `full` reads every byte (strong but slow over SMB); `off` skips it.
+  It's for dedup/move-detection only — change-detection uses (size, mtime) —
+  and nothing consumes it yet, so `off` is fine if you don't need it.
 
 ## Run
 
@@ -93,7 +93,7 @@ docker compose up --build
 | `SCAN_WORKERS`  | `6`      | Worker-pool size (SMB is the bottleneck; keep 4–8)  |
 | `SCAN_INTERVAL` | `5m`     | Periodic rescan; `0` disables the ticker            |
 | `THUMB_PX`      | `400`    | Thumbnail longest edge (px)                         |
-| `HASH_ON_INDEX` | `true`   | Hash new files (extra full read); dedup/move only   |
+| `HASH_MODE`     | `partial`| Content fingerprint: `off` / `partial` / `full`     |
 | `FFMPEG`        | `ffmpeg` | ffmpeg binary                                       |
 | `FFPROBE`       | `ffprobe`| ffprobe binary                                      |
 

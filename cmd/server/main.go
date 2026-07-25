@@ -39,8 +39,13 @@ func main() {
 	defer stop()
 
 	// Background scanner: initial scan on boot, then periodic rescans. A scan in
-	// progress never blocks reads (WAL + single-writer).
-	go scanner.RunPeriodic(ctx)
+	// progress never blocks reads (WAL + single-writer). The done channel lets
+	// shutdown wait for an in-flight scan to persist before we close the DB.
+	scanDone := make(chan struct{})
+	go func() {
+		scanner.RunPeriodic(ctx)
+		close(scanDone)
+	}()
 
 	srv := &http.Server{
 		Addr:    cfg.Addr,
@@ -57,6 +62,14 @@ func main() {
 	log.Printf("listening on %s", cfg.Addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server: %v", err)
+	}
+	// The HTTP server has stopped; give an in-flight scan a moment to finish
+	// persisting its current batch before the deferred st.Close() runs. Writes
+	// are transactional, so blowing past this budget (SIGKILL) is still safe.
+	select {
+	case <-scanDone:
+	case <-time.After(8 * time.Second):
+		log.Println("scanner still busy; exiting anyway (writes are transactional)")
 	}
 	log.Println("shutdown complete")
 }

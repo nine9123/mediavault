@@ -2,7 +2,7 @@ services:
   mediavault:
     build: .
     ports:
-      - "8090:8080"
+      - "8080:8080"
     environment:
       # Keep workers modest: reads go over SMB, so the network link — not the
       # CPU — is the bottleneck. 4-8 typically saturates a gigabit mount.
@@ -11,14 +11,16 @@ services:
       # the UI also has a manual rescan (POST /api/scan).
       SCAN_INTERVAL: "5m"
       THUMB_PX: "400"
-      # Set to "false" to skip the extra full read per new file over the
-      # network. You only lose dedup + move-detection, not correctness.
-      HASH_ON_INDEX: "true"
+      # Content hashing of new files (dedup / move-detection; nothing consumes
+      # it yet, it just fills the field). "partial" = cheap head+tail+size
+      # fingerprint (recommended). "off" = fastest. "full" = read every byte
+      # over the network (slow for big videos).
+      HASH_MODE: "partial"
     volumes:
       # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
-      - /Volumes/share/Collection3:/media:ro
+      - /mnt/nas/media:/media:ro
       # Writable cache: SQLite DB + thumbnails. Safe to delete and rebuild.
-      - /Volumes/share/apps/mediavault:/data
+      - mediavault-data:/data
 
 volumes:
   mediavault-data:

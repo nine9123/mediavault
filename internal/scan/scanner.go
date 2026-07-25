@@ -14,6 +14,7 @@ package scan
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -112,39 +113,56 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	}
 	go func() { wg.Wait(); close(results) }() // close results once workers finish
 
-	// 3. Single writer: batch results into transactions.
+	// 3. Single writer: persist results in small, frequent transactions so
+	//    freshly-indexed items show up in the UI within a second or two (and so
+	//    a mid-scan stop loses at most the current partial batch). Writes use a
+	//    background context on purpose: cancellation stops the *producers* (the
+	//    walk + workers) below, and the writer simply persists whatever they
+	//    already produced rather than tearing a half-written batch on shutdown.
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		const batchSize = 128
-		batch := make([]store.ItemWrite, 0, batchSize)
+		const maxBatch = 32
+		const maxWait = 1500 * time.Millisecond
+		writeCtx := context.Background()
+		batch := make([]store.ItemWrite, 0, maxBatch)
 		flush := func() {
 			if len(batch) == 0 {
 				return
 			}
-			if err := s.store.WriteBatch(ctx, batch); err != nil {
+			if err := s.store.WriteBatch(writeCtx, batch); err != nil {
 				log.Printf("scan: write batch: %v", err)
 				stats.Errors++
 			}
 			batch = batch[:0]
 		}
-		for r := range results {
-			if r.err != nil {
-				log.Printf("scan: %s: %v", r.relpath, r.err)
-				stats.Errors++
-				continue
-			}
-			if r.updated {
-				stats.Updated++
-			} else {
-				stats.Added++
-			}
-			batch = append(batch, r.write)
-			if len(batch) >= batchSize {
-				flush()
+		ticker := time.NewTicker(maxWait)
+		defer ticker.Stop()
+		for {
+			select {
+			case r, ok := <-results:
+				if !ok {
+					flush()
+					return
+				}
+				if r.err != nil {
+					log.Printf("scan: %s: %v", r.relpath, r.err)
+					stats.Errors++
+					continue
+				}
+				if r.updated {
+					stats.Updated++
+				} else {
+					stats.Added++
+				}
+				batch = append(batch, r.write)
+				if len(batch) >= maxBatch {
+					flush()
+				}
+			case <-ticker.C:
+				flush() // time-based flush so partial batches still appear
 			}
 		}
-		flush()
 	}()
 
 	// 4. Walk the tree (single-threaded: it's I/O-bound and parallelising the
@@ -271,14 +289,20 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 		item.ThumbReady = true
 	}
 
-	// Content hash: dedup + move-detection only, NEVER change-detection.
-	// Honest note: ffmpeg (not us) read the file for the probe/thumbnail, so
-	// this hash is a *second* full read over the network per new file. It's
-	// opt-in and isolated here precisely so it's easy to make cheaper — swap
-	// hashFile for a head+tail+size partial hash if the full read costs too
-	// much. Change-detection never needs it; it uses (size, mtime).
-	if s.cfg.HashOnIndex {
-		if h, err := hashFile(j.abs); err != nil {
+	// Content hash: dedup + move-detection only, NEVER change-detection
+	// (that uses size+mtime). Default is "partial" — a head+tail+size
+	// fingerprint that costs two small reads regardless of file size, so it
+	// stays cheap over SMB. "full" reads every byte (strong but slow); "off"
+	// skips it. Nothing consumes the hash yet; it's stored for future dedup.
+	switch s.cfg.HashMode {
+	case "full":
+		if h, err := hashFileFull(j.abs); err != nil {
+			log.Printf("scan: hash %s: %v", j.relpath, err)
+		} else {
+			item.ContentHash = h
+		}
+	case "partial":
+		if h, err := hashFilePartial(j.abs, item.Size); err != nil {
 			log.Printf("scan: hash %s: %v", j.relpath, err)
 		} else {
 			item.ContentHash = h
@@ -384,9 +408,9 @@ func (s *Scanner) RunPeriodic(ctx context.Context) {
 	}
 }
 
-// hashFile returns the hex sha256 of a file's contents. See the note in
-// process about the cost of this read over SMB.
-func hashFile(path string) (string, error) {
+// hashFileFull returns the hex sha256 of a file's entire contents. Strong, but
+// reads every byte — slow over SMB for large media. Used only for HASH_MODE=full.
+func hashFileFull(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -395,6 +419,47 @@ func hashFile(path string) (string, error) {
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashFilePartial fingerprints a file from its size plus its first and last
+// 64 KiB. It reads at most 128 KiB no matter how large the file is, so it stays
+// cheap over the network while still reliably matching / distinguishing real
+// media files (enough to detect a moved or renamed file). Not a cryptographic
+// uniqueness guarantee — a dedup/move hint, not something to trust blindly.
+func hashFilePartial(path string, size int64) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	const chunk = 64 * 1024
+	h := sha256.New()
+
+	// Fold in the size so different-length files can never collide.
+	var sizeBuf [8]byte
+	binary.LittleEndian.PutUint64(sizeBuf[:], uint64(size))
+	h.Write(sizeBuf[:])
+
+	buf := make([]byte, chunk)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return "", err
+	}
+	h.Write(buf[:n])
+
+	// Only read a tail if it wouldn't overlap the head we already hashed.
+	if size > int64(2*chunk) {
+		if _, err := f.Seek(-int64(chunk), io.SeekEnd); err != nil {
+			return "", err
+		}
+		m, err := io.ReadFull(f, buf)
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			return "", err
+		}
+		h.Write(buf[:m])
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

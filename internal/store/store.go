@@ -286,7 +286,7 @@ func (s *Store) RecordScanRun(ctx context.Context, st model.ScanStats) error {
 // ListItems returns present items, newest path last, for the grid.
 func (s *Store) ListItems(ctx context.Context, limit, offset int) ([]model.Item, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+itemCols+` FROM items WHERE missing_since IS NULL ORDER BY relpath LIMIT ? OFFSET ?`,
+		`SELECT `+itemCols+` FROM items WHERE missing_since IS NULL ORDER BY indexed_at DESC, id DESC LIMIT ? OFFSET ?`,
 		limit, offset)
 	if err != nil {
 		return nil, err

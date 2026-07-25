@@ -22,11 +22,15 @@ type Config struct {
 	ScanEvery time.Duration // periodic rescan interval; 0 disables the ticker
 	ThumbPx   int           // thumbnail longest edge, px
 
-	// HashOnIndex computes a content hash the first time a file is indexed.
-	// NOTE: because ffmpeg (not us) reads the file for the thumbnail, this is a
-	// *second* full read over the network per new file. Turn it off if that
-	// cost is too high — you lose only dedup + move-detection, not correctness.
-	HashOnIndex bool
+	// HashMode controls content hashing of new files, used for dedup and
+	// move-detection (so tags can follow a renamed file). Nothing reads it yet;
+	// it just populates the field for those future features.
+	//   "off"     no hashing — fastest.
+	//   "partial" hash head+tail+size only — near-constant tiny cost regardless
+	//             of file size, enough to fingerprint a moved/renamed file.
+	//   "full"    hash every byte — strongest, but reads the whole file over the
+	//             network (slow for large videos). Was the old default.
+	HashMode string
 
 	FFmpeg  string // ffmpeg binary (on PATH by default)
 	FFprobe string // ffprobe binary
@@ -50,16 +54,16 @@ func (c Config) MediaTypeFor(name string) (model.MediaType, bool) {
 // Load reads configuration from the environment.
 func Load() Config {
 	return Config{
-		MediaRoot:   env("MEDIA_ROOT", "/media"),
-		DataDir:     env("DATA_DIR", "/data"),
-		Addr:        env("ADDR", ":8080"),
-		Workers:     envInt("SCAN_WORKERS", 6),
-		ScanEvery:   envDur("SCAN_INTERVAL", 5*time.Minute),
-		ThumbPx:     envInt("THUMB_PX", 400),
-		HashOnIndex: envBool("HASH_ON_INDEX", true),
-		FFmpeg:      env("FFMPEG", "ffmpeg"),
-		FFprobe:     env("FFPROBE", "ffprobe"),
-		Exts:        defaultExts(),
+		MediaRoot: env("MEDIA_ROOT", "/media"),
+		DataDir:   env("DATA_DIR", "/data"),
+		Addr:      env("ADDR", ":8080"),
+		Workers:   envInt("SCAN_WORKERS", 6),
+		ScanEvery: envDur("SCAN_INTERVAL", 5*time.Minute),
+		ThumbPx:   envInt("THUMB_PX", 400),
+		HashMode:  hashMode(env("HASH_MODE", "partial")),
+		FFmpeg:    env("FFMPEG", "ffmpeg"),
+		FFprobe:   env("FFPROBE", "ffprobe"),
+		Exts:      defaultExts(),
 	}
 }
 
@@ -71,6 +75,15 @@ func defaultExts() map[string]model.MediaType {
 		".gif": model.MediaAnimated, ".webp": model.MediaAnimated, // webp may be still or animated; treat as animated
 		".mp4": model.MediaVideo, ".m4v": model.MediaVideo, ".webm": model.MediaVideo,
 		".mkv": model.MediaVideo, ".mov": model.MediaVideo, ".avi": model.MediaVideo,
+	}
+}
+
+func hashMode(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "off", "partial", "full":
+		return strings.ToLower(strings.TrimSpace(v))
+	default:
+		return "partial"
 	}
 }
 
