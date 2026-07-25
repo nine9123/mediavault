@@ -118,6 +118,11 @@ func defaultExts() map[string]model.MediaType {
 		".flv": model.MediaVideo, ".f4v": model.MediaVideo, ".vob": model.MediaVideo,
 		".wmv": model.MediaVideo, ".asf": model.MediaVideo, ".ogv": model.MediaVideo,
 		".3gp": model.MediaVideo, ".3g2": model.MediaVideo, ".divx": model.MediaVideo,
+		// audio — the embedded cover art (if any) becomes the thumbnail
+		".mp3": model.MediaAudio, ".m4a": model.MediaAudio, ".aac": model.MediaAudio,
+		".flac": model.MediaAudio, ".wav": model.MediaAudio, ".ogg": model.MediaAudio,
+		".oga": model.MediaAudio, ".opus": model.MediaAudio, ".wma": model.MediaAudio,
+		".aif": model.MediaAudio, ".aiff": model.MediaAudio,
 	}
 }
 

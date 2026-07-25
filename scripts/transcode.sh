@@ -110,6 +110,21 @@ do_image() { # $1 abs  $2 rel
   fi
 }
 
+do_audio() { # $1 abs  $2 rel  — only for non-web audio; web audio plays as-is
+  local src="$1" rel="$2" out="$DST/$2.mp3"
+  if up_to_date "$src" "$out"; then n_skip=$((n_skip+1)); return; fi
+  mkdir -p "$(dirname "$out")"
+  local tmp="$out.part.mp3"
+  echo "audio->mp3: $rel"
+  # Cover art (if any) is already extracted into mediavault's thumbnail, so we
+  # only need the audio here.
+  if ffmpeg -v error -y -i "$src" -vn -map 0:a:0 -c:a libmp3lame -q:a 2 "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$out"; n_remux=$((n_remux+1))
+  else
+    rm -f "$tmp"; echo "audio convert failed: $rel" >&2; n_fail=$((n_fail+1))
+  fi
+}
+
 while IFS= read -r -d '' f; do
   rel="${f#"$SRC"/}"
   ext="${f##*.}"; ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
@@ -119,6 +134,9 @@ while IFS= read -r -d '' f; do
     # non-web stills that need a JPEG preview (web-native jpg/png/gif/webp/avif/svg are left alone)
     heic|heif|tif|tiff|jp2|j2k|jpf|tga|exr|hdr|dds|ppm|pgm|pbm|pnm|bmp|jxl|cr2|cr3|nef|arw|dng|raf|orf|rw2|pef)
       do_image "$f" "$rel" ;;
+    # non-web audio -> mp3 (mp3/m4a/aac/ogg/oga/opus/flac/wav already play in browsers)
+    wma|aif|aiff)
+      do_audio "$f" "$rel" ;;
     *) : ;;
   esac
 done < <(find "$SRC" -type f -print0)

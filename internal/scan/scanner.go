@@ -356,7 +356,7 @@ func (s *Scanner) buildChains(ctx context.Context) error {
 			return nil
 		}
 		typ, ok := s.cfg.MediaTypeFor(name)
-		if !ok || typ == model.MediaVideo {
+		if !ok || typ == model.MediaVideo || typ == model.MediaAudio {
 			return nil // chains are image stories
 		}
 		rel, err := filepath.Rel(s.cfg.MediaRoot, abs)

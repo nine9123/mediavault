@@ -11,6 +11,7 @@ const (
 	MediaImage    MediaType = "image"    // still: jpg, png, avif, ...
 	MediaAnimated MediaType = "animated" // gif / animated webp (looping, no audio)
 	MediaVideo    MediaType = "video"    // mp4, webm, mkv, ...
+	MediaAudio    MediaType = "audio"    // mp3, flac, m4a, ... (cover art used as thumbnail)
 )
 
 // Item is one media file. Everything here is *derivable* from the file (plus
@@ -26,7 +27,7 @@ type Item struct {
 	MIME         string
 	Width        int
 	Height       int
-	Duration     float64 // seconds; video only
+	Duration     float64 // seconds; video + audio
 	ThumbReady   bool
 	IndexedAt    time.Time
 	SeenAt       time.Time

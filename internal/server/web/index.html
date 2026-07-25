@@ -285,6 +285,11 @@
   .unplayable p.sub{color:var(--bone-faint);font-size:.8rem;word-break:break-all}
   .unplayable a{margin-top:.4rem;color:var(--brass);text-decoration:none;font-family:var(--mono);font-size:.8rem;border:1px solid var(--brass-soft);padding:.5rem .9rem;border-radius:2px}
   .unplayable a:hover{background:var(--brass);color:var(--ink)}
+  .audio{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;padding:24px}
+  .audio .cover{max-width:min(70vw,480px);max-height:min(60vh,480px);width:auto;height:auto;object-fit:contain;border:1px solid var(--ink-line);box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  .audio .cover.noart{display:flex;align-items:center;justify-content:center;width:min(60vw,320px);height:min(60vw,320px);max-height:40vh;background:var(--ink-raised);color:var(--bone-faint);font-size:5rem;line-height:1}
+  .audio audio{width:min(90vw,560px)}
+  .noprev.note{font-size:2rem;color:var(--bone-faint)}
 </style>
 </head>
 <body>
@@ -392,6 +397,13 @@
     return d;
   }
 
+  function noteGlyph() {
+    var d = document.createElement("div");
+    d.className = "noprev note";
+    d.textContent = "\u266a"; // musical note for audio with no embedded cover
+    return d;
+  }
+
   function makeCell(item) {
     var cell = document.createElement("div");
     cell.className = "cell";
@@ -410,13 +422,16 @@
       img.addEventListener("error", function () { img.remove(); cell.appendChild(noPreview()); });
       img.src = item.thumb_url;
       cell.appendChild(img);
+    } else if (item.type === "audio") {
+      cell.appendChild(noteGlyph());
     } else {
       cell.appendChild(noPreview());
     }
 
     var badge = document.createElement("span");
-    badge.className = "badge" + (item.type === "video" ? " vid" : "");
+    badge.className = "badge" + (item.type === "video" || item.type === "audio" ? " vid" : "");
     if (item.type === "video") badge.textContent = "VID " + fmtDuration(item.duration);
+    else if (item.type === "audio") badge.textContent = "AUD " + fmtDuration(item.duration);
     else if (item.type === "animated") badge.textContent = "GIF";
     else badge.textContent = "IMG";
     cell.appendChild(badge);
@@ -625,8 +640,23 @@
     document.body.style.overflow = "hidden";
   }
 
+  function stopMedia(n) {
+    try { n.pause(); } catch (e) {}
+    n.removeAttribute("src");
+    if (n.load) n.load();
+  }
+
+  function clearStage() {
+    el.stage.querySelectorAll("video, audio").forEach(stopMedia);
+    el.stage.querySelectorAll("img, video, audio, .audio, .unplayable").forEach(function (n) { n.remove(); });
+  }
+
   function showUnplayable(item, node) {
-    if (node && node.parentNode) { if (node.tagName === "VIDEO") node.src = ""; node.remove(); }
+    if (node) {
+      if (node.querySelectorAll) node.querySelectorAll("video, audio").forEach(stopMedia);
+      if (node.tagName === "VIDEO" || node.tagName === "AUDIO") stopMedia(node);
+      if (node.parentNode) node.remove();
+    }
     if (S.items[S.viewIndex] !== item || el.stage.querySelector(".unplayable")) return;
     var box = document.createElement("div");
     box.className = "unplayable";
@@ -646,10 +676,7 @@
 
   function renderStage() {
     var item = S.items[S.viewIndex];
-    el.stage.querySelectorAll("img, video, .unplayable").forEach(function (n) {
-      if (n.tagName === "VIDEO") n.src = "";
-      n.remove();
-    });
+    clearStage();
 
     var media;
     if (item.type === "video") {
@@ -660,6 +687,28 @@
       media.playsInline = true;
       media.preload = "metadata";
       media.addEventListener("error", function () { showUnplayable(item, media); });
+    } else if (item.type === "audio") {
+      media = document.createElement("div");
+      media.className = "audio";
+      var cover;
+      if (item.thumb_ready) {
+        cover = document.createElement("img");
+        cover.className = "cover";
+        cover.src = item.thumb_url;
+        cover.alt = baseName(item.relpath);
+      } else {
+        cover = document.createElement("div");
+        cover.className = "cover noart";
+        cover.textContent = "\u266a";
+      }
+      media.appendChild(cover);
+      var audio = document.createElement("audio");
+      audio.src = item.raw_url;
+      audio.controls = true;
+      audio.autoplay = true;
+      audio.preload = "metadata";
+      audio.addEventListener("error", function () { showUnplayable(item, media); });
+      media.appendChild(audio);
     } else {
       media = document.createElement("img");
       media.src = item.raw_url;
@@ -692,8 +741,8 @@
     el.card.appendChild(row("File", baseName(item.relpath)));
     el.card.appendChild(row("Path", item.relpath));
     el.card.appendChild(row("Type", item.type + (item.mime ? "  \u00b7  " + item.mime : "")));
-    if (item.width && item.height) el.card.appendChild(row("Dimensions", item.width + " \u00d7 " + item.height));
-    if (item.type === "video" && item.duration) el.card.appendChild(row("Duration", fmtDuration(item.duration)));
+    if (item.width && item.height && item.type !== "audio") el.card.appendChild(row("Dimensions", item.width + " \u00d7 " + item.height));
+    if ((item.type === "video" || item.type === "audio") && item.duration) el.card.appendChild(row("Duration", fmtDuration(item.duration)));
 
     var tagRow = document.createElement("div");
     tagRow.className = "row";
@@ -809,10 +858,7 @@
   }
 
   function closeViewer() {
-    el.stage.querySelectorAll("img, video, .unplayable").forEach(function (n) {
-      if (n.tagName === "VIDEO") n.src = "";
-      n.remove();
-    });
+    clearStage();
     el.viewer.classList.remove("open");
     el.viewer.setAttribute("aria-hidden", "true");
     S.viewerOpen = false;

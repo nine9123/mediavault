@@ -234,3 +234,16 @@ If part of your collection wasn't showing up before, a rescan will now pick it
 up. Note: HEIC decoding depends on your ffmpeg build, and most RAW won't
 thumbnail without external tooling — such files are still indexed, searchable,
 and downloadable.
+
+## Audio
+
+Audio files (`mp3`, `m4a`, `aac`, `flac`, `wav`, `ogg`/`oga`, `opus`, `wma`,
+`aiff`) are indexed alongside everything else. The file's **embedded cover art**
+is extracted (via ffmpeg) and used as its thumbnail, so a music folder shows
+album covers in the grid; files with no embedded art get a ♪ placeholder.
+Opening one shows the cover with an audio player beneath it.
+
+Most audio plays in the browser directly. `wma` (and some `aiff`) don't, so
+`scripts/transcode.sh` converts those to an mp3 in `DERIVED_DIR`, which
+mediavault then serves — same mechanism as video. Cover art is unaffected (it
+comes from the thumbnail, not the derived audio).

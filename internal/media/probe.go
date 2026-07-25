@@ -56,7 +56,7 @@ func Probe(ctx context.Context, cfg config.Config, path string, typ model.MediaT
 		m.Width = probe.Streams[0].Width
 		m.Height = probe.Streams[0].Height
 	}
-	if typ == model.MediaVideo {
+	if typ == model.MediaVideo || typ == model.MediaAudio {
 		// Prefer the container duration; fall back to the video stream's, since
 		// many webms carry no duration in the format header.
 		if d, ok := parseDur(probe.Format.Duration); ok {

@@ -31,6 +31,11 @@ var mimeByExt = map[string]string{
 	".wmv": "video/x-ms-wmv", ".asf": "video/x-ms-asf",
 	".ogv": "video/ogg", ".3gp": "video/3gpp", ".3g2": "video/3gpp2",
 	".divx": "video/divx",
+	// audio
+	".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+	".flac": "audio/flac", ".wav": "audio/wav", ".ogg": "audio/ogg",
+	".oga": "audio/ogg", ".opus": "audio/opus", ".wma": "audio/x-ms-wma",
+	".aif": "audio/aiff", ".aiff": "audio/aiff",
 }
 
 // MimeFor returns a best-effort MIME type from the file extension.

@@ -333,7 +333,7 @@ func (s *Server) derivedFor(rel string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	for _, suf := range []string{".mp4", ".webm", ".m4v", ".jpg", ".jpeg", ".webp", ".png"} {
+	for _, suf := range []string{".mp4", ".webm", ".m4v", ".jpg", ".jpeg", ".webp", ".png", ".mp3", ".m4a", ".ogg", ".oga"} {
 		if fi, err := os.Stat(base + suf); err == nil && !fi.IsDir() {
 			return base + suf, true
 		}
