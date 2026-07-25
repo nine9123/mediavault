@@ -1,13 +1,15 @@
 // Package sidecar reads and writes the small JSON files that hold
-// human-authored data next to each media file — the ONE place the app ever
-// writes into the media tree, and only ever a sidecar, never the media itself.
+// human-authored data (tags, rating, notes) for each media file. Sidecars are
+// the source of truth for that metadata, so dropping the SQLite cache loses
+// nothing — a rescan reads it all back.
 //
-//	photo.jpg          <- media (read-only, the truth for pixels)
+//	photo.jpg          <- media (the truth for pixels)
 //	photo.jpg.json     <- sidecar (tags, rating, notes — the truth for metadata)
 //	chain.json         <- optional per-folder manifest (title + explicit order)
 //
-// Because this data lives on disk beside the media, dropping the SQLite cache
-// loses nothing: a rescan reads it all back.
+// Where sidecars live is the caller's choice (see config.SidecarPath): beside
+// the media file, or mirrored under a separate writable dir so the media mount
+// can stay read-only. Either way this package only ever writes a sidecar.
 package sidecar
 
 import (
@@ -29,15 +31,14 @@ type Sidecar struct {
 	Notes   string   `json:"notes,omitempty"`
 }
 
-func pathFor(mediaAbs string) string { return mediaAbs + suffix }
-
 // IsSidecar reports whether a filename is a sidecar/manifest (so the scanner
 // skips it as media). Everything ending in .json qualifies.
 func IsSidecar(name string) bool { return strings.HasSuffix(strings.ToLower(name), suffix) }
 
-// Read loads the sidecar for a media file, if one exists.
-func Read(mediaAbs string) (Sidecar, bool, error) {
-	b, err := os.ReadFile(pathFor(mediaAbs))
+// Read loads the sidecar at the given path, if it exists. The caller decides
+// where sidecars live (see config.SidecarPath).
+func Read(path string) (Sidecar, bool, error) {
+	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return Sidecar{}, false, nil
 	}
@@ -51,18 +52,21 @@ func Read(mediaAbs string) (Sidecar, bool, error) {
 	return s, true, nil
 }
 
-// Write persists a sidecar atomically (temp file + rename). The UI calls this
-// when you edit tags/rating; the AI tagger writes its own tags separately.
-func Write(mediaAbs string, s Sidecar) error {
+// Write persists a sidecar atomically (temp file + rename), creating parent
+// directories as needed. This is the only place the app writes metadata.
+func Write(path string, s Sidecar) error {
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := pathFor(mediaAbs) + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, pathFor(mediaAbs))
+	return os.Rename(tmp, path)
 }
 
 // Tags parses the sidecar's tag strings into model.Tags, splitting an optional

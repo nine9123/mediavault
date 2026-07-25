@@ -94,13 +94,19 @@ docker compose up --build
 | `SCAN_INTERVAL` | `5m`     | Periodic rescan; `0` disables the ticker            |
 | `THUMB_PX`      | `400`    | Thumbnail longest edge (px)                         |
 | `HASH_MODE`     | `partial`| Content fingerprint: `off` / `partial` / `full`     |
+| `SIDECAR_DIR`   | *(empty)*| Where tag sidecars live; empty = next to the media  |
 | `FFMPEG`        | `ffmpeg` | ffmpeg binary                                       |
 | `FFPROBE`       | `ffprobe`| ffprobe binary                                      |
 
 ## HTTP API
 
-- `GET  /api/items?limit=&offset=` — list items (JSON DTOs with thumb/raw URLs)
+- `GET  /api/items?limit=&before=&after=` — list items newest-first; `before=<id>`
+  pages older, `after=<id>` fetches newer (used to live-stream during a scan)
 - `GET  /api/search?q=&limit=` — FTS5 search over path + tags
+- `GET  /api/item?path=` — one item plus its tags (manual + ai)
+- `PUT  /api/tags` — `{ "path": "...", "tags": ["a", "artist:b"] }`; writes the
+  sidecar and syncs the DB immediately (no rescan needed)
+- `GET  /api/stats` — collection size + latest scan (drives the live UI)
 - `POST /api/scan` — trigger a rescan (returns 202; overlapping calls collapse)
 - `GET  /api/thumb/{path...}` — cached thumbnail
 - `GET  /api/raw/{path...}` — original file, **served with Range** (video seeks)
@@ -119,6 +125,23 @@ docker compose up --build
 
 Tags may use a `namespace:name` prefix. This file is the source of truth for
 manual tags; a rescan mirrors it into the DB for querying.
+
+**Editing:** open any item and edit its tags in the catalog panel — type a tag
+and press Enter (comma-separate to add several), click `×` to remove one. Each
+change writes the sidecar and updates the DB immediately, so it's searchable
+right away without waiting for a scan. AI tags (if you later add the tagger) are
+shown but not editable here. Click any tag to search for it.
+
+**Search:** the search box runs an FTS5 prefix match over both the file path and
+the tags, so typing a tag name (including a `namespace:name` tag) finds it.
+
+**Where sidecars live** is set by `SIDECAR_DIR`:
+
+- **empty** — beside the media (`photo.jpg.json`). Portable and moves with the
+  file, but requires the media mount to be **writable**.
+- **set to a path** (the compose default, `/meta` on its own volume) — sidecars
+  are mirrored there by relative path, so the **media mount stays read-only**.
+  Back this volume up; it holds your only copy of manual tags/ratings.
 
 ## Chains (your "story" reader)
 

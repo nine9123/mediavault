@@ -16,11 +16,19 @@ services:
       # fingerprint (recommended). "off" = fastest. "full" = read every byte
       # over the network (slow for big videos).
       HASH_MODE: "partial"
+      # Where per-file tag sidecars are written. Set to a writable path (mounted
+      # below) so your media mount can stay read-only. Leave empty to write
+      # sidecars next to each media file instead (needs a writable media mount).
+      SIDECAR_DIR: "/meta"
     volumes:
       # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
       - /mnt/nas/media:/media:ro
       # Writable cache: SQLite DB + thumbnails. Safe to delete and rebuild.
       - mediavault-data:/data
+      # Your tags/ratings live here — the durable source of truth. Keep this
+      # separate from the disposable cache above, and back it up.
+      - mediavault-metadata:/meta
 
 volumes:
   mediavault-data:
+  mediavault-metadata:

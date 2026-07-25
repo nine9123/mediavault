@@ -230,6 +230,7 @@
   .v { font-size: 12.5px; color: var(--bone); margin-top: 3px; word-break: break-word; line-height: 1.5; }
   .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .tag {
+    display: inline-flex; align-items: center;
     font-size: 11px; letter-spacing: .02em;
     color: var(--bone); background: var(--ink);
     border: 1px solid var(--ink-line); border-radius: 2px;
@@ -238,6 +239,22 @@
   .tag.ai { color: var(--bone-dim); border-style: dashed; }
   .tag .ns { color: var(--brass-soft); }
   .tag .src { color: var(--bone-faint); font-size: 9px; margin-left: 4px; }
+  .tag .taglabel { cursor: pointer; }
+  .tag .x {
+    margin-left: 6px; padding: 0 2px;
+    background: transparent; border: 0; cursor: pointer;
+    color: var(--bone-faint); font-size: 13px; line-height: 1;
+  }
+  .tag .x:hover { color: var(--brass); }
+  .tagadd {
+    margin-top: 8px; width: 100%;
+    background: var(--ink); color: var(--bone);
+    border: 1px solid var(--ink-line); border-radius: 2px;
+    padding: 7px 9px; font-family: var(--mono); font-size: 12px;
+  }
+  .tagadd:focus { outline: none; border-color: var(--brass-soft); }
+  .tagadd::placeholder { color: var(--bone-faint); }
+  .taghint { margin-top: 6px; min-height: 14px; font-size: 11px; }
   .muted { color: var(--bone-faint); font-size: 12px; }
 
   /* the one bold use of brass-as-fill: a safelight-bright "new items" pill */
@@ -262,6 +279,11 @@
   @media (prefers-reduced-motion: reduce) {
     *, .cell img, .safelight { transition: none !important; animation: none !important; }
   }
+  .unplayable{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.75rem;padding:3rem 1.5rem;text-align:center}
+  .unplayable p{margin:0;color:var(--bone);font-family:var(--mono);font-size:.9rem;letter-spacing:.02em}
+  .unplayable p.sub{color:var(--bone-faint);font-size:.8rem;word-break:break-all}
+  .unplayable a{margin-top:.4rem;color:var(--brass);text-decoration:none;font-family:var(--mono);font-size:.8rem;border:1px solid var(--brass-soft);padding:.5rem .9rem;border-radius:2px}
+  .unplayable a:hover{background:var(--brass);color:var(--ink)}
 </style>
 </head>
 <body>
@@ -299,15 +321,19 @@
   "use strict";
 
   var PAGE = 120;
+
   var S = {
     mode: "browse",   // browse | search
     query: "",
-    offset: 0,
-    items: [],
-    loading: false,
-    done: false,
+    items: [],        // display order: newest id first
+    maxId: null,      // highest id loaded (top of grid)
+    minId: null,      // lowest id loaded (bottom of grid)
+    doneOlder: false, // no older items remain
+    busyOlder: false,
+    busyNewer: false,
     viewIndex: -1,
-    viewerOpen: false
+    viewerOpen: false,
+    scanning: false
   };
 
   var el = {
@@ -323,11 +349,8 @@
     card: document.getElementById("card"),
     prev: document.getElementById("prev"),
     next: document.getElementById("next"),
-    close: document.getElementById("close"),
-    chip: document.getElementById("chip"),
-    chipn: document.getElementById("chipn")
+    close: document.getElementById("close")
   };
-  var lastCount = null, newSince = 0;
 
   function api(path) {
     return fetch(path).then(function (r) {
@@ -360,21 +383,22 @@
     return i >= 0 ? rel.slice(i + 1) : rel;
   }
 
-  // ---- grid ----
-  function reset() {
-    S.items = [];
-    S.offset = 0;
-    S.done = false;
-    el.grid.innerHTML = "";
-    clearState();
-    newSince = 0;
-    el.chip.classList.add("hidden");
+  // ---- cells ----
+  function noPreview() {
+    var d = document.createElement("div");
+    d.className = "noprev";
+    d.textContent = "no preview";
+    return d;
   }
 
-  function makeCell(item, index) {
+  function makeCell(item) {
     var cell = document.createElement("div");
     cell.className = "cell";
-    cell.addEventListener("click", function () { openViewer(index); });
+    // resolve index at click time so prepends/appends never desync handlers
+    cell.addEventListener("click", function () {
+      var i = S.items.indexOf(item);
+      if (i >= 0) openViewer(i);
+    });
 
     if (item.thumb_ready) {
       var img = document.createElement("img");
@@ -382,10 +406,7 @@
       img.decoding = "async";
       img.alt = baseName(item.relpath);
       img.addEventListener("load", function () { img.classList.add("ok"); });
-      img.addEventListener("error", function () {
-        img.remove();
-        cell.appendChild(noPreview());
-      });
+      img.addEventListener("error", function () { img.remove(); cell.appendChild(noPreview()); });
       img.src = item.thumb_url;
       cell.appendChild(img);
     } else {
@@ -406,77 +427,123 @@
 
     return cell;
   }
-  function noPreview() {
-    var d = document.createElement("div");
-    d.className = "noprev";
-    d.textContent = "no preview";
-    return d;
+
+  function trackBounds(item) {
+    if (S.maxId === null || item.id > S.maxId) S.maxId = item.id;
+    if (S.minId === null || item.id < S.minId) S.minId = item.id;
   }
 
-  function loadMore() {
-    if (S.loading || S.done) return Promise.resolve();
-    S.loading = true;
+  function appendItem(item) {
+    S.items.push(item);
+    el.grid.appendChild(makeCell(item));
+    trackBounds(item);
+  }
+
+  function reset() {
+    S.items = [];
+    S.maxId = null;
+    S.minId = null;
+    S.doneOlder = false;
+    el.grid.innerHTML = "";
+    clearState();
+  }
+
+  function emptyBrowse() {
+    showState("", "No items yet.",
+      "If a scan is running, thumbnails appear here as files are processed. Otherwise add media under your media root and press Rescan.");
+  }
+
+  // ---- initial + older (infinite scroll) ----
+  function loadInitial() {
+    S.busyOlder = true;
     el.sentinel.classList.remove("hidden");
     el.sentinel.textContent = "loading";
-
-    var path = S.mode === "search"
-      ? "/api/search?q=" + encodeURIComponent(S.query) + "&limit=" + 200
-      : "/api/items?limit=" + PAGE + "&offset=" + S.offset;
-
-    return api(path).then(function (data) {
-      var batch = data.items || [];
-      var start = S.items.length;
-      for (var i = 0; i < batch.length; i++) {
-        S.items.push(batch[i]);
-        el.grid.appendChild(makeCell(batch[i], start + i));
-      }
-      S.offset += batch.length;
-
-      // Search returns a single (capped) page; browse is done when short.
-      if (S.mode === "search" || batch.length < PAGE) S.done = true;
-
+    return api("/api/items?limit=" + PAGE).then(function (d) {
+      var batch = d.items || [];
+      batch.forEach(appendItem);
+      if (batch.length < PAGE) S.doneOlder = true;
       if (S.items.length === 0) {
-        if (S.mode === "search") {
-          showState("", "No matches", "for \u201c" + S.query + "\u201d.");
-        } else {
-          showState("", "Nothing indexed yet.",
-            "If a scan is running, thumbnails appear as files are processed. Otherwise add media under your media root and Rescan.");
-        }
+        S.maxId = 0;        // prime the live cursor so items stream in from empty
+        S.doneOlder = true;
+        emptyBrowse();
       }
-      el.sentinel.classList.toggle("hidden", S.done);
-      if (S.done) el.sentinel.textContent = "";
+      el.sentinel.classList.toggle("hidden", S.doneOlder);
     }).catch(function (e) {
-      S.done = true;
+      S.doneOlder = true;
       el.sentinel.classList.add("hidden");
-      if (S.items.length === 0) {
-        showState("err", "Can't reach the server.", "Is mediavault still running? (" + e.message + ")");
-      }
-    }).finally(function () {
-      S.loading = false;
+      if (S.items.length === 0) showState("err", "Can't reach the server.", "Is mediavault still running? (" + e.message + ")");
+    }).finally(function () { S.busyOlder = false; });
+  }
+
+  function loadOlder() {
+    if (S.mode !== "browse" || S.busyOlder || S.doneOlder || S.minId === null) return null;
+    S.busyOlder = true;
+    el.sentinel.classList.remove("hidden");
+    el.sentinel.textContent = "loading";
+    return api("/api/items?before=" + S.minId + "&limit=" + PAGE).then(function (d) {
+      var batch = d.items || [];
+      batch.forEach(appendItem);
+      if (batch.length < PAGE) S.doneOlder = true;
+      el.sentinel.classList.toggle("hidden", S.doneOlder);
+    }).catch(function () {}).finally(function () { S.busyOlder = false; });
+  }
+
+  // ---- newer (live stream, prepend at top) ----
+  function loadNewer() {
+    if (S.mode !== "browse" || S.busyNewer || S.viewerOpen || S.maxId === null) return;
+    S.busyNewer = true;
+    api("/api/items?after=" + S.maxId + "&limit=" + PAGE).then(function (d) {
+      var batch = d.items || []; // ascending by id (oldest-new first)
+      if (batch.length === 0) return;
+      clearState();
+
+      var atTop = (window.scrollY || document.documentElement.scrollTop || 0) < 60;
+      var before = document.body.scrollHeight;
+
+      var frag = document.createDocumentFragment();
+      for (var i = batch.length - 1; i >= 0; i--) frag.appendChild(makeCell(batch[i]));
+      el.grid.insertBefore(frag, el.grid.firstChild);
+
+      var desc = batch.slice().reverse(); // newest first
+      S.items = desc.concat(S.items);
+      desc.forEach(trackBounds);
+
+      // if the reader has scrolled down, keep their view fixed; new items wait above
+      if (!atTop) window.scrollBy(0, document.body.scrollHeight - before);
+    }).catch(function () {}).finally(function () { S.busyNewer = false; });
+  }
+
+  // ---- search ----
+  function runSearch() {
+    el.sentinel.classList.add("hidden");
+    api("/api/search?q=" + encodeURIComponent(S.query) + "&limit=200").then(function (d) {
+      var batch = d.items || [];
+      batch.forEach(function (it) { S.items.push(it); el.grid.appendChild(makeCell(it)); });
+      if (batch.length === 0) showState("", "No matches", "for \u201c" + S.query + "\u201d.");
+    }).catch(function (e) {
+      showState("err", "Can't reach the server.", "(" + e.message + ")");
     });
   }
 
-  // infinite scroll
+  // infinite scroll (older)
   var io = new IntersectionObserver(function (entries) {
-    if (entries[0].isIntersecting) loadMore();
-  }, { rootMargin: "600px" });
+    if (entries[0].isIntersecting) loadOlder();
+  }, { rootMargin: "800px" });
   io.observe(el.sentinel);
 
-  // ---- search (debounced) ----
+  // search (debounced)
   var searchTimer = null;
   el.q.addEventListener("input", function () {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(function () {
       var v = el.q.value.trim();
-      if (v === S.query && v !== "") return;
       S.query = v;
-      S.mode = v === "" ? "browse" : "search";
-      reset();
-      loadMore();
+      if (v === "") { S.mode = "browse"; reset(); loadInitial(); }
+      else { S.mode = "search"; reset(); runSearch(); }
     }, 250);
   });
 
-  // ---- rescan ----
+  // rescan
   el.rescan.addEventListener("click", function () {
     el.rescan.disabled = true;
     fetch("/api/scan", { method: "POST" }).catch(function () {}).finally(function () {
@@ -485,45 +552,36 @@
     });
   });
 
-  // ---- stats (live header) ----
+  // stats: live header + drives the live stream
   function pollStats() {
     api("/api/stats").then(function (st) {
-      el.safelight.classList.toggle("on", !!st.scanning);
+      S.scanning = !!st.scanning;
+      el.safelight.classList.toggle("on", S.scanning);
       var n = (st.items || 0).toLocaleString();
       var txt = "<span class=\"n\">" + n + "</span> items";
-      if (st.scanning) txt += " \u00b7 scanning\u2026";
+      if (S.scanning) txt += " \u00b7 scanning\u2026";
       else if (st.last && st.last.added) txt += " \u00b7 +" + st.last.added + " last scan";
       el.readout.innerHTML = txt;
-      maybeLive(st.items || 0);
-    }).catch(function () { /* header stays as-is */ });
+
+      // recover if the first load failed while the server was still starting
+      if (S.mode === "browse" && S.items.length === 0 && S.maxId === null && !S.busyOlder) {
+        loadInitial();
+        return;
+      }
+      // stream newly-indexed items into the grid
+      if (S.mode === "browse" && !S.viewerOpen) loadNewer();
+    }).catch(function () { /* leave header as-is */ });
   }
 
-  // ---- live populate while scanning ----
-  // The grid is newest-first, so new items land at the top. If you're sitting
-  // at the top watching, refresh the first page in place; if you've scrolled
-  // down, don't yank the view — offer a chip to jump up and pull them in.
-  function maybeLive(count) {
-    if (lastCount === null) { lastCount = count; return; }
-    if (count > lastCount && S.mode === "browse" && !S.viewerOpen) {
-      if (window.scrollY < 150 && !S.loading) {
-        refreshTop();
-      } else {
-        newSince += (count - lastCount);
-        el.chipn.textContent = newSince;
-        el.chip.classList.remove("hidden");
-      }
-    }
-    lastCount = count;
+  // clicking a tag chip searches for that tag
+  function searchTag(str) {
+    closeViewer();
+    el.q.value = str;
+    S.query = str;
+    S.mode = "search";
+    reset();
+    runSearch();
   }
-  function refreshTop() {
-    if (S.loading) return;
-    reset();      // also hides the chip + zeroes newSince
-    loadMore();
-  }
-  el.chip.addEventListener("click", function () {
-    window.scrollTo({ top: 0 });
-    refreshTop();
-  });
 
   // ---- viewer ----
   function openViewer(index) {
@@ -537,11 +595,29 @@
     document.body.style.overflow = "hidden";
   }
 
+  function showUnplayable(item, node) {
+    if (node && node.parentNode) { if (node.tagName === "VIDEO") node.src = ""; node.remove(); }
+    if (S.items[S.viewIndex] !== item || el.stage.querySelector(".unplayable")) return;
+    var box = document.createElement("div");
+    box.className = "unplayable";
+    var p = document.createElement("p");
+    p.textContent = "This format won\u2019t play in the browser.";
+    var sub = document.createElement("p");
+    sub.className = "sub";
+    sub.textContent = baseName(item.relpath);
+    var a = document.createElement("a");
+    a.href = item.raw_url; a.target = "_blank"; a.rel = "noopener";
+    a.textContent = "Open / download original";
+    box.appendChild(p); box.appendChild(sub); box.appendChild(a);
+    el.stage.insertBefore(box, el.stage.firstChild);
+  }
+
   function renderStage() {
     var item = S.items[S.viewIndex];
-    // drop any existing media, keep the controls
-    var old = el.stage.querySelector("img, video");
-    if (old) { if (old.tagName === "VIDEO") old.src = ""; old.remove(); }
+    el.stage.querySelectorAll("img, video, .unplayable").forEach(function (n) {
+      if (n.tagName === "VIDEO") n.src = "";
+      n.remove();
+    });
 
     var media;
     if (item.type === "video") {
@@ -551,6 +627,7 @@
       media.autoplay = true;
       media.playsInline = true;
       media.preload = "metadata";
+      media.addEventListener("error", function () { showUnplayable(item, media); });
     } else {
       media = document.createElement("img");
       media.src = item.raw_url;
@@ -559,72 +636,8 @@
     el.stage.insertBefore(media, el.stage.firstChild);
 
     el.prev.style.visibility = S.viewIndex > 0 ? "visible" : "hidden";
-    var hasNext = S.viewIndex < S.items.length - 1 || !S.done;
+    var hasNext = S.viewIndex < S.items.length - 1 || !S.doneOlder;
     el.next.style.visibility = hasNext ? "visible" : "hidden";
-  }
-
-  function renderCard() {
-    var item = S.items[S.viewIndex];
-    var rows = [];
-    rows.push(row("File", baseName(item.relpath)));
-    rows.push(row("Path", item.relpath));
-    var typeStr = item.type + (item.mime ? "  \u00b7  " + item.mime : "");
-    rows.push(row("Type", typeStr));
-    if (item.width && item.height) rows.push(row("Dimensions", item.width + " \u00d7 " + item.height));
-    if (item.type === "video" && item.duration) rows.push(row("Duration", fmtDuration(item.duration)));
-
-    el.card.innerHTML = "";
-    var h = document.createElement("h2");
-    h.textContent = "Catalog";
-    el.card.appendChild(h);
-    rows.forEach(function (r) { el.card.appendChild(r); });
-
-    // tags load lazily from the detail endpoint
-    var tagRow = document.createElement("div");
-    tagRow.className = "row";
-    tagRow.innerHTML = "<div class=\"k\">Tags</div>";
-    var box = document.createElement("div");
-    box.className = "muted";
-    box.textContent = "\u2026";
-    tagRow.appendChild(box);
-    el.card.appendChild(tagRow);
-
-    api("/api/item?path=" + encodeURIComponent(item.relpath)).then(function (d) {
-      // ignore if the user already moved on
-      if (S.items[S.viewIndex] !== item) return;
-      var tags = d.tags || [];
-      box.remove();
-      if (tags.length === 0) {
-        var m = document.createElement("div");
-        m.className = "muted";
-        m.textContent = "No tags yet.";
-        tagRow.appendChild(m);
-        return;
-      }
-      var wrap = document.createElement("div");
-      wrap.className = "tags";
-      tags.forEach(function (t) {
-        var chip = document.createElement("span");
-        chip.className = "tag" + (t.source === "ai" ? " ai" : "");
-        if (t.namespace) {
-          var ns = document.createElement("span");
-          ns.className = "ns";
-          ns.textContent = t.namespace + ":";
-          chip.appendChild(ns);
-        }
-        chip.appendChild(document.createTextNode(t.name));
-        if (t.source === "ai") {
-          var src = document.createElement("span");
-          src.className = "src";
-          src.textContent = "ai";
-          chip.appendChild(src);
-        }
-        wrap.appendChild(chip);
-      });
-      tagRow.appendChild(wrap);
-    }).catch(function () {
-      box.textContent = "(couldn't load tags)";
-    });
   }
 
   function row(k, v) {
@@ -636,11 +649,137 @@
     return d;
   }
 
+  function renderCard() {
+    var item = S.items[S.viewIndex];
+    el.card.innerHTML = "";
+    var h = document.createElement("h2");
+    h.textContent = "Catalog";
+    el.card.appendChild(h);
+
+    el.card.appendChild(row("File", baseName(item.relpath)));
+    el.card.appendChild(row("Path", item.relpath));
+    el.card.appendChild(row("Type", item.type + (item.mime ? "  \u00b7  " + item.mime : "")));
+    if (item.width && item.height) el.card.appendChild(row("Dimensions", item.width + " \u00d7 " + item.height));
+    if (item.type === "video" && item.duration) el.card.appendChild(row("Duration", fmtDuration(item.duration)));
+
+    var tagRow = document.createElement("div");
+    tagRow.className = "row";
+    var tk = document.createElement("div"); tk.className = "k"; tk.textContent = "Tags";
+    tagRow.appendChild(tk);
+
+    var wrap = document.createElement("div"); wrap.className = "tags";
+    tagRow.appendChild(wrap);
+
+    var input = document.createElement("input");
+    input.className = "tagadd"; input.type = "text";
+    input.placeholder = "Add a tag, press Enter";
+    input.autocomplete = "off"; input.spellcheck = false;
+    tagRow.appendChild(input);
+
+    var note = document.createElement("div"); note.className = "muted taghint";
+    tagRow.appendChild(note);
+    el.card.appendChild(tagRow);
+
+    // Editable state for THIS item. Manual tags (from the sidecar) are editable;
+    // ai tags are shown read-only. Every add/remove PUTs the full manual list.
+    var manual = [];                 // "ns:name" / "name" strings
+    var ai = [];                     // { namespace, name }
+    function tagStr(t) { return t.namespace ? t.namespace + ":" + t.name : t.name; }
+
+    function chipEl(str, isAI, idx) {
+      var chip = document.createElement("span");
+      chip.className = "tag" + (isAI ? " ai" : "");
+      var label = document.createElement("span");
+      label.className = "taglabel";
+      var ci = str.indexOf(":");
+      if (ci > 0) {
+        var ns = document.createElement("span"); ns.className = "ns"; ns.textContent = str.slice(0, ci + 1);
+        label.appendChild(ns);
+        label.appendChild(document.createTextNode(str.slice(ci + 1)));
+      } else {
+        label.textContent = str;
+      }
+      label.title = "Search this tag";
+      label.addEventListener("click", function () { searchTag(str); });
+      chip.appendChild(label);
+      if (isAI) {
+        var s = document.createElement("span"); s.className = "src"; s.textContent = "ai";
+        chip.appendChild(s);
+      } else {
+        var x = document.createElement("button");
+        x.className = "x"; x.type = "button"; x.textContent = "\u00d7"; x.title = "Remove tag";
+        x.addEventListener("click", function (e) {
+          e.stopPropagation();
+          manual.splice(idx, 1); renderChips(); save();
+        });
+        chip.appendChild(x);
+      }
+      return chip;
+    }
+
+    function renderChips() {
+      wrap.innerHTML = "";
+      manual.forEach(function (str, i) { wrap.appendChild(chipEl(str, false, i)); });
+      ai.forEach(function (t) { wrap.appendChild(chipEl(tagStr(t), true, -1)); });
+      if (manual.length === 0 && ai.length === 0) {
+        var m = document.createElement("span"); m.className = "muted"; m.textContent = "No tags yet.";
+        wrap.appendChild(m);
+      }
+    }
+
+    function addFromInput() {
+      var raw = input.value; input.value = "";
+      raw.split(",").forEach(function (part) {
+        var t = part.trim(); if (!t) return;
+        var dup = manual.some(function (mm) { return mm.toLowerCase() === t.toLowerCase(); });
+        if (!dup) manual.push(t);
+      });
+      renderChips(); save();
+    }
+
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); addFromInput(); }
+      else if (e.key === "Backspace" && input.value === "" && manual.length) { manual.pop(); renderChips(); save(); }
+    });
+
+    var saving = false, again = false;
+    function save() {
+      if (S.items[S.viewIndex] !== item) return; // navigated away; don't clobber
+      if (saving) { again = true; return; }       // coalesce rapid edits
+      saving = true; note.textContent = "saving\u2026";
+      fetch("/api/tags", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: item.relpath, tags: manual })
+      }).then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      }).then(function () {
+        note.textContent = "saved";
+        setTimeout(function () { if (note.textContent === "saved") note.textContent = ""; }, 1200);
+      }).catch(function (e) {
+        note.textContent = "couldn't save (" + e.message + ")";
+      }).finally(function () {
+        saving = false;
+        if (again) { again = false; save(); }
+      });
+    }
+
+    api("/api/item?path=" + encodeURIComponent(item.relpath)).then(function (d) {
+      if (S.items[S.viewIndex] !== item) return; // user moved on
+      (d.tags || []).forEach(function (t) {
+        if (t.source === "ai") ai.push({ namespace: t.namespace, name: t.name });
+        else manual.push(tagStr(t));
+      });
+      renderChips();
+    }).catch(function () { note.textContent = "(couldn't load tags)"; });
+  }
+
   function closeViewer() {
-    var v = el.stage.querySelector("video");
-    if (v) v.src = "";
-    var m = el.stage.querySelector("img, video");
-    if (m) m.remove();
+    el.stage.querySelectorAll("img, video, .unplayable").forEach(function (n) {
+      if (n.tagName === "VIDEO") n.src = "";
+      n.remove();
+    });
     el.viewer.classList.remove("open");
     el.viewer.setAttribute("aria-hidden", "true");
     S.viewerOpen = false;
@@ -651,10 +790,9 @@
     var n = S.viewIndex + delta;
     if (n < 0) return;
     if (n >= S.items.length) {
-      if (S.done || S.mode === "search") return;
-      loadMore().then(function () {
-        if (n < S.items.length) openViewer(n);
-      });
+      if (S.mode === "search" || S.doneOlder) return;
+      var p = loadOlder();
+      if (p) p.then(function () { if (n < S.items.length) openViewer(n); });
       return;
     }
     openViewer(n);
@@ -674,9 +812,9 @@
   });
 
   // ---- boot ----
-  loadMore();
+  loadInitial();
   pollStats();
-  setInterval(pollStats, 3000);
+  setInterval(pollStats, 2000);
 })();
 </script>
 </body>

@@ -16,7 +16,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -199,6 +198,9 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 		if err != nil {
 			return nil
 		}
+		if info.Size() == 0 {
+			return nil // empty/partial file (e.g. an in-progress download); pick it up once it has content
+		}
 
 		seenMu.Lock()
 		seen[rel] = struct{}{}
@@ -206,9 +208,11 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 
 		// Cheap change-detection: (size, mtime). No bytes read.
 		cur, existed := index[rel]
-		if existed && cur.Size == info.Size() && cur.MTime == info.ModTime().Unix() {
-			return nil // unchanged -> skip the whole expensive path
+		if existed && cur.Size == info.Size() && cur.MTime == info.ModTime().Unix() && cur.ThumbReady {
+			return nil // unchanged and already thumbnailed -> skip the whole expensive path
 		}
+		// Files that changed, or that were indexed before but never got a
+		// thumbnail (e.g. an older short-clip bug), fall through and reprocess.
 
 		select {
 		case jobs <- job{abs: abs, relpath: rel, info: info, typ: typ, updated: existed}:
@@ -275,12 +279,15 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 		SeenAt:    time.Now(),
 	}
 
-	meta, err := media.Probe(ctx, s.cfg, j.abs, j.typ)
-	if err != nil {
-		res.err = fmt.Errorf("probe: %w", err)
-		return res
+	// Probe is best-effort: a file we can't read metadata for (partial download,
+	// odd codec, transient SMB hiccup) is still worth indexing so it's visible
+	// and downloadable — a later scan re-probes once it settles. We just log why.
+	if meta, err := media.Probe(ctx, s.cfg, j.abs, j.typ); err != nil {
+		log.Printf("scan: probe %s: %v", j.relpath, err)
+		item.MIME = media.MimeFor(j.abs)
+	} else {
+		item.Width, item.Height, item.Duration, item.MIME = meta.Width, meta.Height, meta.Duration, meta.MIME
 	}
-	item.Width, item.Height, item.Duration, item.MIME = meta.Width, meta.Height, meta.Duration, meta.MIME
 
 	// Thumbnail failure is non-fatal — we still index the item.
 	if err := media.Thumbnail(ctx, s.cfg, j.abs, j.typ, media.ThumbPath(s.cfg.ThumbDir(), j.relpath)); err != nil {
@@ -310,7 +317,7 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 	}
 
 	// Fold in human-authored tags from the sidecar (source of truth).
-	if sc, ok, err := sidecar.Read(j.abs); err != nil {
+	if sc, ok, err := sidecar.Read(s.cfg.SidecarPath(j.relpath)); err != nil {
 		log.Printf("scan: sidecar %s: %v", j.relpath, err)
 	} else if ok {
 		res.write.ManualTags = sc.Tags()

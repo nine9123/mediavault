@@ -18,6 +18,7 @@ import (
 	"mediavault/internal/media"
 	"mediavault/internal/model"
 	"mediavault/internal/scan"
+	"mediavault/internal/sidecar"
 	"mediavault/internal/store"
 )
 
@@ -46,6 +47,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/items", s.handleItems)
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/item", s.handleItemDetail)
+	mux.HandleFunc("PUT /api/tags", s.handleSetTags)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
 	mux.HandleFunc("GET /api/thumb/{path...}", s.handleThumb)
@@ -66,6 +68,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // itemDTO is the JSON shape returned to clients, with ready-to-use URLs.
 type itemDTO struct {
+	ID         int64   `json:"id"`
 	Relpath    string  `json:"relpath"`
 	Type       string  `json:"type"`
 	MIME       string  `json:"mime"`
@@ -77,9 +80,26 @@ type itemDTO struct {
 	RawURL     string  `json:"raw_url"`
 }
 
+// tagDTO is the JSON shape for a tag in the item-detail and tag-edit responses.
+type tagDTO struct {
+	Namespace  string  `json:"namespace"`
+	Name       string  `json:"name"`
+	Source     string  `json:"source"`
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
+func toTagDTOs(tags []store.ItemTag) []tagDTO {
+	out := make([]tagDTO, 0, len(tags))
+	for _, t := range tags {
+		out = append(out, tagDTO{Namespace: t.Namespace, Name: t.Name, Source: t.Source, Confidence: t.Confidence})
+	}
+	return out
+}
+
 func toDTO(it model.Item) itemDTO {
 	enc := encRel(it.Relpath)
 	return itemDTO{
+		ID:         it.ID,
 		Relpath:    it.Relpath,
 		Type:       string(it.Type),
 		MIME:       it.MIME,
@@ -93,9 +113,27 @@ func toDTO(it model.Item) itemDTO {
 }
 
 func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
-	limit := clampAtoi(r.URL.Query().Get("limit"), 120, 1, 500)
-	offset := clampAtoi(r.URL.Query().Get("offset"), 0, 0, 1<<30)
-	items, err := s.store.ListItems(r.Context(), limit, offset)
+	q := r.URL.Query()
+	limit := clampAtoi(q.Get("limit"), 120, 1, 500)
+
+	// after=<id>: newer items (for live-streaming during a scan), oldest-first.
+	if a := q.Get("after"); a != "" {
+		after, _ := strconv.ParseInt(a, 10, 64)
+		items, err := s.store.ItemsNewer(r.Context(), after, limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeItems(w, items)
+		return
+	}
+
+	// before=<id> (or absent): newest-first page, older than the cursor.
+	var before int64
+	if b := q.Get("before"); b != "" {
+		before, _ = strconv.ParseInt(b, 10, 64)
+	}
+	items, err := s.store.ItemsOlder(r.Context(), before, limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -135,17 +173,73 @@ func (s *Server) handleItemDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	type tagDTO struct {
-		Namespace  string  `json:"namespace"`
-		Name       string  `json:"name"`
-		Source     string  `json:"source"`
-		Confidence float64 `json:"confidence,omitempty"`
+	writeJSON(w, map[string]any{"item": toDTO(it), "tags": toTagDTOs(tags)})
+}
+
+// handleSetTags writes an item's manual tags to its sidecar (the durable source
+// of truth) and syncs the DB immediately, so the change is visible and
+// searchable without waiting for a rescan. AI tags are left alone.
+func (s *Server) handleSetTags(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string   `json:"path"`
+		Tags []string `json:"tags"`
 	}
-	tds := make([]tagDTO, 0, len(tags))
-	for _, t := range tags {
-		tds = append(tds, tagDTO{Namespace: t.Namespace, Name: t.Name, Source: t.Source, Confidence: t.Confidence})
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
-	writeJSON(w, map[string]any{"item": toDTO(it), "tags": tds})
+	rel := strings.TrimSpace(req.Path)
+	if rel == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return
+	}
+	// Only accept known items: this 404s bad paths and guards traversal, since
+	// a valid relpath is one our own scan produced.
+	it, err := s.store.ItemByRelpath(r.Context(), rel)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Preserve any existing rating/notes; replace only the tag list.
+	scPath := s.cfg.SidecarPath(rel)
+	sc, _, _ := sidecar.Read(scPath)
+	sc.TagList = normalizeTags(req.Tags)
+	if err := sidecar.Write(scPath, sc); err != nil {
+		http.Error(w, "write sidecar: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.SetManualTags(r.Context(), rel, sc.Tags()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	all, err := s.store.TagsForItem(r.Context(), it.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"tags": toTagDTOs(all)})
+}
+
+// normalizeTags trims, drops blanks, and de-duplicates (case-insensitively on
+// the whole "namespace:name" string) while preserving order.
+func normalizeTags(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, t := range in {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		key := strings.ToLower(t)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, t)
+	}
+	return out
 }
 
 // handleStats reports collection size + the latest scan, so the UI can show

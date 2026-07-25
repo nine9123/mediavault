@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 
@@ -45,9 +46,10 @@ type ChainDef struct {
 
 // IndexRow is the cheap snapshot used for change-detection.
 type IndexRow struct {
-	ID    int64
-	Size  int64
-	MTime int64
+	ID         int64
+	Size       int64
+	MTime      int64
+	ThumbReady bool
 }
 
 // Open connects, sets pragmas per-connection (via DSN so every pooled conn
@@ -111,7 +113,7 @@ func (s *Store) dropAll() error {
 // scale the whole map is tiny, so change-detection needs zero per-file DB hits.
 func (s *Store) LoadIndex(ctx context.Context) (map[string]IndexRow, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT relpath,id,size,mtime FROM items WHERE missing_since IS NULL`)
+		`SELECT relpath,id,size,mtime,thumb_ready FROM items WHERE missing_since IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -120,9 +122,11 @@ func (s *Store) LoadIndex(ctx context.Context) (map[string]IndexRow, error) {
 	for rows.Next() {
 		var rp string
 		var r IndexRow
-		if err := rows.Scan(&rp, &r.ID, &r.Size, &r.MTime); err != nil {
+		var thumb int64
+		if err := rows.Scan(&rp, &r.ID, &r.Size, &r.MTime, &thumb); err != nil {
 			return nil, err
 		}
+		r.ThumbReady = thumb != 0
 		out[rp] = r
 	}
 	return out, rows.Err()
@@ -181,13 +185,10 @@ RETURNING id`,
 			}
 		}
 
-		// Keep FTS in sync (rowid = item id). FTS5 has no upsert; delete+insert.
-		if _, err := tx.ExecContext(ctx, `DELETE FROM items_fts WHERE rowid=?`, id); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO items_fts(rowid,relpath,tags) VALUES(?,?,?)`,
-			id, it.Relpath, tagNames(w.ManualTags)); err != nil {
+		// Keep FTS in sync from ALL of the item's tags (manual + any ai), so
+		// search finds either kind. FTS5 has no upsert; rebuildItemFTS does
+		// delete+insert.
+		if err := rebuildItemFTS(ctx, tx, id, it.Relpath); err != nil {
 			return err
 		}
 	}
@@ -297,12 +298,16 @@ func (s *Store) ListItems(ctx context.Context, limit, offset int) ([]model.Item,
 
 // SearchItems runs an FTS5 query over path + tags.
 func (s *Store) SearchItems(ctx context.Context, q string, limit int) ([]model.Item, error) {
+	match := ftsQuery(q)
+	if match == "" {
+		return nil, nil // nothing searchable in the query
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+prefixCols("i")+`
 		FROM items_fts f JOIN items i ON i.id = f.rowid
 		WHERE items_fts MATCH ? AND i.missing_since IS NULL
 		ORDER BY f.rank
-		LIMIT ?`, ftsQuery(q), limit)
+		LIMIT ?`, match, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -376,29 +381,66 @@ func upsertTag(ctx context.Context, tx *sql.Tx, t model.Tag) (int64, error) {
 	return id, err
 }
 
-func tagNames(tags []model.Tag) string {
-	parts := make([]string, 0, len(tags))
-	for _, t := range tags {
-		if t.Namespace != "" {
-			parts = append(parts, t.Namespace+":"+t.Name)
+// rebuildItemFTS refreshes the FTS row for an item from ALL its current tags
+// (manual + ai). FTS5 has no upsert, so we delete then insert by rowid = id.
+func rebuildItemFTS(ctx context.Context, tx *sql.Tx, itemID int64, relpath string) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT t.namespace, t.name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = ?`,
+		itemID)
+	if err != nil {
+		return err
+	}
+	var names []string
+	for rows.Next() {
+		var ns, nm string
+		if err := rows.Scan(&ns, &nm); err != nil {
+			rows.Close()
+			return err
+		}
+		if ns != "" {
+			names = append(names, ns+":"+nm)
 		} else {
-			parts = append(parts, t.Name)
+			names = append(names, nm)
 		}
 	}
-	return strings.Join(parts, " ")
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close() // must close before further statements on the same tx
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM items_fts WHERE rowid=?`, itemID); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO items_fts(rowid,relpath,tags) VALUES(?,?,?)`,
+		itemID, relpath, strings.Join(names, " "))
+	return err
 }
 
-// ftsQuery turns free text into a safe FTS5 MATCH string: each whitespace token
-// becomes a prefix term ("cat" -> cat*), ANDed together.
+// ftsQuery turns free text into a safe FTS5 MATCH string. It tokenises on any
+// non-alphanumeric character — matching how the content is indexed — so a
+// namespaced tag typed literally (e.g. "artist:jane") becomes two prefix terms
+// and never trips FTS5's column-filter syntax. Returns "" when there are no
+// searchable tokens.
 func ftsQuery(q string) string {
-	fields := strings.Fields(q)
-	for i, f := range fields {
-		fields[i] = strings.ReplaceAll(f, `"`, "") + "*"
+	var tokens []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			tokens = append(tokens, b.String()+"*")
+			b.Reset()
+		}
 	}
-	if len(fields) == 0 {
-		return `""`
+	for _, r := range q {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		} else {
+			flush()
+		}
 	}
-	return strings.Join(fields, " ")
+	flush()
+	return strings.Join(tokens, " ")
 }
 
 func prefixCols(alias string) string {
@@ -494,4 +536,78 @@ func (s *Store) TagsForItem(ctx context.Context, itemID int64) ([]ItemTag, error
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// ---- id-cursor listing (stable under concurrent inserts) ----
+//
+// Browsing pages by item id instead of OFFSET. New rows always get higher ids,
+// so paging toward older ids never repeats or skips a row even while a scan is
+// inserting — and the UI can prepend genuinely-new rows at the top.
+
+// ItemsOlder returns present items newest-first (by id). With beforeID > 0 it
+// returns only items older than that id (the "load more" cursor).
+func (s *Store) ItemsOlder(ctx context.Context, beforeID int64, limit int) ([]model.Item, error) {
+	q := `SELECT ` + itemCols + ` FROM items WHERE missing_since IS NULL`
+	args := []any{}
+	if beforeID > 0 {
+		q += ` AND id < ?`
+		args = append(args, beforeID)
+	}
+	q += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanItems(rows)
+}
+
+// ItemsNewer returns present items with id greater than afterID, oldest-first,
+// so the UI can prepend them in order as a scan indexes new files.
+func (s *Store) ItemsNewer(ctx context.Context, afterID int64, limit int) ([]model.Item, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+itemCols+` FROM items WHERE missing_since IS NULL AND id > ? ORDER BY id ASC LIMIT ?`,
+		afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanItems(rows)
+}
+
+// SetManualTags replaces an item's manual tags (from the tag editor). It syncs
+// the DB immediately — clearing this item's manual tags, inserting the new set,
+// and refreshing FTS — so the change is searchable without waiting for a scan.
+// AI tags are untouched. The sidecar (written by the caller) stays the durable
+// source of truth.
+func (s *Store) SetManualTags(ctx context.Context, relpath string, tags []model.Tag) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var id int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM items WHERE relpath=?`, relpath).Scan(&id); err != nil {
+		return err // sql.ErrNoRows if the item isn't indexed
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM item_tags WHERE item_id=? AND source='manual'`, id); err != nil {
+		return err
+	}
+	for _, t := range tags {
+		tagID, err := upsertTag(ctx, tx, t)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO item_tags(item_id,tag_id,source) VALUES(?,?, 'manual')`,
+			id, tagID); err != nil {
+			return err
+		}
+	}
+	if err := rebuildItemFTS(ctx, tx, id, relpath); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

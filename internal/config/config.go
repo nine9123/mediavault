@@ -32,6 +32,12 @@ type Config struct {
 	//             network (slow for large videos). Was the old default.
 	HashMode string
 
+	// SidecarDir is where per-file tag/rating sidecars are read and written.
+	// Empty (default) = next to the media file (needs a writable media mount).
+	// Set it to a writable path to keep the media mount read-only; sidecars are
+	// then mirrored there by relative path.
+	SidecarDir string
+
 	FFmpeg  string // ffmpeg binary (on PATH by default)
 	FFprobe string // ffprobe binary
 
@@ -44,6 +50,16 @@ func (c Config) DBPath() string { return filepath.Join(c.DataDir, "index.db") }
 // ThumbDir is where generated thumbnails are cached.
 func (c Config) ThumbDir() string { return filepath.Join(c.DataDir, "thumbs") }
 
+// SidecarPath returns the sidecar file path for a media relpath, honoring
+// SidecarDir (empty = beside the media file).
+func (c Config) SidecarPath(relpath string) string {
+	rp := filepath.FromSlash(relpath) + ".json"
+	if c.SidecarDir != "" {
+		return filepath.Join(c.SidecarDir, rp)
+	}
+	return filepath.Join(c.MediaRoot, rp)
+}
+
 // MediaTypeFor classifies a filename by extension. ok is false for files we
 // don't index (including sidecars, which end in .json).
 func (c Config) MediaTypeFor(name string) (model.MediaType, bool) {
@@ -54,16 +70,17 @@ func (c Config) MediaTypeFor(name string) (model.MediaType, bool) {
 // Load reads configuration from the environment.
 func Load() Config {
 	return Config{
-		MediaRoot: env("MEDIA_ROOT", "/media"),
-		DataDir:   env("DATA_DIR", "/data"),
-		Addr:      env("ADDR", ":8080"),
-		Workers:   envInt("SCAN_WORKERS", 6),
-		ScanEvery: envDur("SCAN_INTERVAL", 5*time.Minute),
-		ThumbPx:   envInt("THUMB_PX", 400),
-		HashMode:  hashMode(env("HASH_MODE", "partial")),
-		FFmpeg:    env("FFMPEG", "ffmpeg"),
-		FFprobe:   env("FFPROBE", "ffprobe"),
-		Exts:      defaultExts(),
+		MediaRoot:  env("MEDIA_ROOT", "/media"),
+		DataDir:    env("DATA_DIR", "/data"),
+		Addr:       env("ADDR", ":8080"),
+		Workers:    envInt("SCAN_WORKERS", 6),
+		ScanEvery:  envDur("SCAN_INTERVAL", 5*time.Minute),
+		ThumbPx:    envInt("THUMB_PX", 400),
+		HashMode:   hashMode(env("HASH_MODE", "partial")),
+		SidecarDir: env("SIDECAR_DIR", ""),
+		FFmpeg:     env("FFMPEG", "ffmpeg"),
+		FFprobe:    env("FFPROBE", "ffprobe"),
+		Exts:       defaultExts(),
 	}
 }
 
@@ -75,6 +92,11 @@ func defaultExts() map[string]model.MediaType {
 		".gif": model.MediaAnimated, ".webp": model.MediaAnimated, // webp may be still or animated; treat as animated
 		".mp4": model.MediaVideo, ".m4v": model.MediaVideo, ".webm": model.MediaVideo,
 		".mkv": model.MediaVideo, ".mov": model.MediaVideo, ".avi": model.MediaVideo,
+		".mpg": model.MediaVideo, ".mpeg": model.MediaVideo, ".m2v": model.MediaVideo,
+		".ts": model.MediaVideo, ".m2ts": model.MediaVideo, ".mts": model.MediaVideo,
+		".flv": model.MediaVideo, ".f4v": model.MediaVideo, ".vob": model.MediaVideo,
+		".wmv": model.MediaVideo, ".asf": model.MediaVideo, ".ogv": model.MediaVideo,
+		".3gp": model.MediaVideo, ".3g2": model.MediaVideo, ".divx": model.MediaVideo,
 	}
 }
 
