@@ -387,3 +387,32 @@ embeddings, which would justify a Python embedding sidecar + a vector DB like
 Qdrant — a separate, heavier path I can add if you want that quality.
 
 `GET /api/similar?path=<relpath>&limit=<n>`
+
+## Natural-language search (optional, via Ollama)
+
+Point `OLLAMA_URL` at an Ollama server running a **vision** model and mediavault
+will caption your media and make it searchable in plain words. A background
+worker (one image at a time — LLM inference is the bottleneck) captions
+undescribed items over time: it grabs a frame (a couple of seconds in for video,
+to skip fade-ins), sends it to Ollama, and stores the caption. Captions are
+folded into the existing full-text search, so a query like `dog beach sunset`
+matches what's *in* the media, and each caption shows in the viewer panel.
+
+```yaml
+    environment:
+      - OLLAMA_URL=http://your-truenas-ip:11434
+      - OLLAMA_MODEL=llava          # any vision model you've pulled (llama3.2-vision, moondream, qwen2.5-vl, ...)
+      # - OLLAMA_PROMPT=...          # override the captioning prompt to tune results
+```
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `OLLAMA_URL` | `""` (off) | Ollama base URL, e.g. `http://host:11434`. Empty disables captioning. |
+| `OLLAMA_MODEL` | `llava` | Vision model (must be pulled on the Ollama host). |
+| `OLLAMA_PROMPT` | (built-in) | Captioning instruction. |
+
+This is **keyword** matching over rich captions. For *semantic* matching (query
+"puppy by the ocean" finding a caption that says "dog on the beach"), the next
+step is to also embed captions + the query with an Ollama embedding model
+(e.g. `nomic-embed-text`) and rank by cosine — reusing the vector search already
+in place. Ask and I'll add it.

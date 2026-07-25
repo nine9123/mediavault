@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"mediavault/internal/config"
+	"mediavault/internal/describe"
 	"mediavault/internal/scan"
 	"mediavault/internal/server"
 	"mediavault/internal/store"
@@ -27,6 +28,9 @@ func main() {
 		log.Printf("derived dir: %s (serving browser-friendly transcodes when present)", cfg.DerivedDir)
 	} else {
 		log.Printf("derived dir: (unset) — WMV/AVI/HEVC/ALAC won't play until DERIVED_DIR is set and `transcode` has run")
+	}
+	if cfg.OllamaURL != "" {
+		log.Printf("captions: on — %s via %s (natural-language search)", cfg.OllamaModel, cfg.OllamaURL)
 	}
 
 	if err := os.MkdirAll(cfg.ThumbDir(), 0o755); err != nil {
@@ -52,6 +56,10 @@ func main() {
 		scanner.RunPeriodic(ctx)
 		close(scanDone)
 	}()
+
+	if cfg.OllamaURL != "" {
+		go describe.New(cfg, st).Run(ctx)
+	}
 
 	tx := transcode.New(ctx, cfg)
 

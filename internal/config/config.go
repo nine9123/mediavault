@@ -45,6 +45,13 @@ type Config struct {
 	// browser. Empty disables it. Populate it with scripts/transcode.sh.
 	DerivedDir string
 
+	// Optional natural-language search: point OllamaURL at an Ollama server with
+	// a vision model to auto-caption media; captions feed full-text search.
+	// Empty OllamaURL disables it.
+	OllamaURL    string
+	OllamaModel  string
+	OllamaPrompt string
+
 	FFmpeg  string // ffmpeg binary (on PATH by default)
 	FFprobe string // ffprobe binary
 
@@ -77,18 +84,21 @@ func (c Config) MediaTypeFor(name string) (model.MediaType, bool) {
 // Load reads configuration from the environment.
 func Load() Config {
 	return Config{
-		MediaRoot:  env("MEDIA_ROOT", "/media"),
-		DataDir:    env("DATA_DIR", "/data"),
-		Addr:       env("ADDR", ":8080"),
-		Workers:    envInt("SCAN_WORKERS", 6),
-		ScanEvery:  envDur("SCAN_INTERVAL", 5*time.Minute),
-		ThumbPx:    envInt("THUMB_PX", 400),
-		HashMode:   hashMode(env("HASH_MODE", "partial")),
-		SidecarDir: env("SIDECAR_DIR", ""),
-		DerivedDir: env("DERIVED_DIR", ""),
-		FFmpeg:     env("FFMPEG", "ffmpeg"),
-		FFprobe:    env("FFPROBE", "ffprobe"),
-		Exts:       defaultExts(),
+		MediaRoot:    env("MEDIA_ROOT", "/media"),
+		DataDir:      env("DATA_DIR", "/data"),
+		Addr:         env("ADDR", ":8080"),
+		Workers:      envInt("SCAN_WORKERS", 6),
+		ScanEvery:    envDur("SCAN_INTERVAL", 5*time.Minute),
+		ThumbPx:      envInt("THUMB_PX", 400),
+		HashMode:     hashMode(env("HASH_MODE", "partial")),
+		SidecarDir:   env("SIDECAR_DIR", ""),
+		DerivedDir:   env("DERIVED_DIR", ""),
+		OllamaURL:    env("OLLAMA_URL", ""),
+		OllamaModel:  env("OLLAMA_MODEL", "llava"),
+		OllamaPrompt: env("OLLAMA_PROMPT", "Describe this image in one or two sentences for search. Name the main subjects, the setting, notable objects, colors, and mood. Be concise, factual, and specific; do not start with \"The image\"."),
+		FFmpeg:       env("FFMPEG", "ffmpeg"),
+		FFprobe:      env("FFPROBE", "ffprobe"),
+		Exts:         defaultExts(),
 	}
 }
 

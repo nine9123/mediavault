@@ -25,6 +25,11 @@ services:
       # scripts/transcode.sh; mediavault serves a derived file when one exists.
       # Leave empty to disable. Expensive to regenerate, so it's its own volume.
       DERIVED_DIR: "/derived"
+      # Optional natural-language search: point at an Ollama server running a
+      # vision model to auto-caption media (captions feed search). Leave OLLAMA_URL
+      # empty/unset to disable. OLLAMA_MODEL must be a vision model you've pulled.
+      # OLLAMA_URL: "http://your-truenas-ip:11434"
+      # OLLAMA_MODEL: "llava"
     volumes:
       # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
       - /mnt/nas/media:/media:ro

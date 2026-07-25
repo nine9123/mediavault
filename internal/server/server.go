@@ -77,17 +77,18 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // itemDTO is the JSON shape returned to clients, with ready-to-use URLs.
 type itemDTO struct {
-	ID         int64   `json:"id"`
-	Relpath    string  `json:"relpath"`
-	Type       string  `json:"type"`
-	MIME       string  `json:"mime"`
-	Width      int     `json:"width"`
-	Height     int     `json:"height"`
-	Duration   float64 `json:"duration,omitempty"`
-	ThumbReady bool    `json:"thumb_ready"`
-	Views      int     `json:"views"`
-	ThumbURL   string  `json:"thumb_url"`
-	RawURL     string  `json:"raw_url"`
+	ID          int64   `json:"id"`
+	Relpath     string  `json:"relpath"`
+	Type        string  `json:"type"`
+	MIME        string  `json:"mime"`
+	Width       int     `json:"width"`
+	Height      int     `json:"height"`
+	Duration    float64 `json:"duration,omitempty"`
+	ThumbReady  bool    `json:"thumb_ready"`
+	Views       int     `json:"views"`
+	Description string  `json:"description,omitempty"`
+	ThumbURL    string  `json:"thumb_url"`
+	RawURL      string  `json:"raw_url"`
 }
 
 // tagDTO is the JSON shape for a tag in the item-detail and tag-edit responses.
@@ -109,17 +110,18 @@ func toTagDTOs(tags []store.ItemTag) []tagDTO {
 func toDTO(it model.Item) itemDTO {
 	enc := encRel(it.Relpath)
 	return itemDTO{
-		ID:         it.ID,
-		Relpath:    it.Relpath,
-		Type:       string(it.Type),
-		MIME:       it.MIME,
-		Width:      it.Width,
-		Height:     it.Height,
-		Duration:   it.Duration,
-		ThumbReady: it.ThumbReady,
-		Views:      it.Views,
-		ThumbURL:   "/api/thumb/" + enc,
-		RawURL:     "/api/raw/" + enc,
+		ID:          it.ID,
+		Relpath:     it.Relpath,
+		Type:        string(it.Type),
+		MIME:        it.MIME,
+		Width:       it.Width,
+		Height:      it.Height,
+		Duration:    it.Duration,
+		ThumbReady:  it.ThumbReady,
+		Views:       it.Views,
+		Description: it.Description,
+		ThumbURL:    "/api/thumb/" + enc,
+		RawURL:      "/api/raw/" + enc,
 	}
 }
 

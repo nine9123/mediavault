@@ -33,7 +33,7 @@ const schemaVersion = "1"
 
 // itemCols is the canonical column order for every items SELECT, so a single
 // scanItem helper can decode any of them.
-const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,views,indexed_at,seen_at,missing_since"
+const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,views,indexed_at,seen_at,missing_since,description"
 
 type Store struct {
 	db *sql.DB
@@ -123,6 +123,15 @@ func (s *Store) ensureColumns() error {
 	if !has {
 		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN views INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add items.views: %w", err)
+		}
+	}
+	hasDesc, err := s.hasColumn("items", "description")
+	if err != nil {
+		return err
+	}
+	if !hasDesc {
+		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN description TEXT`); err != nil {
+			return fmt.Errorf("add items.description: %w", err)
 		}
 	}
 	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS item_vectors (
@@ -441,10 +450,11 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 			thumb                    int64
 			views                    int64
 			missing                  sql.NullInt64
+			desc                     sql.NullString
 		)
 		if err := rows.Scan(
 			&it.ID, &it.Relpath, &it.Size, &mtime, &hash, &it.Type, &mime,
-			&width, &height, &dur, &thumb, &views, &indexedAt, &seenAt, &missing,
+			&width, &height, &dur, &thumb, &views, &indexedAt, &seenAt, &missing, &desc,
 		); err != nil {
 			return nil, err
 		}
@@ -458,6 +468,7 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 		it.Duration = dur.Float64
 		it.ThumbReady = thumb != 0
 		it.Views = int(views)
+		it.Description = desc.String
 		if missing.Valid {
 			t := time.Unix(missing.Int64, 0)
 			it.MissingSince = &t
@@ -506,12 +517,18 @@ func rebuildItemFTS(ctx context.Context, tx *sql.Tx, itemID int64, relpath strin
 	}
 	rows.Close() // must close before further statements on the same tx
 
+	content := strings.Join(names, " ")
+	var desc sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT description FROM items WHERE id=?`, itemID).Scan(&desc); err == nil && desc.Valid && desc.String != "" {
+		content = strings.TrimSpace(content + " " + desc.String)
+	}
+
 	if _, err := tx.ExecContext(ctx, `DELETE FROM items_fts WHERE rowid=?`, itemID); err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO items_fts(rowid,relpath,tags) VALUES(?,?,?)`,
-		itemID, relpath, strings.Join(names, " "))
+		itemID, relpath, content)
 	return err
 }
 
@@ -983,4 +1000,43 @@ func (s *Store) ItemsByIDs(ctx context.Context, ids []int64) (map[int64]model.It
 		out[it.ID] = it
 	}
 	return out, nil
+}
+
+// ---- AI captions (natural-language search) ----
+
+// SetDescription stores a caption for an item and reindexes it so the caption
+// is searchable in the existing full-text search.
+func (s *Store) SetDescription(ctx context.Context, relpath, desc string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var id int64
+	if err := tx.QueryRowContext(ctx,
+		`UPDATE items SET description=? WHERE relpath=? AND missing_since IS NULL RETURNING id`,
+		desc, relpath).Scan(&id); err != nil {
+		if err == sql.ErrNoRows {
+			return nil // vanished; nothing to do
+		}
+		return err
+	}
+	if err := rebuildItemFTS(ctx, tx, id, relpath); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// UndescribedItems returns present, visual items still needing a caption, newest
+// first (so recently-added media gets described first).
+func (s *Store) UndescribedItems(ctx context.Context, limit int) ([]model.Item, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+itemCols+` FROM items
+		 WHERE missing_since IS NULL AND width > 0 AND (description IS NULL OR description='')
+		 ORDER BY indexed_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanItems(rows)
 }

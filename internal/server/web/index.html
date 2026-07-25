@@ -304,6 +304,8 @@
   .tagsuggest .sugg{font-family:var(--mono);font-size:.72rem;color:var(--bone-dim);background:var(--ink-raised);border:1px solid var(--ink-line);border-radius:2px;padding:.2rem .5rem;cursor:pointer}
   .tagsuggest .sugg::before{content:"+ ";color:var(--brass)}
   .tagsuggest .sugg:hover{border-color:var(--brass);color:var(--bone)}
+  .descrow{margin-top:4px}
+  .descrow .descv{color:var(--bone-dim);font-size:.85rem;line-height:1.5;margin-top:3px;white-space:pre-wrap}
   .vtools{position:absolute;top:12px;left:12px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;z-index:6;max-width:calc(100% - 90px)}
   .vnum{display:flex;align-items:center;gap:2px;font-family:var(--mono);font-size:.72rem;letter-spacing:.03em;color:var(--bone-dim);background:rgba(20,18,16,.72);border:1px solid var(--ink-line);border-radius:2px;padding:.3rem .55rem;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);user-select:none}
   .vnum input{width:3.2rem;background:transparent;border:none;border-bottom:1px solid var(--ink-line-2);color:var(--bone);font-family:var(--mono);font-size:.72rem;text-align:center;padding:0 2px}
@@ -339,7 +341,7 @@
   </header>
 
   <div class="qhint hidden" id="qhint">
-    <p><b>Search</b> matches file names and tags. Multiple words must <b>all</b> match, and every term is a prefix — <code>land</code> finds <code>landscape</code>.</p>
+    <p><b>Search</b> matches file names, tags, and AI captions. Multiple words must <b>all</b> match, and every term is a prefix — <code>land</code> finds <code>landscape</code>.</p>
     <p>Namespaced tags: type the name, or the full <code>ns:name</code> (e.g. <code>artist:jane</code>). Click any tag in the viewer to search it.</p>
     <p>Filter by kind, alone or with terms (e.g. <code>type:video cat</code>):
       <button class="qex" data-q="type:image" type="button">type:image</button>
@@ -1047,6 +1049,13 @@
     if (item.width && item.height && item.type !== "audio") el.card.appendChild(row("Dimensions", item.width + " \u00d7 " + item.height));
     if ((item.type === "video" || item.type === "audio") && item.duration) el.card.appendChild(row("Duration", fmtDuration(item.duration)));
     el.card.appendChild(row("Views", String(item.views || 0)));
+    if (item.description) {
+      var db = document.createElement("div"); db.className = "descrow";
+      var dbk = document.createElement("div"); dbk.className = "k"; dbk.textContent = "Description";
+      var dbv = document.createElement("div"); dbv.className = "descv"; dbv.textContent = item.description;
+      db.appendChild(dbk); db.appendChild(dbv);
+      el.card.appendChild(db);
+    }
 
     var tagRow = document.createElement("div");
     tagRow.className = "row";

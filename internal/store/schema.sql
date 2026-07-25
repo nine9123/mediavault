@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS items (
     duration      REAL,                       -- seconds; video only
     thumb_ready   INTEGER NOT NULL DEFAULT 0, -- 0/1
     views         INTEGER NOT NULL DEFAULT 0, -- times opened in the viewer (popularity signal)
+    description   TEXT,                        -- AI caption (optional); indexed into items_fts
     indexed_at    INTEGER NOT NULL,           -- unix s
     seen_at       INTEGER NOT NULL,           -- unix s; last scan that saw this file
     missing_since INTEGER                     -- set when a scan stops seeing it (soft delete)
