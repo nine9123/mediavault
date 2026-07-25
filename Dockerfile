@@ -22,12 +22,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # ---- runtime stage ----
 FROM debian:bookworm-slim
-# ffmpeg (which includes ffprobe) is the only runtime dependency.
+# ffmpeg (which includes ffprobe) is the only runtime dependency; bash runs the
+# bundled transcode helper.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && apt-get install -y --no-install-recommends ffmpeg bash ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/mediavault /usr/local/bin/mediavault
+# Bundled so you can run `docker compose exec mediavault transcode` — it reads
+# MEDIA_ROOT/DERIVED_DIR from the container env, so paths line up with the app.
+COPY --chmod=0755 scripts/transcode.sh /usr/local/bin/transcode
 
 ENV MEDIA_ROOT=/media \
     DATA_DIR=/data \

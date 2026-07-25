@@ -80,15 +80,15 @@ do_video() { # $1 abs  $2 rel  $3 ext(lowercase)
     # Streams are web-safe: rewrap into mp4 (no video re-encode).
     if [ -n "$a" ] && ! [[ "$a" =~ $mp4_acodec_re ]]; then
       echo "remux+aac: $rel  (v=$v a=$a)"
-      ffmpeg -v error -y -i "$src" -c:v copy -c:a aac -b:a 160k -movflags +faststart "$tmp.mp4"
+      ffmpeg -nostdin -v error -y -i "$src" -c:v copy -c:a aac -b:a 160k -movflags +faststart "$tmp.mp4"
     else
       echo "remux:     $rel  (v=$v a=${a:-none})"
-      ffmpeg -v error -y -i "$src" -map 0:v:0 -map 0:a:0? -c copy -movflags +faststart "$tmp.mp4"
+      ffmpeg -nostdin -v error -y -i "$src" -map 0:v:0 -map 0:a:0? -c copy -movflags +faststart "$tmp.mp4"
     fi
     n_remux=$((n_remux+1))
   else
     echo "encode:    $rel  (v=${v:-?} a=${a:-none})"
-    ffmpeg -v error -y -i "$src" \
+    ffmpeg -nostdin -v error -y -i "$src" \
       -map 0:v:0 -map 0:a:0? \
       -c:v libx264 -preset "$PRESET" -crf "$CRF" -pix_fmt yuv420p \
       -c:a aac -b:a 160k -movflags +faststart "$tmp.mp4"
@@ -102,7 +102,7 @@ do_image() { # $1 abs  $2 rel
   if up_to_date "$src" "$out"; then n_skip=$((n_skip+1)); return; fi
   mkdir -p "$(dirname "$out")"
   local tmp="$out.part.jpg"
-  if ffmpeg -v error -y -i "$src" -frames:v 1 \
+  if ffmpeg -nostdin -v error -y -i "$src" -frames:v 1 \
        -vf "scale='min(${IMG_MAXPX},iw)':-1:flags=lanczos" -q:v 3 "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$out"; echo "preview:   $rel"; n_img=$((n_img+1))
   else
@@ -118,14 +118,14 @@ do_audio() { # $1 abs  $2 rel  — only for non-web audio; web audio plays as-is
   echo "audio->mp3: $rel"
   # Cover art (if any) is already extracted into mediavault's thumbnail, so we
   # only need the audio here.
-  if ffmpeg -v error -y -i "$src" -vn -map 0:a:0 -c:a libmp3lame -q:a 2 "$tmp" 2>/dev/null; then
+  if ffmpeg -nostdin -v error -y -i "$src" -vn -map 0:a:0 -c:a libmp3lame -q:a 2 "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$out"; n_remux=$((n_remux+1))
   else
     rm -f "$tmp"; echo "audio convert failed: $rel" >&2; n_fail=$((n_fail+1))
   fi
 }
 
-while IFS= read -r -d '' f; do
+while IFS= read -r -d '' f <&3; do
   rel="${f#"$SRC"/}"
   ext="${f##*.}"; ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
   case "$ext" in
@@ -139,7 +139,7 @@ while IFS= read -r -d '' f; do
       do_audio "$f" "$rel" ;;
     *) : ;;
   esac
-done < <(find "$SRC" -type f -print0)
+done 3< <(find "$SRC" -type f -print0)
 
 echo
 echo "done: skipped=$n_skip  remuxed=$n_remux  encoded=$n_encode  previews=$n_img  failed=$n_fail"

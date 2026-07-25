@@ -198,8 +198,17 @@ file whenever one exists. Your original archive is never touched.
 MEDIA_ROOT=/mnt/nas/media DERIVED_DIR=/mnt/nas/derived ./scripts/transcode.sh
 ```
 
-Or run it against the same volumes the container uses, e.g. a throwaway ffmpeg
-container mounting media read-only and the derived volume read-write.
+The script is also bundled in the image, so the easiest way is to run it inside
+the running container — it reads MEDIA_ROOT/DERIVED_DIR from the environment, so
+paths always match what the app indexes:
+
+```bash
+docker compose exec mediavault transcode
+```
+
+It runs in the foreground (progress per file) and is safe to re-run — up-to-date
+outputs are skipped. Run it again after importing new media. Once a file has a
+derived copy, it plays in the browser immediately; no re-scan needed.
 
 What the script does, cheaply:
 
@@ -285,9 +294,11 @@ syntax cheatsheet with clickable type filters.
 **Random** also lives inside the viewer, not just the header — and it respects
 the active search/type filter, so `type:video` + Random gives random videos.
 
-**Autoplay next** (toggle in the viewer) advances to the next item when a video
-or track finishes; the choice is remembered in your browser. Combined with a
-`type:video` Random, it becomes continuous random video playback. Note: it
-advances to the next *item* — if that's an image it just displays (images have
-no "ended" event to chain from), and browsers may require the video be muted to
-auto-start without a fresh click.
+**Autoplay next** (toggle in the viewer) advances to the next item
+automatically. Videos and tracks advance when they finish; images and gifs (no
+"ended" event) advance after a configurable **every N s** interval next to the
+toggle — i.e. a slideshow. Both the toggle and the interval are remembered in
+your browser. So a mixed sequence plays each video to its end and lingers N
+seconds on each still, and `type:video` + Random + Autoplay is continuous random
+video. Note: browsers may require a video be muted to auto-start without a fresh
+click.
