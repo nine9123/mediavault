@@ -16,9 +16,9 @@ services:
       HASH_ON_INDEX: "true"
     volumes:
       # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
-      - /mnt/nas/media:/media:ro
+      - /Volumes/share/Collection3:/media:ro
       # Writable cache: SQLite DB + thumbnails. Safe to delete and rebuild.
-      - mediavault-data:/data
+      - /Volumes/share/apps/mediavault:/data
 
 volumes:
   mediavault-data:
