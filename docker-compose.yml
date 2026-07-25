@@ -1,0 +1,24 @@
+services:
+  mediavault:
+    build: .
+    ports:
+      - "8090:8080"
+    environment:
+      # Keep workers modest: reads go over SMB, so the network link — not the
+      # CPU — is the bottleneck. 4-8 typically saturates a gigabit mount.
+      SCAN_WORKERS: "6"
+      # Periodic rescan interval. inotify is unreliable over SMB, so we poll;
+      # the UI also has a manual rescan (POST /api/scan).
+      SCAN_INTERVAL: "5m"
+      THUMB_PX: "400"
+      # Set to "false" to skip the extra full read per new file over the
+      # network. You only lose dedup + move-detection, not correctness.
+      HASH_ON_INDEX: "true"
+    volumes:
+      # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
+      - /mnt/nas/media:/media:ro
+      # Writable cache: SQLite DB + thumbnails. Safe to delete and rebuild.
+      - mediavault-data:/data
+
+volumes:
+  mediavault-data:
