@@ -295,17 +295,19 @@
   .audio .cover.noart{display:flex;align-items:center;justify-content:center;width:min(60vw,320px);height:min(60vw,320px);max-height:40vh;background:var(--ink-raised);color:var(--bone-faint);font-size:5rem;line-height:1}
   .audio audio{width:min(90vw,560px)}
   .noprev.note{font-size:2rem;color:var(--bone-faint)}
-  .recs{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:6px;margin-top:6px}
+  .recs{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:8px;margin:6px 0 4px}
   .recs .rec{position:relative;aspect-ratio:1/1;overflow:hidden;background:var(--ink-raised);border:1px solid var(--ink-line);cursor:pointer}
   .recs .rec img{width:100%;height:100%;object-fit:cover;display:block}
   .recs .rec:hover{border-color:var(--brass)}
   .recs .rec.norec{display:flex;align-items:center;justify-content:center;font-size:.6rem;color:var(--bone-faint);padding:4px;text-align:center;word-break:break-all}
+  .striptitle{margin:16px 0 2px;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--bone-faint)}
   .tagsuggest{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
   .tagsuggest .sugg{font-family:var(--mono);font-size:.72rem;color:var(--bone-dim);background:var(--ink-raised);border:1px solid var(--ink-line);border-radius:2px;padding:.2rem .5rem;cursor:pointer}
   .tagsuggest .sugg::before{content:"+ ";color:var(--brass)}
   .tagsuggest .sugg:hover{border-color:var(--brass);color:var(--bone)}
-  .descrow{margin-top:4px}
-  .descrow .descv{color:var(--bone-dim);font-size:.85rem;line-height:1.5;margin-top:3px;white-space:pre-wrap}
+  .descrow{margin:8px 0}
+  .descrow .descv{color:var(--bone);font-size:.9rem;line-height:1.55;margin-top:4px;white-space:pre-wrap;background:var(--ink-raised);border-left:2px solid var(--brass-soft);padding:8px 10px}
+  .descrow .descv.pending{color:var(--bone-faint);font-style:italic;background:none;border-left-color:var(--ink-line)}
   .vtools{position:absolute;top:12px;left:12px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;z-index:6;max-width:calc(100% - 90px)}
   .vnum{display:flex;align-items:center;gap:2px;font-family:var(--mono);font-size:.72rem;letter-spacing:.03em;color:var(--bone-dim);background:rgba(20,18,16,.72);border:1px solid var(--ink-line);border-radius:2px;padding:.3rem .55rem;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);user-select:none}
   .vnum input{width:3.2rem;background:transparent;border:none;border-bottom:1px solid var(--ink-line-2);color:var(--bone);font-family:var(--mono);font-size:.72rem;text-align:center;padding:0 2px}
@@ -1058,13 +1060,20 @@
     if (item.width && item.height && item.type !== "audio") el.card.appendChild(row("Dimensions", item.width + " \u00d7 " + item.height));
     if ((item.type === "video" || item.type === "audio") && item.duration) el.card.appendChild(row("Duration", fmtDuration(item.duration)));
     el.card.appendChild(row("Views", String(item.views || 0)));
-    if (item.description) {
-      var db = document.createElement("div"); db.className = "descrow";
-      var dbk = document.createElement("div"); dbk.className = "k"; dbk.textContent = "Description";
-      var dbv = document.createElement("div"); dbv.className = "descv"; dbv.textContent = item.description;
-      db.appendChild(dbk); db.appendChild(dbv);
-      el.card.appendChild(db);
+    // Description (AI caption). Always shown so you can judge quality; the text
+    // is refreshed from the live item fetch below, because the grid copy may
+    // predate captioning and be stale/empty.
+    var descBlock = document.createElement("div"); descBlock.className = "descrow";
+    var descK = document.createElement("div"); descK.className = "k"; descK.textContent = "Description";
+    var descV = document.createElement("div"); descV.className = "descv";
+    descBlock.appendChild(descK); descBlock.appendChild(descV);
+    el.card.appendChild(descBlock);
+    function setDesc(text) {
+      text = (text || "").trim();
+      if (text) { descV.textContent = text; descV.classList.remove("pending"); }
+      else { descV.textContent = "Not described yet."; descV.classList.add("pending"); }
     }
+    setDesc(item.description);
 
     var tagRow = document.createElement("div");
     tagRow.className = "row";
@@ -1190,6 +1199,7 @@
 
     api("/api/item?path=" + encodeURIComponent(item.relpath)).then(function (d) {
       if (S.viewList[S.viewIndex] !== item) return; // user moved on
+      if (d.item) setDesc(d.item.description);
       (d.tags || []).forEach(function (t) {
         if (t.source === "ai") ai.push({ namespace: t.namespace, name: t.name });
         else manual.push(tagStr(t));
@@ -1206,7 +1216,7 @@
     // Thumbnail strips of related items. Clicking one opens the whole set as an
     // arrow-navigable queue.
     function stripSection(title, url, emptyMsg) {
-      var hh = document.createElement("div"); hh.className = "k"; hh.textContent = title;
+      var hh = document.createElement("div"); hh.className = "striptitle"; hh.textContent = title;
       el.card.appendChild(hh);
       var box = document.createElement("div"); box.className = "recs";
       el.card.appendChild(box);
