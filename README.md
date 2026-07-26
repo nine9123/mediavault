@@ -441,3 +441,20 @@ slow or down you simply fall back to keyword results. The background worker
 embeds captions as it goes (and backfills existing captions if you turn the
 embedding model on later); matching is a brute-force cosine scan in memory,
 reusing the vector search already in place — still no external vector DB.
+
+## Regenerating captions
+
+Changed the vision model or `OLLAMA_PROMPT` and want fresh captions? Open the
+search help (the **?** by the search box) and use **Regenerate all captions**
+(clears every caption + embedding and re-captions from scratch) or **Re-embed
+only** (keeps captions, recomputes embeddings — for when you change
+`OLLAMA_EMBED_MODEL`). Both run in the background; the header's "captioning X/Y"
+resets and climbs again. Equivalent API calls:
+
+```bash
+curl -X POST http://your-host:8090/api/captions/reset     # captions + embeddings
+curl -X POST http://your-host:8090/api/embeddings/reset   # embeddings only
+```
+
+This is far lighter than deleting the database, which would also wipe
+thumbnails, dimensions, similarity vectors, and view counts.

@@ -1189,3 +1189,69 @@ func (s *Store) CaptionCounts(ctx context.Context) (visual, captioned, embedded 
 		`SELECT COUNT(*) FROM item_embeddings e JOIN items i ON i.id=e.item_id WHERE i.missing_since IS NULL`).Scan(&embedded)
 	return
 }
+
+// ---- resets for regenerating captions ----
+
+// ResetCaptions clears every caption and its embedding and rebuilds full-text
+// search so stale caption text is dropped. The background worker then
+// re-captions from scratch (used when changing the vision model or prompt).
+func (s *Store) ResetCaptions(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE items SET description=NULL`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM item_embeddings`); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, relpath FROM items WHERE missing_since IS NULL`)
+	if err != nil {
+		return err
+	}
+	type ir struct {
+		id  int64
+		rel string
+	}
+	var list []ir
+	for rows.Next() {
+		var r ir
+		if err := rows.Scan(&r.id, &r.rel); err != nil {
+			rows.Close()
+			return err
+		}
+		list = append(list, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range list { // rebuild FTS without caption text
+		if err := rebuildItemFTS(ctx, tx, r.id, r.rel); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.embMu.Lock()
+	s.embs = map[int64][]float32{}
+	s.embInit = true
+	s.embMu.Unlock()
+	return nil
+}
+
+// ResetEmbeddings clears only caption embeddings (e.g. after switching the
+// embedding model); the worker re-embeds existing captions.
+func (s *Store) ResetEmbeddings(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM item_embeddings`); err != nil {
+		return err
+	}
+	s.embMu.Lock()
+	s.embs = map[int64][]float32{}
+	s.embInit = true
+	s.embMu.Unlock()
+	return nil
+}

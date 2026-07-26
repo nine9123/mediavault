@@ -351,6 +351,12 @@
       <button class="qex" data-q="type:audio" type="button">type:audio</button>
       <button class="qex" data-q="type:gif" type="button">type:gif</button>
     </p>
+    <p class="qhint-reset hidden" id="qhintReset" style="border-top:1px solid var(--ink-line);padding-top:10px;margin-top:10px">
+      <b>Captioning</b> — regenerate after changing the model or prompt:
+      <button class="qex" id="resetCaptions" type="button">Regenerate all captions</button>
+      <button class="qex" id="resetEmbeddings" type="button">Re-embed only</button>
+      <span id="resetMsg" class="muted"></span>
+    </p>
   </div>
 
   <main class="sheet">
@@ -422,7 +428,11 @@
     autosecs: document.getElementById("autosecs"),
     autoshuffle: document.getElementById("autoshuffle"),
     qhelp: document.getElementById("qhelp"),
-    qhint: document.getElementById("qhint")
+    qhint: document.getElementById("qhint"),
+    qhintReset: document.getElementById("qhintReset"),
+    resetCaptions: document.getElementById("resetCaptions"),
+    resetEmbeddings: document.getElementById("resetEmbeddings"),
+    resetMsg: document.getElementById("resetMsg")
   };
 
   function api(path) {
@@ -727,10 +737,25 @@
     var b = e.target.closest(".qex");
     if (!b) return;
     var q = b.getAttribute("data-q");
+    if (!q) return; // non-search .qex (reset buttons) are handled below
     el.q.value = q;
     applySearch(q);
     el.qhint.classList.add("hidden");
     el.q.focus();
+  });
+  el.resetCaptions.addEventListener("click", function () {
+    if (!confirm("Clear ALL captions and their embeddings and regenerate them? Runs in the background and can take a long time.")) return;
+    el.resetMsg.textContent = " working\u2026";
+    fetch("/api/captions/reset", { method: "POST" })
+      .then(function (r) { if (!r.ok) throw 0; el.resetMsg.textContent = " cleared \u2014 regenerating in the background."; })
+      .catch(function () { el.resetMsg.textContent = " failed."; });
+  });
+  el.resetEmbeddings.addEventListener("click", function () {
+    if (!confirm("Clear caption embeddings and re-embed the existing captions?")) return;
+    el.resetMsg.textContent = " working\u2026";
+    fetch("/api/embeddings/reset", { method: "POST" })
+      .then(function (r) { if (!r.ok) throw 0; el.resetMsg.textContent = " cleared \u2014 re-embedding in the background."; })
+      .catch(function () { el.resetMsg.textContent = " failed."; });
   });
   document.addEventListener("click", function (e) {
     if (!el.qhint.classList.contains("hidden") && !el.qhint.contains(e.target) && e.target !== el.qhelp) {
@@ -809,6 +834,7 @@
         if (c.captioned < c.visual) txt += " \u00b7 captioning " + c.captioned.toLocaleString() + "/" + c.visual.toLocaleString();
         else if (c.embeddings && c.embedded < c.captioned) txt += " \u00b7 embedding " + c.embedded.toLocaleString() + "/" + c.captioned.toLocaleString();
         else if (c.visual > 0) txt += " \u00b7 captioned";
+        el.qhintReset.classList.remove("hidden");
       }
       el.readout.innerHTML = txt;
 

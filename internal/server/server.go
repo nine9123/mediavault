@@ -60,6 +60,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/item", s.handleItemDetail)
 	mux.HandleFunc("PUT /api/tags", s.handleSetTags)
 	mux.HandleFunc("GET /api/tags/top", s.handleTopTags)
+	mux.HandleFunc("POST /api/captions/reset", s.handleResetCaptions)
+	mux.HandleFunc("POST /api/embeddings/reset", s.handleResetEmbeddings)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
 	mux.HandleFunc("GET /api/thumb/{path...}", s.handleThumb)
@@ -368,6 +370,24 @@ func (s *Server) handleItemDetail(w http.ResponseWriter, r *http.Request) {
 // handleSetTags writes an item's manual tags to its sidecar (the durable source
 // of truth) and syncs the DB immediately, so the change is visible and
 // searchable without waiting for a rescan. AI tags are left alone.
+// handleResetCaptions clears all captions + embeddings so they get regenerated.
+func (s *Server) handleResetCaptions(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.ResetCaptions(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// handleResetEmbeddings clears only caption embeddings (re-embed existing captions).
+func (s *Server) handleResetEmbeddings(w http.ResponseWriter, r *http.Request) {
+	if err := s.store.ResetEmbeddings(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 // handleTopTags returns the most-used manual tags for the quick-add menu.
 func (s *Server) handleTopTags(w http.ResponseWriter, r *http.Request) {
 	limit := clampAtoi(r.URL.Query().Get("limit"), 12, 1, 100)
