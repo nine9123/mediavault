@@ -146,6 +146,13 @@ func (s *Store) ensureColumns() error {
 	)`); err != nil {
 		return fmt.Errorf("create item_vectors: %w", err)
 	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS item_embeddings (
+		item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+		dim     INTEGER NOT NULL,
+		vec     BLOB    NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create item_embeddings: %w", err)
+	}
 	return nil
 }
 
