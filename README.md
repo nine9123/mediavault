@@ -92,6 +92,7 @@ docker compose up --build
 | `ADDR`          | `:8080`  | HTTP listen address                                 |
 | `SCAN_WORKERS`  | `6`      | Worker-pool size (SMB is the bottleneck; keep 4–8)  |
 | `SCAN_INTERVAL` | `5m`     | Periodic rescan; `0` disables the ticker            |
+| `SCAN_SETTLE`   | `60s`    | Ignore new files modified this recently (still being written); `0` disables |
 | `THUMB_PX`      | `400`    | Thumbnail longest edge (px)                         |
 | `HASH_MODE`     | `partial`| Content fingerprint: `off` / `partial` / `full`     |
 | `SIDECAR_DIR`   | *(empty)*| Where tag sidecars live; empty = next to the media  |
@@ -137,6 +138,39 @@ Notes:
   the next scan. Changing `PREVIEW_FORMAT` orphans the old files, so clear the
   directory when you switch.
 
+### Poster-frame offset
+
+By default a video's representative frame is taken 2 seconds in — far enough to
+clear a fade from black. When that lands on something useless (a title card, a
+dark shot), set a per-video offset in the viewer: type a number of seconds, or
+scrub to the frame you want and press **Use current frame**.
+
+The offset drives three things that must agree: the grid thumbnail, the frame
+sent to the vision model for captioning, and the perceptual signature behind
+"looks similar". It is stored in the file's sidecar, not the database, so it
+survives a cache rebuild like tags do. Applying it rebuilds the thumbnail
+immediately; the signature refreshes on the next scan.
+
+**Regenerate caption** in the same panel re-runs the vision model for that one
+item, for when a single caption is wrong and resetting the whole library is not a
+proportionate response. It overwrites the caption and refreshes its embedding, so
+semantic search stops matching the text you just replaced.
+
+### Truncated and incomplete files
+
+`moov atom not found` in the scan log means a file has no container index. MP4
+writes that index at the *end* of the file, so a copy that stopped early parses
+fine right up to where the index should be. It is almost always an interrupted
+download or a file copied while still being written — not a codec problem. Note
+the error names the MP4 demuxer even for a `.webm` path, because ffprobe detects
+containers by content rather than extension; such a file contains MP4 bytes.
+
+Two things reduce the noise: files modified within `SCAN_SETTLE` are skipped until
+they stop changing, and genuinely truncated files are summarised once per scan
+instead of logged individually. They stay listed and downloadable but have no
+dimensions or thumbnail. To find them, look for items with no preview; re-copying
+the file fixes it.
+
 ## HTTP API
 
 - `GET  /api/items?limit=&before=&after=` — list items newest-first; `before=<id>`
@@ -147,6 +181,10 @@ Notes:
   sidecar and syncs the DB immediately (no rescan needed)
 - `GET  /api/preview/<relpath>` — cached animated preview (video only; the
   `preview_url` field in an item is empty until one exists)
+- `POST /api/caption` — `{ "path": "..." }`; re-runs the vision model for that one
+  item and overwrites its caption (also refreshes the caption embedding)
+- `PUT  /api/offset` — `{ "path": "...", "offset": 12.5 }`; sets the poster-frame
+  offset for a video and rebuilds its thumbnail. `null` restores the default
 - `GET  /api/stats` — collection size + latest scan (drives the live UI)
 - `POST /api/scan` — trigger a rescan (returns 202; overlapping calls collapse)
 - `GET  /api/thumb/{path...}` — cached thumbnail

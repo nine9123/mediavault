@@ -20,7 +20,13 @@ type Config struct {
 
 	Workers   int           // scan worker-pool size (keep modest: SMB is the bottleneck)
 	ScanEvery time.Duration // periodic rescan interval; 0 disables the ticker
-	ThumbPx   int           // thumbnail longest edge, px
+
+	// ScanSettle is how recently a file may have been modified and still be
+	// skipped as "probably still being written". An in-progress download has no
+	// index yet, so probing it wastes work and logs a scary error; waiting one
+	// scan interval costs nothing. 0 disables the check.
+	ScanSettle time.Duration
+	ThumbPx    int // thumbnail longest edge, px
 
 	// Animated video previews: several short bursts of frames sampled across
 	// the whole duration, baked into one looping file the browser plays in a
@@ -122,6 +128,7 @@ func Load() Config {
 		Addr:             env("ADDR", ":8080"),
 		Workers:          envInt("SCAN_WORKERS", 6),
 		ScanEvery:        envDur("SCAN_INTERVAL", 5*time.Minute),
+		ScanSettle:       envDur("SCAN_SETTLE", 60*time.Second),
 		ThumbPx:          envInt("THUMB_PX", 400),
 		PreviewFormat:    previewFormat(env("PREVIEW_FORMAT", "webp")),
 		PreviewPx:        envInt("PREVIEW_PX", 320),

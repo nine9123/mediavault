@@ -27,9 +27,10 @@ func ThumbPath(dir, relpath string) string {
 }
 
 // Thumbnail writes a webp thumbnail for src at dst. Stills and animated formats
-// use their first frame; video tries a poster frame ~1s in and falls back to
-// the first frame for short clips. The longest edge is capped at cfg.ThumbPx.
-func Thumbnail(ctx context.Context, cfg config.Config, src string, typ model.MediaType, dst string) error {
+// use their first frame; video seeks to its poster offset (see PosterSeek) and
+// falls back to the first frame for clips shorter than that. The longest edge is
+// capped at cfg.ThumbPx.
+func Thumbnail(ctx context.Context, cfg config.Config, src string, typ model.MediaType, offset float64, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
@@ -41,14 +42,13 @@ func Thumbnail(ctx context.Context, cfg config.Config, src string, typ model.Med
 		return append(a, "-i", src, "-frames:v", "1", "-vf", scale, "-y", dst)
 	}
 
-	if typ == model.MediaVideo {
-		// A ~1s input seek is fast and skips black intro frames. Clips shorter
-		// than the seek point (common for webm loops) yield no frame there, so
-		// retry from the very start before giving up.
-		if err := runFFmpeg(ctx, cfg, frame("-ss", "2")); err == nil {
+	if seek := PosterSeek(typ, offset); seek != nil {
+		// The input seek is fast and skips black intro frames. Clips shorter than
+		// the seek point (common for webm loops) yield no frame there, so retry
+		// from the very start before giving up.
+		if err := runFFmpeg(ctx, cfg, frame(seek...)); err == nil {
 			return nil
 		}
-		return runFFmpeg(ctx, cfg, frame())
 	}
 	return runFFmpeg(ctx, cfg, frame())
 }

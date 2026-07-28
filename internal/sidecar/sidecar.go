@@ -29,6 +29,13 @@ type Sidecar struct {
 	TagList []string `json:"tags"`
 	Rating  int      `json:"rating,omitempty"`
 	Notes   string   `json:"notes,omitempty"`
+
+	// Offset is how many seconds into a video to take the representative frame:
+	// the grid thumbnail, the frame sent to the vision model, and the perceptual
+	// signature. Zero/absent means "use the default" (media.DefaultPosterOffset).
+	// It lives here rather than in the DB because it is a human judgement about
+	// the file — the DB is a disposable cache, and this must survive a rebuild.
+	Offset float64 `json:"offset,omitempty"`
 }
 
 // IsSidecar reports whether a filename is a sidecar/manifest (so the scanner

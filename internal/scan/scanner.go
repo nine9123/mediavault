@@ -69,6 +69,7 @@ type result struct {
 	err      error
 	thumbErr string // non-empty if a thumbnail was attempted and failed
 	prevErr  string // non-empty if an animated preview was attempted and failed
+	partial  bool   // probe failed in a way that means "truncated/incomplete file"
 }
 
 // Scan runs one full pass. Overlapping calls are skipped (the periodic ticker
@@ -93,6 +94,11 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	var thumbSample string
 	var prevFails int
 	var prevSample string
+	var partial int
+	var partialSample string
+	var unsettled int
+
+	var unsettledMu sync.Mutex
 
 	// 1. Snapshot the present index up front so change-detection is pure map
 	//    lookups — no per-file DB round-trips during the walk.
@@ -166,6 +172,12 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 				} else {
 					stats.Added++
 				}
+				if r.partial {
+					partial++
+					if partialSample == "" {
+						partialSample = r.relpath
+					}
+				}
 				if r.prevErr != "" {
 					prevFails++
 					if prevSample == "" {
@@ -224,6 +236,20 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 		}
 		if info.Size() == 0 {
 			return nil // empty/partial file (e.g. an in-progress download); pick it up once it has content
+		}
+		// Still being written? Skip until it settles. An in-progress download has
+		// no container index yet, so probing it is guaranteed to fail noisily and
+		// the result would be an item with no dimensions or thumbnail. The next
+		// scan picks it up. Deliberately before the seen[] bookkeeping below, so a
+		// file that is already indexed is left exactly as it was rather than being
+		// treated as missing.
+		if s.cfg.ScanSettle > 0 && time.Since(info.ModTime()) < s.cfg.ScanSettle {
+			if _, known := index[rel]; !known {
+				unsettledMu.Lock()
+				unsettled++
+				unsettledMu.Unlock()
+				return nil
+			}
 		}
 
 		seenMu.Lock()
@@ -300,6 +326,14 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	if prevFails > 0 {
 		log.Printf("scan: %d video(s) had no animated preview; e.g. %s", prevFails, prevSample)
 	}
+	if unsettled > 0 {
+		log.Printf("scan: %d new file(s) skipped as still being written; will pick them up next scan", unsettled)
+	}
+	if partial > 0 {
+		log.Printf("scan: %d file(s) are truncated or incomplete — no container index, "+
+			"typically an interrupted download or a copy that stopped early; "+
+			"they stay listed but have no dimensions/thumbnail. e.g. %s", partial, partialSample)
+	}
 	if err := s.store.RecordScanRun(ctx, stats); err != nil {
 		log.Printf("scan: record run: %v", err)
 	}
@@ -320,11 +354,30 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 		SeenAt:    time.Now(),
 	}
 
+	// Read the sidecar before any frame work: it carries the poster offset, which
+	// decides WHICH frame becomes the thumbnail, the vision-model input, and the
+	// perceptual signature. Reading it afterwards would silently ignore the
+	// offset on the scan that first sees it.
+	if sc, ok, err := sidecar.Read(s.cfg.SidecarPath(j.relpath)); err != nil {
+		log.Printf("scan: sidecar %s: %v", j.relpath, err)
+	} else if ok {
+		res.write.ManualTags = sc.Tags()
+		item.Offset = sc.Offset
+	}
+
 	// Probe is best-effort: a file we can't read metadata for (partial download,
 	// odd codec, transient SMB hiccup) is still worth indexing so it's visible
-	// and downloadable — a later scan re-probes once it settles. We just log why.
+	// and downloadable — a later scan re-probes once it settles.
+	//
+	// Truncated files are counted and summarised once per scan instead of logged
+	// individually: a folder of interrupted downloads would otherwise reprint the
+	// same "moov atom not found" every five minutes forever.
 	if meta, err := media.Probe(ctx, s.cfg, j.abs, j.typ); err != nil {
-		log.Printf("scan: probe %s: %v", j.relpath, err)
+		if media.IsIncomplete(err) {
+			res.partial = true
+		} else {
+			log.Printf("scan: probe %s: %v", j.relpath, err)
+		}
 		item.MIME = media.MimeFor(j.abs)
 	} else {
 		item.Width, item.Height, item.Duration, item.MIME = meta.Width, meta.Height, meta.Duration, meta.MIME
@@ -337,13 +390,13 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 	// such file. (Cover-less audio shows a ♪; animated webp is rendered directly
 	// in the grid.) Thumbnail failure is non-fatal regardless — we still index.
 	if item.Width > 0 {
-		if err := media.Thumbnail(ctx, s.cfg, j.abs, j.typ, media.ThumbPath(s.cfg.ThumbDir(), j.relpath)); err != nil {
+		if err := media.Thumbnail(ctx, s.cfg, j.abs, j.typ, item.Offset, media.ThumbPath(s.cfg.ThumbDir(), j.relpath)); err != nil {
 			res.thumbErr = err.Error()
 		} else {
 			item.ThumbReady = true
 		}
 		// Perceptual signature for "looks similar" search (best-effort).
-		if vec, err := media.Signature(ctx, s.cfg, j.abs, j.typ); err == nil {
+		if vec, err := media.Signature(ctx, s.cfg, j.abs, j.typ, item.Offset); err == nil {
 			res.write.Vector = vec
 		}
 
@@ -381,13 +434,6 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 		} else {
 			item.ContentHash = h
 		}
-	}
-
-	// Fold in human-authored tags from the sidecar (source of truth).
-	if sc, ok, err := sidecar.Read(s.cfg.SidecarPath(j.relpath)); err != nil {
-		log.Printf("scan: sidecar %s: %v", j.relpath, err)
-	} else if ok {
-		res.write.ManualTags = sc.Tags()
 	}
 
 	res.write.Item = item

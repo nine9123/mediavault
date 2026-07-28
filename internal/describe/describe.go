@@ -80,7 +80,7 @@ func (d *Describer) captionPass(ctx context.Context) {
 				continue
 			}
 			abs := filepath.Join(d.cfg.MediaRoot, filepath.FromSlash(it.Relpath))
-			jpeg, err := media.FrameJPEG(ctx, d.cfg, abs, it.Type, frameMaxPx)
+			jpeg, err := media.FrameJPEG(ctx, d.cfg, abs, it.Type, it.Offset, frameMaxPx)
 			if err != nil {
 				d.failed[it.Relpath] = struct{}{} // no frame; skip this run
 				continue

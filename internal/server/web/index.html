@@ -321,6 +321,15 @@
   .descrow{margin:8px 0}
   .descrow .descv{color:var(--bone);font-size:.9rem;line-height:1.55;margin-top:4px;white-space:pre-wrap;background:var(--ink-raised);border-left:2px solid var(--brass-soft);padding:8px 10px}
   .descrow .descv.pending{color:var(--bone-faint);font-style:italic;background:none;border-left-color:var(--ink-line)}
+  .cardbtn{font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--bone-dim);background:transparent;border:1px solid var(--ink-line);border-radius:2px;padding:5px 9px;cursor:pointer;margin-top:6px}
+  .cardbtn:hover:not(:disabled){color:var(--bone);border-color:var(--ink-line-2)}
+  .cardbtn:disabled{opacity:.5;cursor:default}
+  .cardmsg{font-family:var(--mono);font-size:11px;color:var(--bone-faint);margin-top:6px;min-height:1em}
+  .cardmsg.bad{color:var(--brass-soft)}
+  .offrow{margin:8px 0}
+  .offrow .offctl{display:flex;align-items:center;gap:6px;margin-top:4px;flex-wrap:wrap}
+  .offrow input[type=number]{width:5.5em;font-family:var(--mono);font-size:.8rem;color:var(--bone);background:var(--ink-raised);border:1px solid var(--ink-line);border-radius:2px;padding:5px 6px}
+  .offrow .hint{font-family:var(--mono);font-size:10px;color:var(--bone-faint);margin-top:5px;line-height:1.5}
   .vtools{position:absolute;top:12px;left:12px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;z-index:6;max-width:calc(100% - 90px)}
   .vnum{display:flex;align-items:center;gap:2px;font-family:var(--mono);font-size:.72rem;letter-spacing:.03em;color:var(--bone-dim);background:rgba(20,18,16,.72);border:1px solid var(--ink-line);border-radius:2px;padding:.3rem .55rem;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);user-select:none}
   .vnum input{width:3.2rem;background:transparent;border:none;border-bottom:1px solid var(--ink-line-2);color:var(--bone);font-family:var(--mono);font-size:.72rem;text-align:center;padding:0 2px}
@@ -390,6 +399,7 @@
         <label class="vtoggle" title="When a video/track ends — or an image has shown for the set seconds — advance to the next item"><input type="checkbox" id="autonext"> Autoplay next</label>
         <label class="vnum" title="Seconds to show each image/gif before advancing">every&nbsp;<input type="number" id="autosecs" min="1" max="600" step="1">&nbsp;s</label>
         <label class="vtoggle" title="When autoplaying, jump to a random item instead of the next one"><input type="checkbox" id="autoshuffle"> Shuffle</label>
+        <label class="vtoggle" id="looplabel" title="Repeat the current video/track instead of stopping at the end"><input type="checkbox" id="loop"> Loop</label>
       </div>
       <button class="close" id="close" aria-label="Close">&times;</button>
     </div>
@@ -419,6 +429,9 @@
     autoNext: false,    // auto-advance when a video/track ends
     autoSecs: 5,        // seconds to show each image before auto-advancing
     autoRandom: false,  // autoplay jumps to a random item instead of the next
+    volume: 1,          // remembered playback volume (0-1)
+    muted: false,       // remembered mute state
+    loop: false,        // repeat the current video/track
     scanning: false
   };
 
@@ -442,6 +455,8 @@
     autonext: document.getElementById("autonext"),
     autosecs: document.getElementById("autosecs"),
     autoshuffle: document.getElementById("autoshuffle"),
+    loop: document.getElementById("loop"),
+    looplabel: document.getElementById("looplabel"),
     qhelp: document.getElementById("qhelp"),
     qhint: document.getElementById("qhint"),
     qhintReset: document.getElementById("qhintReset"),
@@ -684,6 +699,19 @@
     });
   })();
 
+  // A rebuilt thumbnail keeps the same URL — the filename is a hash of the
+  // relpath, not of the content — so the browser would happily keep serving the
+  // cached copy. Re-request the grid cell's image with a cache-busting param.
+  function bustThumb(item) {
+    var bust = "?v=" + Date.now();
+    var idx = S.items.indexOf(item);
+    if (idx >= 0) {
+      var cell = el.grid.children[idx];
+      var img = cell && cell.querySelector("img:not(.prev)");
+      if (img) img.src = item.thumb_url + bust;
+    }
+  }
+
   function trackBounds(item) {
     if (S.maxId === null || item.id > S.maxId) S.maxId = item.id;
     if (S.minId === null || item.id < S.minId) S.minId = item.id;
@@ -852,6 +880,14 @@
   }
 
   function openItemByPath(rel) {
+    // Check the queue we're already in first. Going Back through a shuffle
+    // session should return to that item *within the session*, keeping the list
+    // and the arrows intact — refetching it as a lone item would strand you.
+    if (S.viewerOpen && S.viewKind === "queue") {
+      for (var j = 0; j < S.viewList.length; j++) {
+        if (S.viewList[j].relpath === rel) { showAt(j, true); return; }
+      }
+    }
     for (var i = 0; i < S.items.length; i++) {
       if (S.items[i].relpath === rel) { openViewer(i, true); return; }
     }
@@ -927,8 +963,23 @@
     var url = "/api/random" + (q ? "?q=" + encodeURIComponent(q) : "");
     return api(url).then(function (d) { return (d.items && d.items[0]) || null; });
   }
+  // Each Random click is a place you can come back to. Previously the first click
+  // pushed a history entry and every later one REPLACED it (openQueue replaces
+  // whenever the viewer is already open), so Back from the fifth random jumped
+  // straight to the grid and the four items in between were unrecoverable.
+  //
+  // Appending to the existing queue rather than starting a fresh one also keeps
+  // the arrow keys meaningful: the shuffle session stays one navigable list.
   function startRandom() {
-    return fetchRandom().then(function (item) { if (item) openQueue([item], 0, fetchRandom); });
+    return fetchRandom().then(function (item) {
+      if (!item) return;
+      if (S.viewerOpen && S.viewKind === "queue") {
+        S.viewList.push(item);
+        showAt(S.viewList.length - 1, false, true); // true = push, don't replace
+      } else {
+        openQueue([item], 0, fetchRandom);
+      }
+    });
   }
   el.random.addEventListener("click", function () {
     el.random.disabled = true;
@@ -943,15 +994,48 @@
   try { S.autoNext = localStorage.getItem("mv.autoplayNext") === "1"; } catch (e) {}
   try { var sv = parseInt(localStorage.getItem("mv.autoplaySecs"), 10); if (sv >= 1) S.autoSecs = sv; } catch (e) {}
   try { S.autoRandom = localStorage.getItem("mv.autoplayShuffle") === "1"; } catch (e) {}
+  try {
+    var vol = parseFloat(localStorage.getItem("mv.volume"));
+    if (vol >= 0 && vol <= 1) S.volume = vol;
+  } catch (e) {}
+  try { S.muted = localStorage.getItem("mv.muted") === "1"; } catch (e) {}
+  try { S.loop = localStorage.getItem("mv.loop") === "1"; } catch (e) {}
   el.autonext.checked = S.autoNext;
   el.autosecs.value = S.autoSecs;
   el.autoshuffle.checked = S.autoRandom;
+  el.loop.checked = S.loop;
   el.autosecs.disabled = !S.autoNext;
   el.autoshuffle.disabled = !S.autoNext;
+
+  // Loop and autoplay-next are mutually exclusive by construction: a looping
+  // element never fires "ended", which is what drives auto-advance. Rather than
+  // let one silently defeat the other, only one can be armed at a time.
+  function syncLoopEnabled() {
+    el.loop.disabled = S.autoNext;
+    el.looplabel.title = S.autoNext
+      ? "Disabled while Autoplay next is on \u2014 a looping video never ends, so it would never advance"
+      : "Repeat the current video/track instead of stopping at the end";
+  }
+  syncLoopEnabled();
+
+  el.loop.addEventListener("change", function () {
+    S.loop = el.loop.checked;
+    try { localStorage.setItem("mv.loop", S.loop ? "1" : "0"); } catch (e) {}
+    // Apply to whatever is playing right now, so the checkbox takes effect
+    // without needing to navigate away and back.
+    el.stage.querySelectorAll("video, audio").forEach(function (n) { n.loop = S.loop; });
+  });
   el.autonext.addEventListener("change", function () {
     S.autoNext = el.autonext.checked;
     el.autosecs.disabled = !S.autoNext;
     el.autoshuffle.disabled = !S.autoNext;
+    if (S.autoNext && S.loop) { // autoplay wins; make the conflict visible
+      S.loop = false;
+      el.loop.checked = false;
+      try { localStorage.setItem("mv.loop", "0"); } catch (e) {}
+      el.stage.querySelectorAll("video, audio").forEach(function (n) { n.loop = false; });
+    }
+    syncLoopEnabled();
     try { localStorage.setItem("mv.autoplayNext", S.autoNext ? "1" : "0"); } catch (e) {}
     armSlideshow();
   });
@@ -1047,11 +1131,16 @@
     }, Math.max(1, S.autoSecs) * 1000);
   }
 
-  function showAt(i, noHist) {
+  // hist: omitted/false = replace the current entry (paging shouldn't spam
+  // history); push = add a new entry (a deliberate jump, e.g. Random).
+  function showAt(i, noHist, push) {
     if (i < 0 || i >= S.viewList.length) return;
     stopTxPoll();
     S.viewIndex = i;
-    if (!noHist) replItem(S.viewList[i].relpath);
+    if (!noHist) {
+      if (push) pushItem(S.viewList[i].relpath);
+      else replItem(S.viewList[i].relpath);
+    }
     renderStage();
     renderCard();
     scheduleView(S.viewList[i]);
@@ -1077,6 +1166,25 @@
     S.viewKind = "queue"; S.viewList = list; S.viewMore = moreFn || null;
     if (!noHist) { if (wasOpen) replItem(list[idx].relpath); else pushItem(list[idx].relpath); }
     showViewer(); showAt(idx, true);
+  }
+
+  // The browser's default controls don't remember volume between elements: each
+  // new <video> starts at 1.0. We create a fresh element per item, so without
+  // this every navigation resets the volume. Restoring before playback starts
+  // avoids a burst at full volume, and volumechange fires for both the slider
+  // and the mute button, so one listener covers both.
+  function applyMediaPrefs(n) {
+    n.volume = S.volume;
+    n.muted = S.muted;
+    n.loop = S.loop;
+    n.addEventListener("volumechange", function () {
+      S.volume = n.volume;
+      S.muted = n.muted;
+      try {
+        localStorage.setItem("mv.volume", String(S.volume));
+        localStorage.setItem("mv.muted", S.muted ? "1" : "0");
+      } catch (e) {}
+    });
   }
 
   function stopMedia(n) {
@@ -1181,6 +1289,7 @@
       media.autoplay = true;
       media.playsInline = true;
       media.preload = "metadata";
+      applyMediaPrefs(media);
       media.addEventListener("error", function () { tryConvert(item, media); });
       media.addEventListener("ended", onMediaEnded);
     } else if (item.type === "audio") {
@@ -1203,6 +1312,7 @@
       audio.controls = true;
       audio.autoplay = true;
       audio.preload = "metadata";
+      applyMediaPrefs(audio);
       audio.addEventListener("error", function () { tryConvert(item, media); });
       audio.addEventListener("ended", onMediaEnded);
       media.appendChild(audio);
@@ -1257,6 +1367,123 @@
       else { descV.textContent = "Not described yet."; descV.classList.add("pending"); }
     }
     setDesc(item.description);
+
+    // --- regenerate this one caption ---
+    // Library-wide "Regenerate all captions" already exists in the search help;
+    // this is the per-item version, for when one caption is wrong and resetting
+    // thousands is not a reasonable response to that.
+    var recap = document.createElement("button");
+    recap.className = "cardbtn"; recap.type = "button";
+    recap.textContent = "Regenerate caption";
+    var recapMsg = document.createElement("div"); recapMsg.className = "cardmsg";
+    descBlock.appendChild(recap);
+    descBlock.appendChild(recapMsg);
+
+    function say(node, text, bad) {
+      node.textContent = text || "";
+      node.classList.toggle("bad", !!bad);
+    }
+
+    recap.addEventListener("click", function () {
+      var target = item; // captured: the user may navigate while we wait
+      recap.disabled = true;
+      say(recapMsg, "Asking the vision model\u2026");
+      fetch("/api/caption", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: target.relpath })
+      }).then(function (r) {
+        return r.text().then(function (body) {
+          if (!r.ok) throw new Error(body || ("HTTP " + r.status));
+          return JSON.parse(body);
+        });
+      }).then(function (d) {
+        target.description = d.description || "";
+        // Only touch the DOM if this item is still the one on screen.
+        if (S.viewList[S.viewIndex] === target) {
+          setDesc(target.description);
+          say(recapMsg, "Updated.");
+        }
+      }).catch(function (e) {
+        if (S.viewList[S.viewIndex] === target) say(recapMsg, String(e.message || e), true);
+      }).finally(function () {
+        if (S.viewList[S.viewIndex] === target) recap.disabled = false;
+      });
+    });
+
+    // --- poster-frame offset (video only) ---
+    // Which frame represents the video: the grid thumbnail, the frame handed to
+    // the vision model, and the "looks similar" signature all read it.
+    if (item.type === "video") {
+      var offBlock = document.createElement("div"); offBlock.className = "offrow";
+      var offK = document.createElement("div"); offK.className = "k"; offK.textContent = "Thumbnail offset";
+      var offCtl = document.createElement("div"); offCtl.className = "offctl";
+
+      var offIn = document.createElement("input");
+      offIn.type = "number"; offIn.min = "0"; offIn.step = "0.5";
+      if (item.duration) offIn.max = String(Math.floor(item.duration));
+      offIn.value = item.offset ? String(item.offset) : "";
+      offIn.placeholder = String(item.offset_default || 2);
+      offIn.title = "Seconds into the video. Blank = default.";
+
+      var offUnit = document.createElement("span"); offUnit.className = "hint"; offUnit.textContent = "s";
+      var offSave = document.createElement("button");
+      offSave.className = "cardbtn"; offSave.type = "button"; offSave.textContent = "Apply";
+      offSave.style.marginTop = "0";
+      var offHere = document.createElement("button");
+      offHere.className = "cardbtn"; offHere.type = "button"; offHere.textContent = "Use current frame";
+      offHere.style.marginTop = "0";
+      offHere.title = "Take the offset from where the video is paused right now";
+
+      offCtl.appendChild(offIn); offCtl.appendChild(offUnit);
+      offCtl.appendChild(offSave); offCtl.appendChild(offHere);
+
+      var offMsg = document.createElement("div"); offMsg.className = "cardmsg";
+      var offHint = document.createElement("div"); offHint.className = "hint";
+      offHint.textContent = "Used for the grid thumbnail, the vision-model frame and similarity. "
+        + "Saved to the sidecar, so it survives a database rebuild.";
+
+      offBlock.appendChild(offK); offBlock.appendChild(offCtl);
+      offBlock.appendChild(offMsg); offBlock.appendChild(offHint);
+      el.card.appendChild(offBlock);
+
+      offHere.addEventListener("click", function () {
+        var v = el.stage.querySelector("video");
+        if (!v) { say(offMsg, "No video playing.", true); return; }
+        offIn.value = String(Math.round(v.currentTime * 10) / 10);
+        say(offMsg, "");
+      });
+
+      offSave.addEventListener("click", function () {
+        var target = item;
+        var raw = offIn.value.trim();
+        var val = raw === "" ? null : parseFloat(raw);
+        if (raw !== "" && !(val >= 0)) { say(offMsg, "Enter a number of seconds, or leave blank.", true); return; }
+        offSave.disabled = true; offHere.disabled = true;
+        say(offMsg, "Rebuilding thumbnail\u2026");
+        fetch("/api/offset", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: target.relpath, offset: val })
+        }).then(function (r) {
+          return r.text().then(function (body) {
+            if (!r.ok) throw new Error(body || ("HTTP " + r.status));
+            return JSON.parse(body);
+          });
+        }).then(function (d) {
+          target.offset = d.offset || 0;
+          if (S.viewList[S.viewIndex] === target) {
+            offIn.value = target.offset ? String(target.offset) : "";
+            say(offMsg, d.thumb_rebuilt ? "Saved. Thumbnail rebuilt." : "Saved, but no frame at that point.", !d.thumb_rebuilt);
+          }
+          bustThumb(target);
+        }).catch(function (e) {
+          if (S.viewList[S.viewIndex] === target) say(offMsg, String(e.message || e), true);
+        }).finally(function () {
+          if (S.viewList[S.viewIndex] === target) { offSave.disabled = false; offHere.disabled = false; }
+        });
+      });
+    }
 
     var tagRow = document.createElement("div");
     tagRow.className = "row";

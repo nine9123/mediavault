@@ -28,6 +28,7 @@ type Item struct {
 	Width        int
 	Height       int
 	Duration     float64 // seconds; video + audio
+	Offset       float64 // seconds into a video for its representative frame; 0 = default
 	ThumbReady   bool
 	PreviewReady bool   // animated multi-segment preview exists (video only)
 	Views        int    // times opened in the viewer (popularity signal)

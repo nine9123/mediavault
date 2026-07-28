@@ -26,13 +26,12 @@ const (
 	sigGrid   = 12                        // RGB grid edge (structure)
 	sigColorW = 0.4                       // color weight (structure gets 1-this)
 	SigDim    = sigGrid*sigGrid*3 + 4*4*4 // 432 + 64 = 496
-	sigPoster = "2"                       // seconds into a video to sample (skip fade-ins)
 )
 
 // Signature returns the perceptual descriptor for a file, or an error if a
 // frame can't be decoded. Caller should gate on the item having a visual stream.
-func Signature(ctx context.Context, cfg config.Config, path string, typ model.MediaType) ([]float32, error) {
-	grid, err := rgbGrid(ctx, cfg, path, typ)
+func Signature(ctx context.Context, cfg config.Config, path string, typ model.MediaType, offset float64) ([]float32, error) {
+	grid, err := rgbGrid(ctx, cfg, path, typ, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -43,20 +42,20 @@ func Signature(ctx context.Context, cfg config.Config, path string, typ model.Me
 }
 
 // rgbGrid decodes one frame downscaled to sigGrid×sigGrid as raw RGB. Video is
-// sampled a couple of seconds in (fade-ins are usually black); short clips fall
-// back to the first frame.
-func rgbGrid(ctx context.Context, cfg config.Config, path string, typ model.MediaType) ([]byte, error) {
+// sampled at its poster offset (fade-ins are usually black); short clips fall
+// back to the first frame. Using the same offset as the thumbnail matters:
+// "looks similar" should compare the frames you actually see in the grid.
+func rgbGrid(ctx context.Context, cfg config.Config, path string, typ model.MediaType, offset float64) ([]byte, error) {
 	vf := fmt.Sprintf("scale=%d:%d,format=rgb24", sigGrid, sigGrid)
 	run := func(seek ...string) ([]byte, error) {
 		args := append([]string{"-nostdin", "-v", "error"}, seek...)
 		args = append(args, "-i", path, "-frames:v", "1", "-vf", vf, "-f", "rawvideo", "-")
 		return exec.CommandContext(ctx, cfg.FFmpeg, args...).Output()
 	}
-	if typ == model.MediaVideo {
-		if out, err := run("-ss", sigPoster); err == nil && len(out) >= sigGrid*sigGrid*3 {
+	if seek := PosterSeek(typ, offset); seek != nil {
+		if out, err := run(seek...); err == nil && len(out) >= sigGrid*sigGrid*3 {
 			return out, nil
 		}
-		return run()
 	}
 	return run()
 }

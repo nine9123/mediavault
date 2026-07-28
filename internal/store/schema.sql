@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS items (
     width         INTEGER,
     height        INTEGER,
     duration      REAL,                       -- seconds; video only
+    offset_s      REAL,                       -- poster-frame offset (s); mirrors the sidecar
     thumb_ready   INTEGER NOT NULL DEFAULT 0, -- 0/1
     preview_ready INTEGER NOT NULL DEFAULT 0, -- 0/1; animated preview exists
     views         INTEGER NOT NULL DEFAULT 0, -- times opened in the viewer (popularity signal)

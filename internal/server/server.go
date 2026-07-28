@@ -8,6 +8,7 @@ import (
 	"embed"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -59,6 +60,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/transcode", s.handleTranscodeStatus)
 	mux.HandleFunc("GET /api/item", s.handleItemDetail)
 	mux.HandleFunc("PUT /api/tags", s.handleSetTags)
+	mux.HandleFunc("POST /api/caption", s.handleRecaption)
+	mux.HandleFunc("PUT /api/offset", s.handleSetOffset)
 	mux.HandleFunc("GET /api/tags/top", s.handleTopTags)
 	mux.HandleFunc("POST /api/captions/reset", s.handleResetCaptions)
 	mux.HandleFunc("POST /api/embeddings/reset", s.handleResetEmbeddings)
@@ -81,22 +84,28 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(b)
 }
 
+// captionFramePx matches the background describer's frame size, so an on-demand
+// caption sees exactly the same input the automatic one would have.
+const captionFramePx = 512
+
 // itemDTO is the JSON shape returned to clients, with ready-to-use URLs.
 type itemDTO struct {
-	ID           int64   `json:"id"`
-	Relpath      string  `json:"relpath"`
-	Type         string  `json:"type"`
-	MIME         string  `json:"mime"`
-	Width        int     `json:"width"`
-	Height       int     `json:"height"`
-	Duration     float64 `json:"duration,omitempty"`
-	ThumbReady   bool    `json:"thumb_ready"`
-	PreviewReady bool    `json:"preview_ready"`
-	Views        int     `json:"views"`
-	Description  string  `json:"description,omitempty"`
-	ThumbURL     string  `json:"thumb_url"`
-	PreviewURL   string  `json:"preview_url,omitempty"`
-	RawURL       string  `json:"raw_url"`
+	ID            int64   `json:"id"`
+	Relpath       string  `json:"relpath"`
+	Type          string  `json:"type"`
+	MIME          string  `json:"mime"`
+	Width         int     `json:"width"`
+	Height        int     `json:"height"`
+	Duration      float64 `json:"duration,omitempty"`
+	Offset        float64 `json:"offset,omitempty"`
+	OffsetDefault float64 `json:"offset_default"`
+	ThumbReady    bool    `json:"thumb_ready"`
+	PreviewReady  bool    `json:"preview_ready"`
+	Views         int     `json:"views"`
+	Description   string  `json:"description,omitempty"`
+	ThumbURL      string  `json:"thumb_url"`
+	PreviewURL    string  `json:"preview_url,omitempty"`
+	RawURL        string  `json:"raw_url"`
 }
 
 // tagDTO is the JSON shape for a tag in the item-detail and tag-edit responses.
@@ -118,20 +127,22 @@ func toTagDTOs(tags []store.ItemTag) []tagDTO {
 func toDTO(it model.Item) itemDTO {
 	enc := encRel(it.Relpath)
 	return itemDTO{
-		ID:           it.ID,
-		Relpath:      it.Relpath,
-		Type:         string(it.Type),
-		MIME:         it.MIME,
-		Width:        it.Width,
-		Height:       it.Height,
-		Duration:     it.Duration,
-		ThumbReady:   it.ThumbReady,
-		PreviewReady: it.PreviewReady,
-		Views:        it.Views,
-		Description:  it.Description,
-		ThumbURL:     "/api/thumb/" + enc,
-		PreviewURL:   previewURL(it, enc),
-		RawURL:       "/api/raw/" + enc,
+		ID:            it.ID,
+		Relpath:       it.Relpath,
+		Type:          string(it.Type),
+		MIME:          it.MIME,
+		Width:         it.Width,
+		Height:        it.Height,
+		Duration:      it.Duration,
+		Offset:        it.Offset,
+		OffsetDefault: media.DefaultPosterOffset,
+		ThumbReady:    it.ThumbReady,
+		PreviewReady:  it.PreviewReady,
+		Views:         it.Views,
+		Description:   it.Description,
+		ThumbURL:      "/api/thumb/" + enc,
+		PreviewURL:    previewURL(it, enc),
+		RawURL:        "/api/raw/" + enc,
 	}
 }
 
@@ -449,6 +460,142 @@ func (s *Server) handleSetTags(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"tags": toTagDTOs(all)})
+}
+
+// handleRecaption regenerates one item's caption on demand, so a bad caption can
+// be fixed without resetting the whole library. Synchronous: the caller is a
+// human waiting on a button, and inference takes seconds, not minutes.
+func (s *Server) handleRecaption(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.OllamaURL == "" {
+		http.Error(w, "captioning is not configured (set OLLAMA_URL)", http.StatusServiceUnavailable)
+		return
+	}
+	it, ok := s.itemFromBody(w, r)
+	if !ok {
+		return
+	}
+	if it.Width == 0 {
+		http.Error(w, "no visual frame to describe", http.StatusUnprocessableEntity)
+		return
+	}
+
+	abs := filepath.Join(s.cfg.MediaRoot, filepath.FromSlash(it.Relpath))
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
+	defer cancel()
+
+	jpeg, err := media.FrameJPEG(ctx, s.cfg, abs, it.Type, it.Offset, captionFramePx)
+	if err != nil {
+		http.Error(w, "could not extract a frame: "+err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	desc, err := ollama.Caption(ctx, s.cfg, jpeg)
+	if err != nil {
+		http.Error(w, "caption failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if desc == "" {
+		http.Error(w, "the model returned an empty caption", http.StatusBadGateway)
+		return
+	}
+	// SetDescription also drops the stale embedding, so semantic search stops
+	// matching the caption we just replaced.
+	if err := s.store.SetDescription(ctx, it.Relpath, desc); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Re-embed inline when configured, so the new caption is searchable at once
+	// rather than whenever the background pass next runs. Failure is not fatal:
+	// the caption is already saved and the backfill will retry.
+	if s.cfg.OllamaEmbedModel != "" {
+		if vec, err := ollama.Embed(ctx, s.cfg, desc); err != nil {
+			log.Printf("caption: re-embed %s: %v", it.Relpath, err)
+		} else if err := s.store.SetEmbedding(ctx, it.Relpath, vec); err != nil {
+			log.Printf("caption: save embedding %s: %v", it.Relpath, err)
+		}
+	}
+	writeJSON(w, map[string]any{"description": desc})
+}
+
+// handleSetOffset sets how far into a video its representative frame is taken,
+// then rebuilds the derivatives that depend on that choice. The sidecar is
+// written first: it is the source of truth, and the DB is a cache of it.
+func (s *Server) handleSetOffset(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path   string   `json:"path"`
+		Offset *float64 `json:"offset"` // pointer so null/absent means "clear"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	it, err := s.store.ItemByRelpath(r.Context(), strings.TrimSpace(req.Path))
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	var off float64
+	if req.Offset != nil {
+		off = *req.Offset
+	}
+	if off < 0 || math.IsNaN(off) || math.IsInf(off, 0) {
+		http.Error(w, "offset must be a non-negative number of seconds", http.StatusBadRequest)
+		return
+	}
+	// Clamp into the video: an offset past the end yields no frame, and the
+	// thumbnailer would silently fall back to frame 0, which looks like the
+	// setting was ignored.
+	if it.Duration > 0 && off > it.Duration {
+		off = math.Max(0, it.Duration-0.1)
+	}
+
+	scPath := s.cfg.SidecarPath(it.Relpath)
+	sc, _, _ := sidecar.Read(scPath) // preserve tags/rating/notes
+	sc.Offset = off
+	if err := sidecar.Write(scPath, sc); err != nil {
+		http.Error(w, "write sidecar: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.store.SetOffset(r.Context(), it.Relpath, off); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Rebuild what the offset decides. The thumbnail is what the user is looking
+	// at, so it is worth waiting for; the animated preview is unaffected (it
+	// samples the whole duration) and the signature is refreshed on the next scan.
+	abs := filepath.Join(s.cfg.MediaRoot, filepath.FromSlash(it.Relpath))
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	thumbOK := true
+	if err := media.Thumbnail(ctx, s.cfg, abs, it.Type, off, media.ThumbPath(s.cfg.ThumbDir(), it.Relpath)); err != nil {
+		log.Printf("offset: rethumbnail %s: %v", it.Relpath, err)
+		thumbOK = false
+	}
+	writeJSON(w, map[string]any{"offset": off, "thumb_rebuilt": thumbOK})
+}
+
+// itemFromBody decodes a {"path": ...} body and resolves it to a known item.
+// Only indexed relpaths are accepted, which 404s bad paths and blocks traversal.
+func (s *Server) itemFromBody(w http.ResponseWriter, r *http.Request) (model.Item, bool) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return model.Item{}, false
+	}
+	rel := strings.TrimSpace(req.Path)
+	if rel == "" {
+		http.Error(w, "missing path", http.StatusBadRequest)
+		return model.Item{}, false
+	}
+	it, err := s.store.ItemByRelpath(r.Context(), rel)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return model.Item{}, false
+	}
+	return it, true
 }
 
 // normalizeTags trims, drops blanks, and de-duplicates (case-insensitively on

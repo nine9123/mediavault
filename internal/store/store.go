@@ -33,7 +33,7 @@ const schemaVersion = "1"
 
 // itemCols is the canonical column order for every items SELECT, so a single
 // scanItem helper can decode any of them.
-const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,preview_ready,views,indexed_at,seen_at,missing_since,description"
+const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,offset_s,thumb_ready,preview_ready,views,indexed_at,seen_at,missing_since,description"
 
 type Store struct {
 	db *sql.DB
@@ -129,6 +129,15 @@ func (s *Store) ensureColumns() error {
 	if !has {
 		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN views INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add items.views: %w", err)
+		}
+	}
+	hasOff, err := s.hasColumn("items", "offset_s")
+	if err != nil {
+		return err
+	}
+	if !hasOff {
+		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN offset_s REAL`); err != nil {
+			return fmt.Errorf("add items.offset_s: %w", err)
 		}
 	}
 	hasPrev, err := s.hasColumn("items", "preview_ready")
@@ -249,19 +258,20 @@ func (s *Store) WriteBatch(ctx context.Context, batch []ItemWrite) error {
 		var id int64
 		err := tx.QueryRowContext(ctx, `
 INSERT INTO items
-  (relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,preview_ready,indexed_at,seen_at,missing_since)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+  (relpath,size,mtime,content_hash,type,mime,width,height,duration,offset_s,thumb_ready,preview_ready,indexed_at,seen_at,missing_since)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
 ON CONFLICT(relpath) DO UPDATE SET
   size=excluded.size, mtime=excluded.mtime,
   content_hash=COALESCE(excluded.content_hash, items.content_hash),
   type=excluded.type, mime=excluded.mime,
   width=excluded.width, height=excluded.height, duration=excluded.duration,
+  offset_s=excluded.offset_s,
   thumb_ready=excluded.thumb_ready, preview_ready=excluded.preview_ready,
   indexed_at=excluded.indexed_at,
   seen_at=excluded.seen_at, missing_since=NULL
 RETURNING id`,
 			it.Relpath, it.Size, it.MTime.Unix(), nullStr(it.ContentHash),
-			string(it.Type), it.MIME, it.Width, it.Height, it.Duration,
+			string(it.Type), it.MIME, it.Width, it.Height, it.Duration, nullFloat(it.Offset),
 			b2i(it.ThumbReady), b2i(it.PreviewReady), it.IndexedAt.Unix(), it.SeenAt.Unix(),
 		).Scan(&id)
 		if err != nil {
@@ -470,7 +480,7 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 			mtime, indexedAt, seenAt int64
 			hash, mime               sql.NullString
 			width, height            sql.NullInt64
-			dur                      sql.NullFloat64
+			dur, off                 sql.NullFloat64
 			thumb, prev              int64
 			views                    int64
 			missing                  sql.NullInt64
@@ -478,7 +488,7 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 		)
 		if err := rows.Scan(
 			&it.ID, &it.Relpath, &it.Size, &mtime, &hash, &it.Type, &mime,
-			&width, &height, &dur, &thumb, &prev, &views, &indexedAt, &seenAt, &missing, &desc,
+			&width, &height, &dur, &off, &thumb, &prev, &views, &indexedAt, &seenAt, &missing, &desc,
 		); err != nil {
 			return nil, err
 		}
@@ -490,6 +500,7 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 		it.Width = int(width.Int64)
 		it.Height = int(height.Int64)
 		it.Duration = dur.Float64
+		it.Offset = off.Float64
 		it.ThumbReady = thumb != 0
 		it.PreviewReady = prev != 0
 		it.Views = int(views)
@@ -595,6 +606,15 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// nullFloat keeps "unset" distinguishable from a real 0 in the column, matching
+// how the sidecar omits the field entirely.
+func nullFloat(f float64) any {
+	if f <= 0 {
+		return nil
+	}
+	return f
 }
 
 func b2i(b bool) int {
@@ -1049,7 +1069,34 @@ func (s *Store) SetDescription(ctx context.Context, relpath, desc string) error 
 	if err := rebuildItemFTS(ctx, tx, id, relpath); err != nil {
 		return err
 	}
-	return tx.Commit()
+	// Drop the old embedding: it encodes the PREVIOUS caption, and nothing else
+	// would ever refresh it (CaptionedButUnembedded only looks for items with no
+	// embedding at all). Without this, regenerating a caption leaves semantic
+	// search matching text that is no longer displayed anywhere.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM item_embeddings WHERE item_id=?`, id); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.forgetEmb(id) // keep the in-memory cache in step with the table
+	return nil
+}
+
+// forgetEmb evicts one embedding from the in-memory search cache.
+func (s *Store) forgetEmb(id int64) {
+	s.embMu.Lock()
+	delete(s.embs, id)
+	s.embMu.Unlock()
+}
+
+// SetOffset records the poster-frame offset for an item (the sidecar remains the
+// source of truth; this is the queryable mirror).
+func (s *Store) SetOffset(ctx context.Context, relpath string, offset float64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE items SET offset_s=? WHERE relpath=? AND missing_since IS NULL`,
+		nullFloat(offset), relpath)
+	return err
 }
 
 // UndescribedItems returns present, visual items still needing a caption, newest
@@ -1149,6 +1196,24 @@ func (s *Store) SemanticSearch(ctx context.Context, qvec []float32, typ string, 
 	if err := s.loadEmbs(ctx); err != nil {
 		return nil, err
 	}
+	// Restrict the candidate pool up front when a type filter is active.
+	//
+	// This used to rank every embedding, truncate to limit*4, and only then drop
+	// rows of the wrong type — which returns nothing at all whenever the top
+	// limit*4 matches happen to be the wrong type. On a library that is mostly
+	// video, "type:image <phrase>" reliably came back empty, because 800 videos
+	// scored above the best image. Filtering first makes the result depend on the
+	// ranking rather than on the type mix of the library.
+	var allow map[int64]bool
+	if typ != "" {
+		var err error
+		if allow, err = s.idsOfType(ctx, typ); err != nil {
+			return nil, err
+		}
+		if len(allow) == 0 {
+			return nil, nil
+		}
+	}
 	type sc struct {
 		id    int64
 		score float64
@@ -1156,6 +1221,9 @@ func (s *Store) SemanticSearch(ctx context.Context, qvec []float32, typ string, 
 	s.embMu.Lock()
 	all := make([]sc, 0, len(s.embs))
 	for id, v := range s.embs {
+		if allow != nil && !allow[id] {
+			continue
+		}
 		if len(v) == len(qvec) {
 			all = append(all, sc{id, media.Cosine(qvec, v)})
 		}
@@ -1163,12 +1231,8 @@ func (s *Store) SemanticSearch(ctx context.Context, qvec []float32, typ string, 
 	s.embMu.Unlock()
 	sort.Slice(all, func(i, j int) bool { return all[i].score > all[j].score })
 
-	take := limit
-	if typ != "" {
-		take = limit * 4 // over-fetch so type filtering can still fill `limit`
-	}
-	if len(all) > take {
-		all = all[:take]
+	if len(all) > limit {
+		all = all[:limit]
 	}
 	ids := make([]int64, len(all))
 	for i, a := range all {
@@ -1193,6 +1257,26 @@ func (s *Store) SemanticSearch(ctx context.Context, qvec []float32, typ string, 
 		}
 	}
 	return out, nil
+}
+
+// idsOfType returns the ids of present items of one media type, as a set for
+// filtering the in-memory embedding scan.
+func (s *Store) idsOfType(ctx context.Context, typ string) (map[int64]bool, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM items WHERE type=? AND missing_since IS NULL`, typ)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]bool)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // CaptionCounts reports captioning/embedding progress for the status UI:

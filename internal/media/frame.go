@@ -10,9 +10,9 @@ import (
 )
 
 // FrameJPEG returns one representative frame as a JPEG (longest edge ~maxPx),
-// for sending to a vision model. Video is sampled a couple of seconds in to skip
-// fade-ins, with a fallback to the first frame for short clips.
-func FrameJPEG(ctx context.Context, cfg config.Config, path string, typ model.MediaType, maxPx int) ([]byte, error) {
+// for sending to a vision model. Video is sampled at its poster offset (see
+// PosterSeek), with a fallback to the first frame for short clips.
+func FrameJPEG(ctx context.Context, cfg config.Config, path string, typ model.MediaType, offset float64, maxPx int) ([]byte, error) {
 	vf := fmt.Sprintf("scale='min(%d,iw)':-1", maxPx)
 	run := func(seek ...string) ([]byte, error) {
 		args := append([]string{"-nostdin", "-v", "error"}, seek...)
@@ -26,11 +26,10 @@ func FrameJPEG(ctx context.Context, cfg config.Config, path string, typ model.Me
 		}
 		return out, nil
 	}
-	if typ == model.MediaVideo {
-		if b, err := run("-ss", "2"); err == nil {
+	if seek := PosterSeek(typ, offset); seek != nil {
+		if b, err := run(seek...); err == nil {
 			return b, nil
 		}
-		return run()
 	}
 	return run()
 }

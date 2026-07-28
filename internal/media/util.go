@@ -46,6 +46,37 @@ func MimeFor(path string) string {
 	return "application/octet-stream"
 }
 
+// incompleteMarkers are the ffmpeg/ffprobe messages that mean "this file is not
+// a whole file" rather than "this codec is unsupported". The common cause is an
+// interrupted download: MP4 keeps its index (the `moov` atom) at the END of the
+// file, so a copy that stopped early parses as valid right up to the point where
+// the index should be and then fails. Note this also fires for a .webm whose
+// bytes are really MP4 — ffprobe detects containers by content, not extension,
+// which is why the error names the mov demuxer for a .webm path.
+var incompleteMarkers = []string{
+	"moov atom not found",
+	"Invalid data found when processing input",
+	"End of file",
+	"Truncating packet",
+	"could not find codec parameters",
+}
+
+// IsIncomplete reports whether err looks like a truncated or still-being-written
+// file. Callers use it to aggregate these into one log line instead of one per
+// file, since a stalled download folder can otherwise fill the log every scan.
+func IsIncomplete(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, m := range incompleteMarkers {
+		if strings.Contains(msg, strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
+}
+
 // ffErr turns an exec failure into a useful message. When the child wrote to
 // stderr (ffprobe with "-v error" prints the actual cause there), surface its
 // first line instead of the useless bare "exit status 1".
