@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS items (
     height        INTEGER,
     duration      REAL,                       -- seconds; video only
     thumb_ready   INTEGER NOT NULL DEFAULT 0, -- 0/1
+    preview_ready INTEGER NOT NULL DEFAULT 0, -- 0/1; animated preview exists
     views         INTEGER NOT NULL DEFAULT 0, -- times opened in the viewer (popularity signal)
     description   TEXT,                        -- AI caption (optional); indexed into items_fts
     indexed_at    INTEGER NOT NULL,           -- unix s

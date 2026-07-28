@@ -135,6 +135,19 @@
     opacity: 0; transition: opacity .25s ease;
   }
   .cell img.ok { opacity: 1; }
+  /* The animated preview stacks on top of the poster frame and cross-fades in.
+     Keeping the poster underneath means a preview that is still downloading, or
+     that failed, degrades to exactly the old behaviour instead of a blank tile. */
+  .cell img.prev { position: absolute; inset: 0; z-index: 1; }
+  .cell .badge, .cell .name { z-index: 2; }
+  /* Marker on cells whose preview is playing: a filled dot on the duration
+     badge, so it's clear the motion is a sampled preview and not the video. */
+  .cell.playing .badge::after {
+    content: "";
+    display: inline-block; width: 4px; height: 4px; margin-left: 5px;
+    vertical-align: middle; border-radius: 50%;
+    background: currentColor;
+  }
   .noprev {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
@@ -339,6 +352,7 @@
     <button class="btn ghost" id="qhelp" type="button" title="Search help" aria-label="Search help">?</button>
     <span class="readout" id="readout"><span class="n">—</span> items</span>
     <button class="btn" id="random" title="Open a random item — then arrow through more">Random</button>
+    <button class="btn" id="previews" title="Animated video previews in the grid: AUTO plays the ones on screen, HOVER only under the cursor, OFF never">Previews: auto</button>
     <button class="btn" id="rescan">Rescan</button>
   </header>
 
@@ -416,6 +430,7 @@
     safelight: document.getElementById("safelight"),
     q: document.getElementById("q"),
     rescan: document.getElementById("rescan"),
+    previews: document.getElementById("previews"),
     random: document.getElementById("random"),
     viewer: document.getElementById("viewer"),
     stage: document.getElementById("stage"),
@@ -513,6 +528,10 @@
       cell.appendChild(noPreview());
     }
 
+    // preview_url is only populated once a preview exists on disk, so its mere
+    // presence is the readiness check.
+    if (item.preview_url) pvRegister(cell, item.preview_url);
+
     var badge = document.createElement("span");
     badge.className = "badge" + (item.type === "video" || item.type === "audio" ? " vid" : "");
     if (item.type === "video") badge.textContent = "VID " + fmtDuration(item.duration);
@@ -529,6 +548,142 @@
     return cell;
   }
 
+  // ---- animated previews ----
+  // The previews are pre-baked files (internal/media/preview.go), so playback is
+  // purely a display decision here: an <img> in the DOM plays, removing it
+  // stops. Hence three modes rather than a hardcoded choice — "autoplay every
+  // tile" is not obviously right. Fifty simultaneously animating tiles is hard
+  // to read, and each one is a continuously decoding animation costing memory
+  // and battery. AUTO therefore plays only the cells actually on screen, capped.
+  var PV = {
+    mode: "auto",
+    visible: new Set(), // cells currently intersecting the viewport
+    hovered: null,
+    playing: new Map(), // cell -> preview <img>
+    cap: 16,            // ceiling on simultaneous animations
+    io: null
+  };
+  var PV_MODES = ["auto", "hover", "off"];
+
+  var CAN_HOVER = !window.matchMedia || window.matchMedia("(hover: hover)").matches;
+  var LESS_MOTION = !!window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function pvEffectiveMode() {
+    if (PV.mode === "off") return "off";
+    // The viewer is a full-screen overlay; nothing behind it is worth decoding.
+    if (S.viewerOpen) return "off";
+    // On a touch device there is no hover, so HOVER would mean "never plays".
+    if (PV.mode === "hover") return CAN_HOVER ? "hover" : "auto";
+    return "auto";
+  }
+
+  function pvObserver() {
+    if (PV.io || !window.IntersectionObserver) return PV.io;
+    PV.io = new IntersectionObserver(function (entries) {
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i].isIntersecting) PV.visible.add(entries[i].target);
+        else PV.visible.delete(entries[i].target);
+      }
+      pvSync();
+    }, { threshold: 0.35 });
+    return PV.io;
+  }
+
+  function pvRegister(cell, url) {
+    cell.__prevURL = url;
+    cell.addEventListener("mouseenter", function () { PV.hovered = cell; pvSync(); });
+    cell.addEventListener("mouseleave", function () {
+      if (PV.hovered === cell) PV.hovered = null;
+      pvSync();
+    });
+    var io = pvObserver();
+    if (io) io.observe(cell);
+    else PV.visible.add(cell); // no IntersectionObserver: the cap alone bounds it
+  }
+
+  function pvStart(cell) {
+    if (PV.playing.has(cell) || !cell.__prevURL) return;
+    var img = document.createElement("img");
+    img.className = "prev";
+    img.decoding = "async";
+    img.alt = "";
+    img.setAttribute("aria-hidden", "true"); // decorative; the poster frame has the alt text
+    img.addEventListener("load", function () {
+      img.classList.add("ok");
+      cell.classList.add("playing");
+    });
+    img.addEventListener("error", function () {
+      // Index says ready but the file is gone (previews dir cleared, format
+      // switched). Forget the URL so scrolling past doesn't refetch it forever.
+      cell.__prevURL = null;
+      pvStop(cell);
+    });
+    img.src = cell.__prevURL;
+    cell.appendChild(img);
+    PV.playing.set(cell, img);
+  }
+
+  function pvStop(cell) {
+    var img = PV.playing.get(cell);
+    if (img) {
+      img.remove(); // dropping the element is what frees the decoder
+      PV.playing.delete(cell);
+    }
+    cell.classList.remove("playing");
+  }
+
+  function pvSync() {
+    var mode = pvEffectiveMode(), want = new Set();
+    if (mode === "auto") {
+      // Sets iterate in insertion order, so when more cells are visible than the
+      // cap allows, the ones that came into view earliest keep playing instead
+      // of an arbitrary subset churning as the observer fires.
+      var n = 0;
+      PV.visible.forEach(function (c) {
+        if (n < PV.cap && c.__prevURL) { want.add(c); n++; }
+      });
+    } else if (mode === "hover" && PV.hovered && PV.hovered.__prevURL) {
+      want.add(PV.hovered);
+    }
+    var live = [];
+    PV.playing.forEach(function (img, cell) { live.push(cell); });
+    for (var i = 0; i < live.length; i++) {
+      if (!want.has(live[i])) pvStop(live[i]);
+    }
+    want.forEach(pvStart);
+  }
+
+  // Called before the grid is emptied: stop everything and drop the observer,
+  // which would otherwise keep references to detached cells.
+  function pvReset() {
+    var live = [];
+    PV.playing.forEach(function (img, cell) { live.push(cell); });
+    for (var i = 0; i < live.length; i++) pvStop(live[i]);
+    if (PV.io) { PV.io.disconnect(); PV.io = null; }
+    PV.visible.clear();
+    PV.hovered = null;
+  }
+
+  function pvSetMode(m, persist) {
+    PV.mode = m;
+    el.previews.textContent = "Previews: " + m;
+    el.previews.setAttribute("aria-label", "Video previews: " + m);
+    if (persist) { try { localStorage.setItem("mv.previewMode", m); } catch (e) {} }
+    pvSync();
+  }
+
+  (function initPreviews() {
+    var m = null;
+    try { m = localStorage.getItem("mv.previewMode"); } catch (e) {}
+    // Default to hover when the OS asks for reduced motion: a grid that starts
+    // animating on its own is exactly what that setting is about.
+    if (PV_MODES.indexOf(m) < 0) m = LESS_MOTION ? "hover" : "auto";
+    pvSetMode(m, false);
+    el.previews.addEventListener("click", function () {
+      pvSetMode(PV_MODES[(PV_MODES.indexOf(PV.mode) + 1) % PV_MODES.length], true);
+    });
+  })();
+
   function trackBounds(item) {
     if (S.maxId === null || item.id > S.maxId) S.maxId = item.id;
     if (S.minId === null || item.id < S.minId) S.minId = item.id;
@@ -541,6 +696,7 @@
   }
 
   function reset() {
+    pvReset();
     S.items = [];
     S.maxId = null;
     S.minId = null;
@@ -862,6 +1018,7 @@
     el.viewer.classList.add("open");
     el.viewer.setAttribute("aria-hidden", "false");
     document.body.style.overflow = "hidden";
+    pvSync(); // stop grid previews decoding behind the overlay
   }
 
   var viewTimer = null, slideTimer = null, txPoll = null, txTried = {};
@@ -1287,6 +1444,7 @@
     el.viewer.setAttribute("aria-hidden", "true");
     S.viewerOpen = false;
     document.body.style.overflow = "";
+    pvSync();
   }
 
   function navigate(delta) {

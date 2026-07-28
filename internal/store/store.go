@@ -33,7 +33,7 @@ const schemaVersion = "1"
 
 // itemCols is the canonical column order for every items SELECT, so a single
 // scanItem helper can decode any of them.
-const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,views,indexed_at,seen_at,missing_since,description"
+const itemCols = "id,relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,preview_ready,views,indexed_at,seen_at,missing_since,description"
 
 type Store struct {
 	db *sql.DB
@@ -65,11 +65,12 @@ type ChainDef struct {
 
 // IndexRow is the cheap snapshot used for change-detection.
 type IndexRow struct {
-	ID         int64
-	Size       int64
-	MTime      int64
-	ThumbReady bool
-	HasVector  bool
+	ID           int64
+	Size         int64
+	MTime        int64
+	ThumbReady   bool
+	PreviewReady bool
+	HasVector    bool
 }
 
 // Open connects, sets pragmas per-connection (via DSN so every pooled conn
@@ -128,6 +129,15 @@ func (s *Store) ensureColumns() error {
 	if !has {
 		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN views INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("add items.views: %w", err)
+		}
+	}
+	hasPrev, err := s.hasColumn("items", "preview_ready")
+	if err != nil {
+		return err
+	}
+	if !hasPrev {
+		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN preview_ready INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add items.preview_ready: %w", err)
 		}
 	}
 	hasDesc, err := s.hasColumn("items", "description")
@@ -198,7 +208,7 @@ func (s *Store) dropAll() error {
 // scale the whole map is tiny, so change-detection needs zero per-file DB hits.
 func (s *Store) LoadIndex(ctx context.Context) (map[string]IndexRow, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT relpath,id,size,mtime,thumb_ready,
+		`SELECT relpath,id,size,mtime,thumb_ready,preview_ready,
 		        (SELECT 1 FROM item_vectors v WHERE v.item_id=items.id)
 		 FROM items WHERE missing_since IS NULL`)
 	if err != nil {
@@ -209,12 +219,13 @@ func (s *Store) LoadIndex(ctx context.Context) (map[string]IndexRow, error) {
 	for rows.Next() {
 		var rp string
 		var r IndexRow
-		var thumb int64
+		var thumb, prev int64
 		var hasVec sql.NullInt64
-		if err := rows.Scan(&rp, &r.ID, &r.Size, &r.MTime, &thumb, &hasVec); err != nil {
+		if err := rows.Scan(&rp, &r.ID, &r.Size, &r.MTime, &thumb, &prev, &hasVec); err != nil {
 			return nil, err
 		}
 		r.ThumbReady = thumb != 0
+		r.PreviewReady = prev != 0
 		r.HasVector = hasVec.Valid
 		out[rp] = r
 	}
@@ -238,19 +249,20 @@ func (s *Store) WriteBatch(ctx context.Context, batch []ItemWrite) error {
 		var id int64
 		err := tx.QueryRowContext(ctx, `
 INSERT INTO items
-  (relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,indexed_at,seen_at,missing_since)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+  (relpath,size,mtime,content_hash,type,mime,width,height,duration,thumb_ready,preview_ready,indexed_at,seen_at,missing_since)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
 ON CONFLICT(relpath) DO UPDATE SET
   size=excluded.size, mtime=excluded.mtime,
   content_hash=COALESCE(excluded.content_hash, items.content_hash),
   type=excluded.type, mime=excluded.mime,
   width=excluded.width, height=excluded.height, duration=excluded.duration,
-  thumb_ready=excluded.thumb_ready, indexed_at=excluded.indexed_at,
+  thumb_ready=excluded.thumb_ready, preview_ready=excluded.preview_ready,
+  indexed_at=excluded.indexed_at,
   seen_at=excluded.seen_at, missing_since=NULL
 RETURNING id`,
 			it.Relpath, it.Size, it.MTime.Unix(), nullStr(it.ContentHash),
 			string(it.Type), it.MIME, it.Width, it.Height, it.Duration,
-			b2i(it.ThumbReady), it.IndexedAt.Unix(), it.SeenAt.Unix(),
+			b2i(it.ThumbReady), b2i(it.PreviewReady), it.IndexedAt.Unix(), it.SeenAt.Unix(),
 		).Scan(&id)
 		if err != nil {
 			return fmt.Errorf("upsert %s: %w", it.Relpath, err)
@@ -459,14 +471,14 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 			hash, mime               sql.NullString
 			width, height            sql.NullInt64
 			dur                      sql.NullFloat64
-			thumb                    int64
+			thumb, prev              int64
 			views                    int64
 			missing                  sql.NullInt64
 			desc                     sql.NullString
 		)
 		if err := rows.Scan(
 			&it.ID, &it.Relpath, &it.Size, &mtime, &hash, &it.Type, &mime,
-			&width, &height, &dur, &thumb, &views, &indexedAt, &seenAt, &missing, &desc,
+			&width, &height, &dur, &thumb, &prev, &views, &indexedAt, &seenAt, &missing, &desc,
 		); err != nil {
 			return nil, err
 		}
@@ -479,6 +491,7 @@ func scanItems(rows *sql.Rows) ([]model.Item, error) {
 		it.Height = int(height.Int64)
 		it.Duration = dur.Float64
 		it.ThumbReady = thumb != 0
+		it.PreviewReady = prev != 0
 		it.Views = int(views)
 		it.Description = desc.String
 		if missing.Valid {

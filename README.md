@@ -95,8 +95,47 @@ docker compose up --build
 | `THUMB_PX`      | `400`    | Thumbnail longest edge (px)                         |
 | `HASH_MODE`     | `partial`| Content fingerprint: `off` / `partial` / `full`     |
 | `SIDECAR_DIR`   | *(empty)*| Where tag sidecars live; empty = next to the media  |
+| `PREVIEW_FORMAT`| `webp`   | Animated video previews: `webp` / `gif` / `off`      |
+| `PREVIEW_PX`    | `320`    | Preview longest edge (px)                            |
+| `PREVIEW_SEGMENTS`| `12`   | Max sampled bursts per video                         |
+| `PREVIEW_SEG_FRAMES`| `6`  | Frames per burst                                     |
+| `PREVIEW_SEG_EVERY`| `20`  | Seconds of video per burst, before the cap applies   |
+| `PREVIEW_FPS`   | `8`      | Preview playback rate                                |
+| `PREVIEW_SPEED` | `1`      | Burst speed; `1` = real time, `2` = 2x (time-lapse)  |
+| `PREVIEW_QUALITY`| `55`    | WebP quality 0–100 (ignored for gif)                 |
+| `PREVIEW_MIN_DUR`| `5`     | Skip videos shorter than this (seconds)              |
 | `FFMPEG`        | `ffmpeg` | ffmpeg binary                                       |
 | `FFPROBE`       | `ffprobe`| ffprobe binary                                      |
+
+### Animated video previews
+
+A poster frame tells you a video exists; it doesn't tell you what's in it. So
+each video also gets a small looping animation built from several short bursts of
+frames sampled at evenly spaced points across the *whole* duration — a 10-minute
+video yields ~0.75s from 25s in, then from 75s in, and so on, twelve times. The
+result plays in a plain `<img>`, so the grid needs no JS to animate it and no
+hover to trigger it.
+
+Notes:
+
+- **WebP, not GIF, by default.** Same autoplay-in-an-`<img>` behaviour, but full
+  colour instead of a 256-entry palette and 2–5x smaller for identical frames
+  (measured: ~120–280 KB per preview vs ~620–730 KB as GIF). `PREVIEW_FORMAT=gif`
+  is there if you need it.
+- **Cost.** Generation adds `PREVIEW_SEGMENTS` seeks per video on top of the
+  thumbnail, so the first scan over a large video library takes noticeably
+  longer. It's resumable — progress is recorded per file — and
+  `PREVIEW_FORMAT=off` skips it entirely. Each burst is a separate input seek
+  rather than one decode pass with a `select` filter, specifically so a 4 GB
+  video isn't pulled across the network mount in full.
+- **Playback is a client choice.** The grid has a `Previews` toggle: `auto` plays
+  only the cells currently on screen (capped at 16 simultaneous animations),
+  `hover` plays just the one under the cursor, `off` disables it. The setting
+  persists per browser and defaults to `hover` when the OS requests reduced
+  motion. Because the file is pre-baked, switching modes costs nothing.
+- Previews live in `DATA_DIR/previews`; deleting that directory rebuilds them on
+  the next scan. Changing `PREVIEW_FORMAT` orphans the old files, so clear the
+  directory when you switch.
 
 ## HTTP API
 
@@ -106,6 +145,8 @@ docker compose up --build
 - `GET  /api/item?path=` — one item plus its tags (manual + ai)
 - `PUT  /api/tags` — `{ "path": "...", "tags": ["a", "artist:b"] }`; writes the
   sidecar and syncs the DB immediately (no rescan needed)
+- `GET  /api/preview/<relpath>` — cached animated preview (video only; the
+  `preview_url` field in an item is empty until one exists)
 - `GET  /api/stats` — collection size + latest scan (drives the live UI)
 - `POST /api/scan` — trigger a rescan (returns 202; overlapping calls collapse)
 - `GET  /api/thumb/{path...}` — cached thumbnail

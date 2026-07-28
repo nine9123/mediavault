@@ -65,6 +65,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
 	mux.HandleFunc("GET /api/thumb/{path...}", s.handleThumb)
+	mux.HandleFunc("GET /api/preview/{path...}", s.handlePreview)
 	mux.HandleFunc("GET /api/raw/{path...}", s.handleRaw)
 	return mux
 }
@@ -82,18 +83,20 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 // itemDTO is the JSON shape returned to clients, with ready-to-use URLs.
 type itemDTO struct {
-	ID          int64   `json:"id"`
-	Relpath     string  `json:"relpath"`
-	Type        string  `json:"type"`
-	MIME        string  `json:"mime"`
-	Width       int     `json:"width"`
-	Height      int     `json:"height"`
-	Duration    float64 `json:"duration,omitempty"`
-	ThumbReady  bool    `json:"thumb_ready"`
-	Views       int     `json:"views"`
-	Description string  `json:"description,omitempty"`
-	ThumbURL    string  `json:"thumb_url"`
-	RawURL      string  `json:"raw_url"`
+	ID           int64   `json:"id"`
+	Relpath      string  `json:"relpath"`
+	Type         string  `json:"type"`
+	MIME         string  `json:"mime"`
+	Width        int     `json:"width"`
+	Height       int     `json:"height"`
+	Duration     float64 `json:"duration,omitempty"`
+	ThumbReady   bool    `json:"thumb_ready"`
+	PreviewReady bool    `json:"preview_ready"`
+	Views        int     `json:"views"`
+	Description  string  `json:"description,omitempty"`
+	ThumbURL     string  `json:"thumb_url"`
+	PreviewURL   string  `json:"preview_url,omitempty"`
+	RawURL       string  `json:"raw_url"`
 }
 
 // tagDTO is the JSON shape for a tag in the item-detail and tag-edit responses.
@@ -115,18 +118,20 @@ func toTagDTOs(tags []store.ItemTag) []tagDTO {
 func toDTO(it model.Item) itemDTO {
 	enc := encRel(it.Relpath)
 	return itemDTO{
-		ID:          it.ID,
-		Relpath:     it.Relpath,
-		Type:        string(it.Type),
-		MIME:        it.MIME,
-		Width:       it.Width,
-		Height:      it.Height,
-		Duration:    it.Duration,
-		ThumbReady:  it.ThumbReady,
-		Views:       it.Views,
-		Description: it.Description,
-		ThumbURL:    "/api/thumb/" + enc,
-		RawURL:      "/api/raw/" + enc,
+		ID:           it.ID,
+		Relpath:      it.Relpath,
+		Type:         string(it.Type),
+		MIME:         it.MIME,
+		Width:        it.Width,
+		Height:       it.Height,
+		Duration:     it.Duration,
+		ThumbReady:   it.ThumbReady,
+		PreviewReady: it.PreviewReady,
+		Views:        it.Views,
+		Description:  it.Description,
+		ThumbURL:     "/api/thumb/" + enc,
+		PreviewURL:   previewURL(it, enc),
+		RawURL:       "/api/raw/" + enc,
 	}
 }
 
@@ -503,6 +508,29 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	go s.scanner.Scan(context.Background())
 	w.WriteHeader(http.StatusAccepted)
 	writeJSON(w, map[string]string{"status": "scan started"})
+}
+
+// previewURL is empty unless a preview exists, so the client can treat a
+// present URL as "safe to load" without a second readiness check.
+func previewURL(it model.Item, enc string) string {
+	if !it.PreviewReady {
+		return ""
+	}
+	return "/api/preview/" + enc
+}
+
+// handlePreview serves a cached animated preview. Same shape as handleThumb: the
+// on-disk name is a hash of the relpath, so the path segment is the relpath.
+// Content-Type is set explicitly because the ".preview.webp" double extension
+// defeats Go's sniffing on some builds, and a mislabelled webp won't animate.
+func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.PreviewsEnabled() {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", s.cfg.PreviewMIME())
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	http.ServeFile(w, r, media.PreviewPath(s.cfg.PreviewDir(), r.PathValue("path"), s.cfg.PreviewFormat))
 }
 
 // handleThumb serves a cached thumbnail. The on-disk name is a hash of the

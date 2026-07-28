@@ -29,6 +29,7 @@ type Item struct {
 	Height       int
 	Duration     float64 // seconds; video + audio
 	ThumbReady   bool
+	PreviewReady bool   // animated multi-segment preview exists (video only)
 	Views        int    // times opened in the viewer (popularity signal)
 	Description  string // AI caption (optional); feeds full-text search
 	IndexedAt    time.Time

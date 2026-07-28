@@ -22,6 +22,21 @@ type Config struct {
 	ScanEvery time.Duration // periodic rescan interval; 0 disables the ticker
 	ThumbPx   int           // thumbnail longest edge, px
 
+	// Animated video previews: several short bursts of frames sampled across
+	// the whole duration, baked into one looping file the browser plays in a
+	// plain <img>. Generation costs PreviewSegments seeks per video on top of
+	// the thumbnail, so on a large library the first scan is noticeably longer;
+	// PreviewFormat "off" disables the feature entirely.
+	PreviewFormat    string  // "webp" (default) | "gif" | "off"
+	PreviewPx        int     // preview longest edge, px (smaller than ThumbPx is fine)
+	PreviewFPS       int     // sampling + playback rate; equal values mean 1x speed
+	PreviewSegments  int     // maximum number of bursts
+	PreviewSegFrames int     // frames per burst
+	PreviewSegEvery  float64 // seconds of video per burst, before the cap applies
+	PreviewSpeed     float64 // playback speed of each burst; 1 = real time, 2 = 2x
+	PreviewQuality   int     // libwebp -q:v, 0-100 (ignored for gif)
+	PreviewMinDur    float64 // skip videos shorter than this; they're their own preview
+
 	// HashMode controls content hashing of new files, used for dedup and
 	// move-detection (so tags can follow a renamed file). Nothing reads it yet;
 	// it just populates the field for those future features.
@@ -67,6 +82,21 @@ func (c Config) DBPath() string { return filepath.Join(c.DataDir, "index.db") }
 // ThumbDir is where generated thumbnails are cached.
 func (c Config) ThumbDir() string { return filepath.Join(c.DataDir, "thumbs") }
 
+// PreviewDir is where generated animated previews are cached. Kept separate
+// from ThumbDir so `rm -rf` on either one rebuilds just that derivative.
+func (c Config) PreviewDir() string { return filepath.Join(c.DataDir, "previews") }
+
+// PreviewsEnabled reports whether animated previews should be generated.
+func (c Config) PreviewsEnabled() bool { return c.PreviewFormat != "off" }
+
+// PreviewMIME is the Content-Type for generated previews.
+func (c Config) PreviewMIME() string {
+	if c.PreviewFormat == "gif" {
+		return "image/gif"
+	}
+	return "image/webp"
+}
+
 // SidecarPath returns the sidecar file path for a media relpath, honoring
 // SidecarDir (empty = beside the media file).
 func (c Config) SidecarPath(relpath string) string {
@@ -93,6 +123,15 @@ func Load() Config {
 		Workers:          envInt("SCAN_WORKERS", 6),
 		ScanEvery:        envDur("SCAN_INTERVAL", 5*time.Minute),
 		ThumbPx:          envInt("THUMB_PX", 400),
+		PreviewFormat:    previewFormat(env("PREVIEW_FORMAT", "webp")),
+		PreviewPx:        envInt("PREVIEW_PX", 320),
+		PreviewFPS:       envInt("PREVIEW_FPS", 8),
+		PreviewSegments:  envInt("PREVIEW_SEGMENTS", 12),
+		PreviewSegFrames: envInt("PREVIEW_SEG_FRAMES", 6),
+		PreviewSegEvery:  envFloat("PREVIEW_SEG_EVERY", 20),
+		PreviewSpeed:     envFloat("PREVIEW_SPEED", 1),
+		PreviewQuality:   envInt("PREVIEW_QUALITY", 55),
+		PreviewMinDur:    envFloat("PREVIEW_MIN_DUR", 5),
 		HashMode:         hashMode(env("HASH_MODE", "partial")),
 		SidecarDir:       env("SIDECAR_DIR", ""),
 		DerivedDir:       env("DERIVED_DIR", ""),
@@ -140,6 +179,19 @@ func defaultExts() map[string]model.MediaType {
 	}
 }
 
+// previewFormat validates PREVIEW_FORMAT, falling back to webp on anything
+// unrecognized rather than silently producing files nothing can read.
+func previewFormat(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "gif":
+		return "gif"
+	case "off", "none", "false", "0":
+		return "off"
+	default:
+		return "webp"
+	}
+}
+
 func hashMode(v string) string {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "off", "partial", "full":
@@ -179,6 +231,15 @@ func envBool(k string, def bool) bool {
 	if v := os.Getenv(k); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			return b
+		}
+	}
+	return def
+}
+
+func envFloat(k string, def float64) float64 {
+	if v := os.Getenv(k); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

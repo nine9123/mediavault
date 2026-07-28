@@ -68,6 +68,7 @@ type result struct {
 	write    store.ItemWrite
 	err      error
 	thumbErr string // non-empty if a thumbnail was attempted and failed
+	prevErr  string // non-empty if an animated preview was attempted and failed
 }
 
 // Scan runs one full pass. Overlapping calls are skipped (the periodic ticker
@@ -90,6 +91,8 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	stats := model.ScanStats{Started: time.Now()}
 	var thumbFails int
 	var thumbSample string
+	var prevFails int
+	var prevSample string
 
 	// 1. Snapshot the present index up front so change-detection is pure map
 	//    lookups — no per-file DB round-trips during the walk.
@@ -163,6 +166,12 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 				} else {
 					stats.Added++
 				}
+				if r.prevErr != "" {
+					prevFails++
+					if prevSample == "" {
+						prevSample = r.relpath + " (" + r.prevErr + ")"
+					}
+				}
 				if r.thumbErr != "" {
 					thumbFails++
 					if thumbSample == "" {
@@ -227,7 +236,10 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 			// Unchanged. Skip once it has both a thumbnail and a signature;
 			// otherwise reprocess once this run to backfill whatever's missing
 			// (bounds pointless re-probing of files that can produce neither).
-			if cur.ThumbReady && cur.HasVector {
+			// A video that predates the preview feature has a thumbnail and a
+			// vector but no preview, so previews have to count toward "done"
+			// here or they'd never backfill on an existing index.
+			if cur.ThumbReady && cur.HasVector && (cur.PreviewReady || !s.wantsPreview(typ)) {
 				return nil
 			}
 			if _, tried := s.thumbRetried[rel]; tried {
@@ -285,6 +297,9 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	if thumbFails > 0 {
 		log.Printf("scan: %d file(s) had no thumbnail (unreadable frame / no cover art); e.g. %s", thumbFails, thumbSample)
 	}
+	if prevFails > 0 {
+		log.Printf("scan: %d video(s) had no animated preview; e.g. %s", prevFails, prevSample)
+	}
 	if err := s.store.RecordScanRun(ctx, stats); err != nil {
 		log.Printf("scan: record run: %v", err)
 	}
@@ -331,6 +346,21 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 		if vec, err := media.Signature(ctx, s.cfg, j.abs, j.typ); err == nil {
 			res.write.Vector = vec
 		}
+
+		// Animated preview: bursts of frames from across the whole video, so the
+		// grid can show what's in it rather than just its opening seconds. Only
+		// video needs this — a still has nothing to animate, and an existing
+		// gif/animated webp is already its own preview. Clips under
+		// PreviewMinDur are skipped for the same reason: at that length the
+		// poster frame and the preview would show the same thing.
+		if s.wantsPreview(j.typ) && item.Duration >= s.cfg.PreviewMinDur {
+			dst := media.PreviewPath(s.cfg.PreviewDir(), j.relpath, s.cfg.PreviewFormat)
+			if err := media.Preview(ctx, s.cfg, j.abs, item.Duration, dst); err != nil {
+				res.prevErr = err.Error()
+			} else {
+				item.PreviewReady = true
+			}
+		}
 	}
 
 	// Content hash: dedup + move-detection only, NEVER change-detection
@@ -362,6 +392,11 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 
 	res.write.Item = item
 	return res
+}
+
+// wantsPreview reports whether this media type gets an animated preview.
+func (s *Scanner) wantsPreview(typ model.MediaType) bool {
+	return s.cfg.PreviewsEnabled() && typ == model.MediaVideo
 }
 
 // buildChains derives reading-order chains from the filesystem: any directory
