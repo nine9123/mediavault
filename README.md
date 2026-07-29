@@ -96,6 +96,8 @@ docker compose up --build
 | `THUMB_PX`      | `400`    | Thumbnail longest edge (px)                         |
 | `HASH_MODE`     | `partial`| Content fingerprint: `off` / `partial` / `full`     |
 | `SIDECAR_DIR`   | *(empty)*| Where tag sidecars live; empty = next to the media  |
+| `API_KEY`       | *(empty)*| Shared key gating every `/api/` route; empty = no auth |
+| `AUTH_TTL`      | `720h`   | How long a browser session lasts (30 days)          |
 | `PREVIEW_FORMAT`| `webp`   | Animated video previews: `webp` / `gif` / `off`      |
 | `PREVIEW_PX`    | `320`    | Preview longest edge (px)                            |
 | `PREVIEW_SEGMENTS`| `12`   | Max sampled bursts per video                         |
@@ -171,6 +173,52 @@ instead of logged individually. They stay listed and downloadable but have no
 dimensions or thumbnail. To find them, look for items with no preview; re-copying
 the file fixes it.
 
+## Access control
+
+Set `API_KEY` and every `/api/` route requires it. There are no accounts — one
+shared key, entered once per browser:
+
+```yaml
+environment:
+  - API_KEY=paste-a-long-random-string-here   # e.g. `openssl rand -base64 24`
+```
+
+Leaving it empty keeps the old behaviour (open to anyone who can reach the port),
+and the startup log says so in as many words, so a typo in the variable name
+doesn't read as protection.
+
+How it works, and why it isn't header-only: the browser loads thumbnails,
+previews and video through `<img src>` and `<video src>`. Those requests come from
+the browser's own loader, and JavaScript cannot attach a header to them — a
+header-only key would authenticate the JSON endpoints and 401 every image and
+video in the app. So entering the key exchanges it for a session **cookie**, which
+the browser does attach to those loads. (Routing media through `fetch()` into blob
+URLs would avoid the cookie but break video seeking, since it defeats HTTP Range
+requests.)
+
+- The UI shell at `/` is served without a key, because there has to be somewhere
+  to type it. It contains no library data.
+- The cookie holds a signed, expiring token — not the key itself — so the cookie
+  jar never stores the master credential and the expiry can't be extended by
+  editing it. It is `HttpOnly`, and `Secure` is set only when the request arrived
+  over HTTPS (an unconditional `Secure` flag would make a plain-HTTP LAN server
+  unusable).
+- **Revoking access:** change `API_KEY` and restart. Every existing session dies,
+  because tokens are signed with the key. **Lock** in the header only clears the
+  current device.
+- Scripts can skip the cookie and send `X-API-Key: <key>` or
+  `Authorization: Bearer <key>` instead:
+  ```bash
+  curl -H "X-API-Key: $API_KEY" http://nas:8080/api/stats
+  ```
+- Ten wrong keys per minute per client gets a `429`, so the key can't be quietly
+  brute-forced over the network.
+
+This is a lock on the front door, not transport security: over plain HTTP the key
+and your media still cross the network in the clear. On a home LAN that is usually
+the accepted trade-off; if you expose this beyond it, put it behind a reverse proxy
+with TLS.
+
 ## HTTP API
 
 - `GET  /api/items?limit=&before=&after=` — list items newest-first; `before=<id>`
@@ -185,6 +233,10 @@ the file fixes it.
   item and overwrites its caption (also refreshes the caption embedding)
 - `PUT  /api/offset` — `{ "path": "...", "offset": 12.5 }`; sets the poster-frame
   offset for a video and rebuilds its thumbnail. `null` restores the default
+- `GET  /api/auth` — whether a key is required and whether this client has a
+  session (unauthenticated; reveals nothing about the library)
+- `POST /api/auth` — `{ "key": "..." }`; sets the session cookie
+- `DELETE /api/auth` — clears the session cookie on this device
 - `GET  /api/stats` — collection size + latest scan (drives the live UI)
 - `POST /api/scan` — trigger a rescan (returns 202; overlapping calls collapse)
 - `GET  /api/thumb/{path...}` — cached thumbnail

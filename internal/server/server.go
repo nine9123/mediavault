@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"mediavault/internal/auth"
 	"mediavault/internal/config"
 	"mediavault/internal/media"
 	"mediavault/internal/model"
@@ -39,12 +40,17 @@ type Server struct {
 	store   *store.Store
 	scanner *scan.Scanner
 	tx      *transcode.Transcoder
+	auth    *auth.Auth
 }
 
 // New creates a Server.
 func New(cfg config.Config, st *store.Store, sc *scan.Scanner, tx *transcode.Transcoder) *Server {
-	return &Server{cfg: cfg, store: st, scanner: sc, tx: tx}
+	return &Server{cfg: cfg, store: st, scanner: sc, tx: tx,
+		auth: auth.New(cfg.APIKey, cfg.AuthTTL)}
 }
+
+// Auth exposes the authenticator so main can log whether the API is protected.
+func (s *Server) Auth() *auth.Auth { return s.auth }
 
 // Routes builds the router (Go 1.22 method+pattern matching).
 func (s *Server) Routes() http.Handler {
@@ -70,7 +76,138 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/thumb/{path...}", s.handleThumb)
 	mux.HandleFunc("GET /api/preview/{path...}", s.handlePreview)
 	mux.HandleFunc("GET /api/raw/{path...}", s.handleRaw)
-	return mux
+
+	// Auth endpoints are reachable without a session, for obvious reasons.
+	mux.HandleFunc("GET /api/auth", s.handleAuthStatus)
+	mux.HandleFunc("POST /api/auth", s.handleLogin)
+	mux.HandleFunc("DELETE /api/auth", s.handleLogout)
+
+	// Wrapping the finished mux — rather than checking inside each handler — is
+	// what makes this fail closed: a route added later is protected by default,
+	// and forgetting to add a check is not a possible mistake.
+	return s.requireAuth(mux)
+}
+
+// publicPaths are served without a session. The UI shell has to be, or there
+// would be nowhere to type the key; it contains no library data, just markup.
+func publicPaths(p string) bool {
+	return p == "/" || p == "/api/auth"
+}
+
+// requireAuth rejects unauthenticated requests to everything except publicPaths.
+// It accepts either the session cookie (which is what browsers send on <img> and
+// <video> loads) or an X-API-Key / Bearer header (for curl and scripts).
+func (s *Server) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.auth.Enabled() || publicPaths(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if s.authed(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Deliberately no WWW-Authenticate header: it would make the browser pop
+		// its own native credential dialog over the app's own login screen.
+		w.Header().Set("Cache-Control", "no-store")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	})
+}
+
+// authed reports whether a request carries a valid session or key.
+func (s *Server) authed(r *http.Request) bool {
+	if k := auth.KeyFromRequest(r); k != "" && s.auth.VerifyKey(k) {
+		return true
+	}
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		return s.auth.VerifyToken(c.Value, time.Now())
+	}
+	return false
+}
+
+const sessionCookie = "mv_session"
+
+// handleAuthStatus lets the UI decide, on load, whether to show the key prompt or
+// go straight to the library. Unauthenticated by design — it reveals only whether
+// a key is required, never anything about the library.
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, map[string]any{
+		"enabled": s.auth.Enabled(),
+		"authed":  !s.auth.Enabled() || s.authed(r),
+	})
+}
+
+// handleLogin exchanges the API key for a session cookie.
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if !s.auth.Enabled() {
+		writeJSON(w, map[string]any{"ok": true, "enabled": false})
+		return
+	}
+	client := auth.Client(r)
+	now := time.Now()
+	if !s.auth.AllowAttempt(client, now) {
+		http.Error(w, "too many attempts — wait a minute and try again", http.StatusTooManyRequests)
+		return
+	}
+	var req struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !s.auth.VerifyKey(strings.TrimSpace(req.Key)) {
+		s.auth.RecordFailure(client, now)
+		log.Printf("auth: failed login from %s", client)
+		http.Error(w, "wrong key", http.StatusUnauthorized)
+		return
+	}
+	s.auth.RecordSuccess(client)
+	token, expires := s.auth.Issue(now)
+	http.SetCookie(w, s.sessionCookieFor(r, token, expires))
+	writeJSON(w, map[string]any{"ok": true, "enabled": true, "expires": expires.Unix()})
+}
+
+// handleLogout clears the session cookie on this device. Other devices keep
+// theirs; to revoke everything, change API_KEY.
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	c := s.sessionCookieFor(r, "", time.Unix(0, 0))
+	c.MaxAge = -1
+	http.SetCookie(w, c)
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// sessionCookieFor builds the session cookie.
+//
+// HttpOnly because JavaScript never needs to read it — only the browser's own
+// loaders do, and keeping it out of reach of script limits what an injected
+// script could steal. Secure is set only when the request actually arrived over
+// TLS: this is typically a plain-HTTP box on a LAN, and an unconditional Secure
+// flag would make the browser discard the cookie and lock everyone out.
+func (s *Server) sessionCookieFor(r *http.Request, value string, expires time.Time) *http.Cookie {
+	return &http.Cookie{
+		Name:     sessionCookie,
+		Value:    value,
+		Path:     "/",
+		Expires:  expires,
+		MaxAge:   int(time.Until(expires).Seconds()),
+		HttpOnly: true,
+		Secure:   isTLS(r),
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+// isTLS reports whether the request reached us over HTTPS. X-Forwarded-Proto is
+// caller-controlled, but trusting it here can only ADD the Secure flag — a
+// spoofed value restricts the attacker's own cookie and nothing else.
+func isTLS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // handleIndex serves the embedded single-page UI.

@@ -84,9 +84,12 @@ func main() {
 
 	tx := transcode.New(ctx, cfg)
 
+	api := server.New(cfg, st, scanner, tx)
+	log.Print(api.Auth().Describe())
+
 	srv := &http.Server{
 		Addr:    cfg.Addr,
-		Handler: server.New(cfg, st, scanner, tx).Routes(),
+		Handler: api.Routes(),
 	}
 
 	go func() {

@@ -318,6 +318,17 @@
   .tagsuggest .sugg{font-family:var(--mono);font-size:.72rem;color:var(--bone-dim);background:var(--ink-raised);border:1px solid var(--ink-line);border-radius:2px;padding:.2rem .5rem;cursor:pointer}
   .tagsuggest .sugg::before{content:"+ ";color:var(--brass)}
   .tagsuggest .sugg:hover{border-color:var(--brass);color:var(--bone)}
+  /* Login gate. Opaque, not translucent: nothing behind it should be readable
+     before a key is entered, even though the grid never loads unauthenticated. */
+  .gate{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;background:var(--ink);padding:24px}
+  .gate.hidden{display:none}
+  .gatebox{width:100%;max-width:340px}
+  .gatebox .mark{font-family:var(--mono);font-size:.95rem;letter-spacing:.14em;text-transform:uppercase;color:var(--bone-dim);margin-bottom:18px;display:flex;align-items:center;gap:9px}
+  .gatebox label{display:block;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--bone-faint);margin-bottom:7px}
+  .gatebox input{width:100%;box-sizing:border-box;font-family:var(--mono);font-size:.9rem;color:var(--bone);background:var(--ink-raised);border:1px solid var(--ink-line);border-radius:2px;padding:11px 12px}
+  .gatebox input:focus{outline:none;border-color:var(--ink-line-2)}
+  .gatebox .go{width:100%;margin-top:10px;padding:11px}
+  .gatebox .err{font-family:var(--mono);font-size:11px;color:var(--brass-soft);margin-top:10px;min-height:1.2em}
   .descrow{margin:8px 0}
   .descrow .descv{color:var(--bone);font-size:.9rem;line-height:1.55;margin-top:4px;white-space:pre-wrap;background:var(--ink-raised);border-left:2px solid var(--brass-soft);padding:8px 10px}
   .descrow .descv.pending{color:var(--bone-faint);font-style:italic;background:none;border-left-color:var(--ink-line)}
@@ -350,6 +361,20 @@
 </style>
 </head>
 <body>
+  <!-- Shown until /api/auth confirms a session. The server serves this shell
+       unauthenticated (there has to be somewhere to type the key); every /api/
+       route behind it requires the session cookie. -->
+  <div class="gate" id="gate" aria-hidden="false">
+    <div class="gatebox">
+      <div class="mark"><span class="safelight"></span>mediavault</div>
+      <label for="gatekey">API key</label>
+      <input id="gatekey" type="password" autocomplete="current-password" spellcheck="false" autofocus
+             aria-describedby="gateerr" placeholder="Paste your key">
+      <button class="btn go" id="gatego" type="button">Unlock</button>
+      <div class="err" id="gateerr" role="alert" aria-live="polite"></div>
+    </div>
+  </div>
+
   <header class="bar">
     <div class="mark"><span class="safelight" id="safelight"></span>mediavault</div>
     <label class="search">
@@ -363,6 +388,7 @@
     <button class="btn" id="random" title="Open a random item — then arrow through more">Random</button>
     <button class="btn" id="previews" title="Animated video previews in the grid: AUTO plays the ones on screen, HOVER only under the cursor, OFF never">Previews: auto</button>
     <button class="btn" id="rescan">Rescan</button>
+    <button class="btn hidden" id="logout" title="Forget the API key on this device">Lock</button>
   </header>
 
   <div class="qhint hidden" id="qhint">
@@ -432,7 +458,8 @@
     volume: 1,          // remembered playback volume (0-1)
     muted: false,       // remembered mute state
     loop: false,        // repeat the current video/track
-    scanning: false
+    scanning: false,
+    authEnabled: false // whether the server requires a key at all
   };
 
   var el = {
@@ -444,6 +471,11 @@
     q: document.getElementById("q"),
     rescan: document.getElementById("rescan"),
     previews: document.getElementById("previews"),
+    gate: document.getElementById("gate"),
+    gatekey: document.getElementById("gatekey"),
+    gatego: document.getElementById("gatego"),
+    gateerr: document.getElementById("gateerr"),
+    logout: document.getElementById("logout"),
     random: document.getElementById("random"),
     viewer: document.getElementById("viewer"),
     stage: document.getElementById("stage"),
@@ -467,6 +499,10 @@
 
   function api(path) {
     return fetch(path).then(function (r) {
+      // The session can lapse while the tab sits open, or the container can be
+      // restarted with a different key. Without this the UI would just look
+      // broken and empty; instead it falls back to asking for the key.
+      if (r.status === 401) { lock(); throw new Error("unauthorized"); }
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     });
@@ -1714,15 +1750,93 @@
   });
   window.addEventListener("popstate", render);
 
-  // ---- boot ----
-  (function () {
+  // ---- access gate ----
+  // There are no accounts: one shared key, exchanged for a session cookie. The
+  // key is deliberately NOT kept in localStorage — the cookie already persists
+  // the session, it is HttpOnly so a script can't read it back, and it is the
+  // only thing the browser will attach to <img>/<video> requests anyway.
+  var booted = false, statsTimer = null;
+
+  function startApp() {
+    if (booted) return;
+    booted = true;
+    el.gate.classList.add("hidden");
+    el.gate.setAttribute("aria-hidden", "true");
+    el.logout.classList.toggle("hidden", !S.authEnabled);
+
     var h = parseHash();
     if (h.q) { el.q.value = h.q; applySearch(h.q, true); }
     else { loadInitial().then(fillViewport); }
     if (h.v) openItemByPath(h.v);
-  })();
-  pollStats();
-  setInterval(pollStats, 2000);
+
+    pollStats();
+    if (!statsTimer) statsTimer = setInterval(pollStats, 2000);
+  }
+
+  // Return to the gate. Everything already on screen is torn down: leaving a
+  // grid of thumbnails visible behind a login prompt would defeat the point.
+  function lock() {
+    if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+    booted = false;
+    if (S.viewerOpen) closeViewer();
+    reset();
+    el.gate.classList.remove("hidden");
+    el.gate.setAttribute("aria-hidden", "false");
+    el.gatekey.value = "";
+    el.logout.classList.add("hidden");
+    setTimeout(function () { el.gatekey.focus(); }, 0);
+  }
+
+  function submitKey() {
+    var key = el.gatekey.value;
+    if (!key) { el.gateerr.textContent = "Enter the key."; return; }
+    el.gatego.disabled = true;
+    el.gateerr.textContent = "Checking\u2026";
+    fetch("/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: key })
+    }).then(function (r) {
+      if (r.ok) {
+        el.gateerr.textContent = "";
+        el.gatekey.value = "";
+        // Read it from the response: a successful login is authoritative about
+        // whether a key is required, whereas S.authEnabled depends on the boot
+        // probe having already run.
+        return r.json().catch(function () { return {}; }).then(function (d) {
+          S.authEnabled = (d.enabled !== false);
+          startApp();
+        });
+      }
+      return r.text().then(function (t) {
+        el.gateerr.textContent = (t || "").trim() || ("Rejected (HTTP " + r.status + ")");
+      });
+    }).catch(function () {
+      el.gateerr.textContent = "Could not reach the server.";
+    }).finally(function () { el.gatego.disabled = false; });
+  }
+
+  el.gatego.addEventListener("click", submitKey);
+  el.gatekey.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); submitKey(); }
+  });
+  el.logout.addEventListener("click", function () {
+    fetch("/api/auth", { method: "DELETE" }).catch(function () {}).finally(lock);
+  });
+
+  // ---- boot ----
+  // Ask whether a key is required before touching any data endpoint, so an
+  // unauthenticated visitor sees the prompt rather than a screenful of errors.
+  fetch("/api/auth").then(function (r) { return r.json(); }).then(function (d) {
+    S.authEnabled = !!(d && d.enabled);
+    if (d && d.authed) startApp();
+    else lock();
+  }).catch(function () {
+    // Status unavailable: show the gate rather than assuming access. If auth is
+    // in fact disabled, the first submitted value is accepted regardless.
+    S.authEnabled = true;
+    lock();
+  });
 })();
 </script>
 </body>

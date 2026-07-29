@@ -76,6 +76,14 @@ type Config struct {
 	// over captions. Empty leaves search as keyword-only.
 	OllamaEmbedModel string
 
+	// APIKey gates every /api/ route. Empty disables authentication, which is
+	// the old behaviour and fine on a trusted host, but is announced loudly at
+	// startup so a typo in the variable name isn't mistaken for protection.
+	APIKey string
+	// AuthTTL is how long a browser session lasts before the key must be
+	// re-entered. Sessions are also invalidated whenever APIKey changes.
+	AuthTTL time.Duration
+
 	FFmpeg  string // ffmpeg binary (on PATH by default)
 	FFprobe string // ffprobe binary
 
@@ -146,6 +154,8 @@ func Load() Config {
 		OllamaModel:      env("OLLAMA_MODEL", "llava"),
 		OllamaPrompt:     env("OLLAMA_PROMPT", "Describe this image in one or two sentences for search. Name the main subjects, the setting, notable objects, colors, and mood. Be concise, factual, and specific; do not start with \"The image\"."),
 		OllamaEmbedModel: env("OLLAMA_EMBED_MODEL", ""),
+		APIKey:           env("API_KEY", ""),
+		AuthTTL:          envDur("AUTH_TTL", 30*24*time.Hour),
 		FFmpeg:           env("FFMPEG", "ffmpeg"),
 		FFprobe:          env("FFPROBE", "ffprobe"),
 		Exts:             defaultExts(),
