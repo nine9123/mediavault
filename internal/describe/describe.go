@@ -21,13 +21,19 @@ import (
 const frameMaxPx = 512
 
 type Describer struct {
-	cfg    config.Config
-	store  *store.Store
-	failed map[string]struct{} // frames we couldn't extract; skip for this run
+	cfg       config.Config
+	store     *store.Store
+	failed    map[string]struct{} // frames we couldn't extract; skip for this run
+	failedEmb map[string]struct{} // captions the embed model rejected; skip for this run
 }
 
 func New(cfg config.Config, st *store.Store) *Describer {
-	return &Describer{cfg: cfg, store: st, failed: map[string]struct{}{}}
+	return &Describer{
+		cfg:       cfg,
+		store:     st,
+		failed:    map[string]struct{}{},
+		failedEmb: map[string]struct{}{},
+	}
 }
 
 func (d *Describer) embedOn() bool { return d.cfg.OllamaEmbedModel != "" }
@@ -120,18 +126,39 @@ func (d *Describer) embedPass(ctx context.Context) {
 		if len(items) == 0 {
 			return
 		}
+		progressed := false
 		for _, it := range items {
 			if ctx.Err() != nil {
 				return
 			}
+			if _, skip := d.failedEmb[it.Relpath]; skip {
+				continue
+			}
 			vec, err := ollama.Embed(ctx, d.cfg, it.Description)
 			if err != nil {
+				// Separate "this caption is bad" from "the server is unhappy". A 4xx
+				// is the former, and returning on it stalls the whole backfill:
+				// CaptionedButUnembedded keeps handing the item back, newest first,
+				// so every ticker pass dies on the same row and nothing behind it in
+				// the queue is ever embedded. Skip the item instead.
+				if ollama.PermanentError(err) {
+					log.Printf("describe: embed %s: %v (skipping)", it.Relpath, err)
+					d.failedEmb[it.Relpath] = struct{}{}
+					continue
+				}
 				log.Printf("describe: embed: %v", err) // server down/busy -> back off
 				return
 			}
 			if err := d.store.SetEmbedding(ctx, it.Relpath, vec); err != nil {
 				log.Printf("describe: embed save %s: %v", it.Relpath, err)
+				continue
 			}
+			progressed = true
+		}
+		// A batch of nothing but skips would otherwise re-query the same rows
+		// forever, since none of them gain an embedding.
+		if !progressed {
+			return
 		}
 	}
 }
