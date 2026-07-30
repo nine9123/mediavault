@@ -113,6 +113,26 @@
   .btn:hover { color: var(--brass); border-color: var(--brass-soft); }
   .btn:disabled { color: var(--bone-faint); border-color: var(--ink-line); cursor: default; }
 
+  /* Sits immediately after the Previews button and reads as part of that
+     control, so it borrows .btn's border and metrics rather than the viewer
+     bar's translucent .vnum treatment. */
+  .capnum {
+    display: flex; align-items: center; gap: 6px;
+    font-family: var(--mono); font-size: 12px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--bone-dim);
+    border: 1px solid var(--ink-line); border-radius: 2px;
+    padding: 7px 10px; white-space: nowrap; user-select: none;
+  }
+  .capnum input {
+    width: 3.4rem; background: transparent; border: none;
+    border-bottom: 1px solid var(--ink-line-2);
+    color: var(--bone); font-family: var(--mono); font-size: 12px;
+    text-align: center; padding: 0 2px;
+  }
+  .capnum input:focus { outline: none; border-bottom-color: var(--brass); }
+  .capnum.off { color: var(--bone-faint); }
+  .capnum.off input { color: var(--bone-faint); opacity: .5; }
+
   /* ---- contact sheet ---- */
   .sheet { padding: var(--gap); }
   .grid {
@@ -386,7 +406,10 @@
     <button class="btn ghost" id="qhelp" type="button" title="Search help" aria-label="Search help">?</button>
     <span class="readout" id="readout"><span class="n">—</span> items</span>
     <button class="btn" id="random" title="Open a random item — then arrow through more">Random</button>
-    <button class="btn" id="previews" title="Animated video previews in the grid: AUTO plays the ones on screen, HOVER only under the cursor, OFF never">Previews: auto</button>
+    <button class="btn" id="previews" title="Animated video previews in the grid: AUTO plays the ones on screen up to the limit beside this button, HOVER only under the cursor, OFF never">Previews: auto</button>
+    <label class="capnum" id="pvcaplabel" title="How many grid previews may animate at once in AUTO mode. Raise it to fill the screen; each animation holds its decoded frames in memory, so a very high limit costs RAM on a large grid.">
+      max&nbsp;<input id="pvcap" type="number" min="1" max="512" step="1" aria-label="Maximum previews animating at once">
+    </label>
     <button class="btn" id="rescan">Rescan</button>
     <button class="btn hidden" id="logout" title="Forget the API key on this device">Lock</button>
   </header>
@@ -471,6 +494,8 @@
     q: document.getElementById("q"),
     rescan: document.getElementById("rescan"),
     previews: document.getElementById("previews"),
+    pvcap: document.getElementById("pvcap"),
+    pvcaplabel: document.getElementById("pvcaplabel"),
     gate: document.getElementById("gate"),
     gatekey: document.getElementById("gatekey"),
     gatego: document.getElementById("gatego"),
@@ -605,13 +630,17 @@
   // stops. Hence three modes rather than a hardcoded choice — "autoplay every
   // tile" is not obviously right. Fifty simultaneously animating tiles is hard
   // to read, and each one is a continuously decoding animation costing memory
-  // and battery. AUTO therefore plays only the cells actually on screen, capped.
+  // and battery. AUTO therefore plays only the cells actually on screen, capped
+  // — but where that cap sits is a taste-and-hardware call, not something this
+  // file can know, so it is a control in the header (PV_CAP_DEFAULT is only the
+  // starting point).
+  var PV_CAP_MIN = 1, PV_CAP_MAX = 512, PV_CAP_DEFAULT = 16;
   var PV = {
     mode: "auto",
     visible: new Set(), // cells currently intersecting the viewport
     hovered: null,
     playing: new Map(), // cell -> preview <img>
-    cap: 16,            // ceiling on simultaneous animations
+    cap: PV_CAP_DEFAULT, // ceiling on simultaneous animations
     io: null
   };
   var PV_MODES = ["auto", "hover", "off"];
@@ -720,10 +749,45 @@
     el.previews.textContent = "Previews: " + m;
     el.previews.setAttribute("aria-label", "Video previews: " + m);
     if (persist) { try { localStorage.setItem("mv.previewMode", m); } catch (e) {} }
+    pvCapEnable();
+    pvSync();
+  }
+
+  // The cap only bites in AUTO: HOVER plays one cell and OFF none. Dim the field
+  // when it cannot do anything. Deliberately keyed off PV.mode rather than
+  // pvEffectiveMode(), so opening the viewer — which suspends previews while it
+  // is up — doesn't make the control flicker.
+  function pvCapRelevant() {
+    return PV.mode === "auto" || (PV.mode === "hover" && !CAN_HOVER);
+  }
+
+  function pvCapEnable() {
+    var on = pvCapRelevant();
+    el.pvcap.disabled = !on;
+    el.pvcaplabel.classList.toggle("off", !on);
+  }
+
+  function pvSetCap(n, persist) {
+    // parseFloat, not Number: Number("") and Number(null) are both 0, which
+    // would clamp to PV_CAP_MIN — so clearing the field would silently mean
+    // "play one cell" rather than "back to the default".
+    n = Math.round(parseFloat(n));
+    if (!isFinite(n)) n = PV_CAP_DEFAULT;
+    PV.cap = Math.min(PV_CAP_MAX, Math.max(PV_CAP_MIN, n));
+    // Only write back when it differs, so clamping never rewrites the field
+    // under a partially-typed number.
+    if (el.pvcap.value !== String(PV.cap)) el.pvcap.value = String(PV.cap);
+    if (persist) { try { localStorage.setItem("mv.previewCap", PV.cap); } catch (e) {} }
     pvSync();
   }
 
   (function initPreviews() {
+    var c = NaN;
+    try { c = parseInt(localStorage.getItem("mv.previewCap"), 10); } catch (e) {}
+    // Before pvSetMode, so the first pvSync already uses the stored cap rather
+    // than playing 16 cells and then correcting itself.
+    pvSetCap(isFinite(c) ? c : PV_CAP_DEFAULT, false);
+
     var m = null;
     try { m = localStorage.getItem("mv.previewMode"); } catch (e) {}
     // Default to hover when the OS asks for reduced motion: a grid that starts
@@ -733,6 +797,14 @@
     el.previews.addEventListener("click", function () {
       pvSetMode(PV_MODES[(PV_MODES.indexOf(PV.mode) + 1) % PV_MODES.length], true);
     });
+    // "input" applies while typing so the grid responds live; "change" (blur,
+    // enter, spinner) is where a clamp is allowed to rewrite the field, so
+    // typing the "12" of "128" doesn't get normalized out from under you.
+    el.pvcap.addEventListener("input", function () {
+      var n = parseInt(el.pvcap.value, 10);
+      if (n >= PV_CAP_MIN && n <= PV_CAP_MAX) pvSetCap(n, true);
+    });
+    el.pvcap.addEventListener("change", function () { pvSetCap(el.pvcap.value, true); });
   })();
 
   // A rebuilt thumbnail keeps the same URL — the filename is a hash of the
