@@ -1,0 +1,42 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: 192.168.178.40:30008
+  IMAGE_NAME: nine9/mediavault
+  WATCHTOWER_SCOPE: mediavault   # must match the watchtower.scope label on the app
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Gitea registry
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login ${{ env.REGISTRY }} \
+            -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: Build image
+        run: |
+          SHA_SHORT=$(echo "${{ gitea.sha }}" | cut -c1-8)
+          docker build \
+            --label "org.opencontainers.image.revision=${{ gitea.sha }}" \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHA_SHORT} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+          echo "SHA_SHORT=${SHA_SHORT}" >> "$GITEA_ENV"
+
+      - name: Push image
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_SHORT }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Trigger watchtower update
+        run: |
+          curl -sf -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
+            "http://${{ secrets.TRUENAS_LAN_IP }}/v1/update?scope=${{ env.WATCHTOWER_SCOPE }}"
