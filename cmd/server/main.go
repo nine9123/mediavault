@@ -14,6 +14,7 @@ import (
 
 	"mediavault/internal/config"
 	"mediavault/internal/describe"
+	"mediavault/internal/faces"
 	"mediavault/internal/ollama"
 	"mediavault/internal/scan"
 	"mediavault/internal/server"
@@ -54,6 +55,10 @@ func main() {
 		}()
 	}
 
+	if cfg.FacesEnabled() {
+		log.Printf("people: on — face recognition via %s (durable names: %s)", cfg.FaceURL, cfg.PeoplePath())
+	}
+
 	if err := os.MkdirAll(cfg.ThumbDir(), 0o755); err != nil {
 		log.Fatalf("prepare data dir: %v", err)
 	}
@@ -82,9 +87,17 @@ func main() {
 		go describe.New(cfg, st).Run(ctx)
 	}
 
+	// One recognizer, shared: the worker fills the faces table, the HTTP layer
+	// reads it, and both cluster with the same similarity threshold.
+	var rec *faces.Recognizer
+	if cfg.FacesEnabled() {
+		rec = faces.New(cfg, st)
+		go rec.Run(ctx)
+	}
+
 	tx := transcode.New(ctx, cfg)
 
-	api := server.New(cfg, st, scanner, tx)
+	api := server.New(cfg, st, scanner, tx, rec)
 	log.Print(api.Auth().Describe())
 
 	srv := &http.Server{

@@ -172,6 +172,43 @@ func (s *Store) ensureColumns() error {
 	)`); err != nil {
 		return fmt.Errorf("create item_embeddings: %w", err)
 	}
+	hasFaces, err := s.hasColumn("items", "faces_done")
+	if err != nil {
+		return err
+	}
+	if !hasFaces {
+		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN faces_done INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add items.faces_done: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS people (
+		id   INTEGER PRIMARY KEY,
+		name TEXT NOT NULL UNIQUE COLLATE NOCASE
+	)`); err != nil {
+		return fmt.Errorf("create people: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS faces (
+		id        INTEGER PRIMARY KEY,
+		item_id   INTEGER NOT NULL REFERENCES items(id)  ON DELETE CASCADE,
+		person_id INTEGER          REFERENCES people(id) ON DELETE SET NULL,
+		x         REAL NOT NULL,
+		y         REAL NOT NULL,
+		w         REAL NOT NULL,
+		h         REAL NOT NULL,
+		score     REAL,
+		dim       INTEGER NOT NULL,
+		vec       BLOB    NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create faces: %w", err)
+	}
+	for _, ix := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_faces_item   ON faces(item_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)`,
+	} {
+		if _, err := s.db.Exec(ix); err != nil {
+			return fmt.Errorf("index faces: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -202,7 +239,8 @@ func (s *Store) hasColumn(table, col string) (bool, error) {
 func (s *Store) dropAll() error {
 	for _, t := range []string{
 		"items_fts", "scan_runs", "chain_items", "chains",
-		"item_vectors", "item_embeddings", "item_tags", "tags", "items", "meta",
+		"item_vectors", "item_embeddings", "faces", "people",
+		"item_tags", "tags", "items", "meta",
 	} {
 		if _, err := s.db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
 			return err

@@ -66,6 +66,13 @@ func Write(path string, s Sidecar) error {
 	if err != nil {
 		return err
 	}
+	return writeAtomic(path, b)
+}
+
+// writeAtomic writes b to path via a temp file + rename, creating parent
+// directories as needed, so a crash mid-write can never leave a truncated
+// metadata file where a complete one used to be.
+func writeAtomic(path string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

@@ -76,6 +76,27 @@ type Config struct {
 	// over captions. Empty leaves search as keyword-only.
 	OllamaEmbedModel string
 
+	// Optional face recognition, served by a SEPARATE container (see facerec/):
+	// point FaceURL at anything speaking the small HTTP contract in
+	// internal/face. Empty disables the People page and all face work — nothing
+	// about the core app depends on it.
+	FaceURL string
+	// FaceMatch is the cosine-similarity threshold above which two face
+	// embeddings are the same person. 0 means "ask the service" (its /health
+	// advertises a value suited to its model), which is almost always better than
+	// a number guessed here: a dlib descriptor and an ArcFace embedding sit at
+	// very different similarities for the same pair of photos.
+	FaceMatch float64
+	// FaceFramePx is the longest edge of the frame handed to the detector. Faces
+	// are small relative to a frame, so this is deliberately larger than the
+	// captioning frame — a face 5% of the width of a 512px frame is 25px across,
+	// below what any detector will find.
+	FaceFramePx int
+	// FaceMaxPerItem caps how many faces are stored per item, keeping the
+	// highest-scoring ones. A crowd shot can return dozens of low-quality
+	// detections that only add noise to clustering.
+	FaceMaxPerItem int
+
 	// APIKey gates every /api/ route. Empty disables authentication, which is
 	// the old behaviour and fine on a trusted host, but is announced loudly at
 	// startup so a typo in the variable name isn't mistaken for protection.
@@ -99,6 +120,24 @@ func (c Config) ThumbDir() string { return filepath.Join(c.DataDir, "thumbs") }
 // PreviewDir is where generated animated previews are cached. Kept separate
 // from ThumbDir so `rm -rf` on either one rebuilds just that derivative.
 func (c Config) PreviewDir() string { return filepath.Join(c.DataDir, "previews") }
+
+// FaceDir is where cropped face thumbnails are cached (another derivative of
+// the media, so it lives in the disposable data dir).
+func (c Config) FaceDir() string { return filepath.Join(c.DataDir, "faces") }
+
+// FacesEnabled reports whether a recognition service is configured.
+func (c Config) FacesEnabled() bool { return c.FaceURL != "" }
+
+// PeoplePath is the durable record of who is who: names and the faces that
+// define them. It sits beside the tag sidecars (same writable volume, same
+// backup story) because it is human-authored data, not cache — detections can
+// be recomputed from the media, but a name cannot.
+func (c Config) PeoplePath() string {
+	if c.SidecarDir != "" {
+		return filepath.Join(c.SidecarDir, "people.json")
+	}
+	return filepath.Join(c.MediaRoot, "people.json")
+}
 
 // PreviewsEnabled reports whether animated previews should be generated.
 func (c Config) PreviewsEnabled() bool { return c.PreviewFormat != "off" }
@@ -154,6 +193,10 @@ func Load() Config {
 		OllamaModel:      env("OLLAMA_MODEL", "llava"),
 		OllamaPrompt:     env("OLLAMA_PROMPT", "Describe this image in one or two sentences for search. Name the main subjects, the setting, notable objects, colors, and mood. Be concise, factual, and specific; do not start with \"The image\"."),
 		OllamaEmbedModel: env("OLLAMA_EMBED_MODEL", ""),
+		FaceURL:          env("FACE_URL", ""),
+		FaceMatch:        envFloat("FACE_MATCH", 0),
+		FaceFramePx:      envInt("FACE_FRAME_PX", 1280),
+		FaceMaxPerItem:   envInt("FACE_MAX_PER_ITEM", 20),
 		APIKey:           env("API_KEY", ""),
 		AuthTTL:          envDur("AUTH_TTL", 30*24*time.Hour),
 		FFmpeg:           env("FFMPEG", "ffmpeg"),

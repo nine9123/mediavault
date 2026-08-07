@@ -15,10 +15,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"mediavault/internal/auth"
 	"mediavault/internal/config"
+	"mediavault/internal/faces"
 	"mediavault/internal/media"
 	"mediavault/internal/model"
 	"mediavault/internal/ollama"
@@ -41,12 +43,27 @@ type Server struct {
 	scanner *scan.Scanner
 	tx      *transcode.Transcoder
 	auth    *auth.Auth
+	// rec is the face recognizer, shared with its background worker so both use
+	// the same similarity threshold. nil when FACE_URL is unset.
+	rec *faces.Recognizer
+	// cropSem bounds concurrent face-crop ffmpeg runs. The People page asks for
+	// every cover at once, and each miss is a process; a browser's own connection
+	// limit happens to bound this today, which is not something to rely on.
+	cropSem chan struct{}
+	// cropSeq makes each crop's temp filename unique, so two requests for the
+	// same face can't write the same partial file.
+	cropSeq atomic.Uint64
 }
 
+// maxCrops is how many face crops may be cut at once. Small: each one is an
+// ffmpeg process reading a frame over the network mount.
+const maxCrops = 4
+
 // New creates a Server.
-func New(cfg config.Config, st *store.Store, sc *scan.Scanner, tx *transcode.Transcoder) *Server {
-	return &Server{cfg: cfg, store: st, scanner: sc, tx: tx,
-		auth: auth.New(cfg.APIKey, cfg.AuthTTL)}
+func New(cfg config.Config, st *store.Store, sc *scan.Scanner, tx *transcode.Transcoder, rec *faces.Recognizer) *Server {
+	return &Server{cfg: cfg, store: st, scanner: sc, tx: tx, rec: rec,
+		auth:    auth.New(cfg.APIKey, cfg.AuthTTL),
+		cropSem: make(chan struct{}, maxCrops)}
 }
 
 // Auth exposes the authenticator so main can log whether the API is protected.
@@ -71,6 +88,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/tags/top", s.handleTopTags)
 	mux.HandleFunc("POST /api/captions/reset", s.handleResetCaptions)
 	mux.HandleFunc("POST /api/embeddings/reset", s.handleResetEmbeddings)
+	// People (face recognition; all of these 503 unless FACE_URL is set).
+	mux.HandleFunc("GET /api/people", s.handlePeople)
+	mux.HandleFunc("GET /api/people/items", s.handlePeopleItems)
+	mux.HandleFunc("PUT /api/people", s.handleNamePerson)
+	mux.HandleFunc("DELETE /api/people", s.handleForgetPerson)
+	mux.HandleFunc("POST /api/faces/reset", s.handleResetFaces)
+	mux.HandleFunc("GET /api/face/{id}", s.handleFaceCrop)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 	mux.HandleFunc("POST /api/scan", s.handleScan)
 	mux.HandleFunc("GET /api/thumb/{path...}", s.handleThumb)
@@ -517,7 +541,13 @@ func (s *Server) handleItemDetail(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]any{"item": toDTO(it), "tags": toTagDTOs(tags)})
+	resp := map[string]any{"item": toDTO(it), "tags": toTagDTOs(tags)}
+	// Who is in it. Omitted entirely when recognition is off, so the card doesn't
+	// grow an empty section on a library that never asked for faces.
+	if f := s.facesForItemDTO(r, it.ID); len(f) > 0 {
+		resp["faces"] = f
+	}
+	writeJSON(w, resp)
 }
 
 // handleSetTags writes an item's manual tags to its sidecar (the durable source
@@ -780,6 +810,15 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 			resp["captions"] = map[string]any{
 				"visual": visual, "captioned": captioned,
 				"embeddings": s.cfg.OllamaEmbedModel != "", "embedded": embedded,
+			}
+		}
+	}
+	// The presence of this block is what tells the UI to show the People page at
+	// all, so it doubles as feature detection.
+	if s.facesOn() {
+		if visual, done, nfaces, named, err := s.store.FaceCounts(r.Context()); err == nil {
+			resp["faces"] = map[string]any{
+				"visual": visual, "done": done, "faces": nfaces, "named": named,
 			}
 		}
 	}

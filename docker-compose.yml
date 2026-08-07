@@ -31,6 +31,12 @@ services:
       # OLLAMA_URL: "http://your-truenas-ip:11434"
       # OLLAMA_MODEL: "llava"
       # OLLAMA_EMBED_MODEL: "nomic-embed-text"   # enables *semantic* search (pull it on the Ollama host)
+      # Optional People page: point at a face-recognition service (the facerec
+      # container below, or your own — see facerec/README.md for the contract).
+      # Empty/unset disables faces entirely; nothing else in the app depends on it.
+      # FACE_URL: "http://facerec:8000"
+      # FACE_MATCH: "0.82"      # cosine threshold; unset = use what the service advertises
+      # FACE_FRAME_PX: "1280"   # frame size sent to the detector; larger finds smaller faces
     volumes:
       # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
       - /mnt/nas/media:/media:ro
@@ -43,6 +49,22 @@ services:
       # scripts/transcode.sh, read by mediavault. Persist it so you don't
       # re-transcode after clearing the cache.
       - mediavault-derived:/derived
+
+  # Face recognition, in its own container: dlib is a C++ build and the weights
+  # are ~100 MB, neither of which belongs in the mediavault image. It gets NO
+  # media mount — mediavault extracts each frame with ffmpeg and posts the JPEG.
+  #
+  # Commented out because it is opt-in and the first build compiles dlib (5-15
+  # minutes). To enable: uncomment this block AND FACE_URL above, then
+  #   docker compose up -d --build
+  # facerec:
+  #   build: ./facerec
+  #   restart: unless-stopped
+  #   environment:
+  #     FACE_MODEL: "hog"       # or "cnn": better on small/turned faces, much slower
+  #     FACE_UPSAMPLE: "1"      # "2" finds smaller faces at ~4x the cost
+  #   # No ports published: only mediavault needs to reach it, over the compose
+  #   # network. Publish 8000 only if you want to curl /health from the host.
 
 volumes:
   mediavault-data:
