@@ -17,7 +17,7 @@ const testKey = "correct-horse-battery-staple"
 // newTestServer builds a Server with no store: these tests exercise the auth
 // middleware, which must decide before any handler touches the database.
 func newTestServer(key string) *Server {
-	return New(config.Config{APIKey: key, AuthTTL: time.Hour}, nil, nil, nil)
+	return New(config.Config{APIKey: key, AuthTTL: time.Hour}, nil, nil, nil, nil)
 }
 
 // sentinel stands in for a real route, so "did the request get through?" is

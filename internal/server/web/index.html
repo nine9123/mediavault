@@ -378,6 +378,31 @@
   .qhint code{font-family:var(--mono);font-size:.78rem;color:var(--brass);background:rgba(217,164,65,.08);padding:.05rem .3rem;border-radius:2px}
   .qhint .qex{font-family:var(--mono);font-size:.75rem;color:var(--brass);background:none;border:1px solid var(--brass-soft);border-radius:2px;padding:.15rem .45rem;margin:0 .12rem;cursor:pointer}
   .qhint .qex:hover{background:var(--brass);color:var(--ink)}
+
+  /* ---- people (face recognition) ----
+     Wider cells than the contact sheet: a face crop plus a name and counts needs
+     room, and there are tens of people where there are thousands of files. */
+  .people{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;padding:6px 0 24px}
+  .pcard{display:flex;flex-direction:column;gap:8px;background:var(--ink-raised);border:1px solid var(--ink-line);padding:10px;cursor:pointer}
+  .pcard:hover{border-color:var(--ink-line-2)}
+  .pcard .pface{width:100%;aspect-ratio:1/1;object-fit:cover;display:block;background:var(--ink);border:1px solid var(--ink-line)}
+  .pcard .pface.noface{display:flex;align-items:center;justify-content:center;font-size:2rem;color:var(--bone-faint)}
+  .pcard .pname{font-family:var(--mono);font-size:12.5px;color:var(--bone);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pcard .pname.unnamed{color:var(--bone-faint)}
+  .pcard .pmeta{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--bone-faint)}
+  .pcard .pacts{display:flex;gap:6px;flex-wrap:wrap}
+  .pcard .pacts .cardbtn{margin-top:0}
+  .peoplehead{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;padding:10px 0 4px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--bone-faint)}
+  .peoplehead .lead{color:var(--brass);letter-spacing:.2em}
+  .pagehead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 2px 12px;font-family:var(--mono)}
+  .pagehead .title{font-size:13px;letter-spacing:.06em;color:var(--bone)}
+  .pagehead .sub{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--bone-faint)}
+  .facechips{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+  .facechips .fchip{display:flex;flex-direction:column;align-items:center;gap:3px;width:56px;background:none;border:0;padding:0;cursor:pointer}
+  .facechips .fchip img{width:52px;height:52px;object-fit:cover;border:1px solid var(--ink-line);border-radius:2px}
+  .facechips .fchip:hover img{border-color:var(--brass)}
+  .facechips .fchip span{font-family:var(--mono);font-size:9px;letter-spacing:.03em;color:var(--bone-dim);max-width:56px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .facechips .fchip.unnamed span{color:var(--bone-faint)}
 </style>
 </head>
 <body>
@@ -406,6 +431,8 @@
     <button class="btn ghost" id="qhelp" type="button" title="Search help" aria-label="Search help">?</button>
     <span class="readout" id="readout"><span class="n">—</span> items</span>
     <button class="btn" id="random" title="Open a random item — then arrow through more">Random</button>
+    <!-- Shown only when a recognition service is configured (see FACE_URL). -->
+    <button class="btn hidden" id="peoplebtn" title="Browse the people found in your library">People</button>
     <button class="btn" id="previews" title="Animated video previews in the grid: AUTO plays the ones on screen up to the limit beside this button, HOVER only under the cursor, OFF never">Previews: auto</button>
     <label class="capnum" id="pvcaplabel" title="How many grid previews may animate at once in AUTO mode. Raise it to fill the screen; each animation holds its decoded frames in memory, so a very high limit costs RAM on a large grid.">
       max&nbsp;<input id="pvcap" type="number" min="1" max="512" step="1" aria-label="Maximum previews animating at once">
@@ -429,9 +456,17 @@
       <button class="qex" id="resetEmbeddings" type="button">Re-embed only</button>
       <span id="resetMsg" class="muted"></span>
     </p>
+    <p class="qhint-faces hidden" id="qhintFaces" style="border-top:1px solid var(--ink-line);padding-top:10px;margin-top:10px">
+      <b>Faces</b> — re-run detection after changing the recognition model. Names are
+      kept (they live in <code>people.json</code>) and re-attached as it catches up:
+      <button class="qex" id="resetFaces" type="button">Re-detect all faces</button>
+      <span id="facesMsg" class="muted"></span>
+    </p>
   </div>
 
   <main class="sheet">
+    <div class="pagehead hidden" id="pagehead"></div>
+    <div class="people hidden" id="people"></div>
     <div class="grid" id="grid"></div>
     <div class="sentinel hidden" id="sentinel">loading</div>
     <div class="state hidden" id="state"></div>
@@ -462,8 +497,10 @@
   var PAGE = 120;
 
   var S = {
-    mode: "browse",   // browse | search
+    mode: "browse",   // browse | search | people | person
     query: "",
+    personRef: null,  // "p<id>" (named person) or "f<face id>" (unnamed group)
+    facesOn: false,   // a recognition service is configured (from /api/stats)
     items: [],        // display order: newest id first
     maxId: null,      // highest id loaded (top of grid)
     minId: null,      // lowest id loaded (bottom of grid)
@@ -487,6 +524,12 @@
 
   var el = {
     grid: document.getElementById("grid"),
+    people: document.getElementById("people"),
+    pagehead: document.getElementById("pagehead"),
+    peoplebtn: document.getElementById("peoplebtn"),
+    qhintFaces: document.getElementById("qhintFaces"),
+    resetFaces: document.getElementById("resetFaces"),
+    facesMsg: document.getElementById("facesMsg"),
     sentinel: document.getElementById("sentinel"),
     state: document.getElementById("state"),
     readout: document.getElementById("readout"),
@@ -838,6 +881,10 @@
     S.minId = null;
     S.doneOlder = false;
     el.grid.innerHTML = "";
+    el.people.innerHTML = "";
+    el.people.classList.add("hidden");
+    el.pagehead.innerHTML = "";
+    el.pagehead.classList.add("hidden");
     clearState();
   }
 
@@ -965,7 +1012,7 @@
       if (i < 0) return;
       var k = kv.slice(0, i), val = kv.slice(i + 1);
       try { val = decodeURIComponent(val); } catch (e) {}
-      if (k === "q" || k === "v") out[k] = val;
+      if (k === "q" || k === "v" || k === "people" || k === "person") out[k] = val;
     });
     return out;
   }
@@ -977,8 +1024,19 @@
   // Make the UI match the current URL (on back/forward). Never changes history.
   function render() {
     var h = parseHash();
-    var q = h.q || "";
-    if (q !== S.query) { el.q.value = q; applySearch(q, true); }
+    if (h.person) {
+      if (S.mode !== "person" || S.personRef !== h.person) showPerson(h.person, true);
+    } else if (h.people) {
+      if (S.mode !== "people") showPeople(true);
+    } else {
+      var q = h.q || "";
+      // The mode test matters as much as the query test: coming Back out of the
+      // People page to an empty search is a change even though the query isn't.
+      if (q !== S.query || S.mode === "people" || S.mode === "person") {
+        el.q.value = q;
+        applySearch(q, true);
+      }
+    }
     if (h.v) {
       var cur = (S.viewerOpen && S.viewList[S.viewIndex]) ? S.viewList[S.viewIndex].relpath : null;
       if (cur !== h.v) openItemByPath(h.v);
@@ -1184,6 +1242,16 @@
         else if (c.visual > 0) txt += " \u00b7 captioned";
         el.qhintReset.classList.remove("hidden");
       }
+      // The block's presence is the feature flag: no recognition service, no
+      // People button, and nothing about faces on screen.
+      if (st.faces) {
+        S.facesOn = true;
+        el.peoplebtn.classList.remove("hidden");
+        el.qhintFaces.classList.remove("hidden");
+        var f = st.faces;
+        if (f.done < f.visual) txt += " \u00b7 faces " + f.done.toLocaleString() + "/" + f.visual.toLocaleString();
+        else if (f.faces > 0) txt += " \u00b7 " + f.faces.toLocaleString() + " faces";
+      }
       el.readout.innerHTML = txt;
 
       // recover if the first load failed while the server was still starting
@@ -1203,6 +1271,219 @@
     history.pushState({}, "", "#q=" + encodeURIComponent(str));
     applySearch(str, true);
   }
+
+  // ---- people (face recognition) ----
+  // Two kinds of card sit on this page, and the difference is the whole design:
+  //
+  //   a named person   — a human said "this is Jane". Durable: it is written to
+  //                      people.json, next to the tag sidecars.
+  //   an unnamed group — the recognition service found faces that look alike.
+  //                      Derived: recomputed from the embeddings, so it has no id
+  //                      of its own and is addressed by one of its faces.
+  //
+  // Naming a group is therefore the only edit here, and it is what turns the
+  // second kind into the first.
+  function showPeople(noHist) {
+    S.mode = "people";
+    S.personRef = null;
+    reset();
+    el.sentinel.classList.add("hidden");
+    if (!noHist) history.pushState({}, "", "#people=1");
+    el.people.classList.remove("hidden");
+    api("/api/people").then(function (d) {
+      if (S.mode !== "people") return;
+      renderPeople(d);
+    }).catch(function (e) {
+      if (S.mode !== "people") return;
+      showState("err", "Couldn't load people.", "(" + e.message + ")");
+    });
+  }
+
+  function renderPeople(d) {
+    el.people.innerHTML = "";
+    var people = d.people || [], clusters = d.clusters || [], pr = d.progress || {};
+
+    // The header goes above the grid, not in it: it is a caption for the page,
+    // and inside .people it would occupy a card slot.
+    var head = document.createElement("div");
+    head.className = "peoplehead";
+    var lead = document.createElement("span");
+    lead.className = "lead";
+    lead.textContent = "People";
+    head.appendChild(lead);
+    var bits = [people.length + " named", (d.clusters_total || clusters.length) + " unnamed"];
+    if (pr.visual) bits.push("looked at " + (pr.done || 0).toLocaleString() + "/" + pr.visual.toLocaleString());
+    if (pr.faces) bits.push(pr.faces.toLocaleString() + " faces");
+    var meta = document.createElement("span");
+    meta.textContent = bits.join(" \u00b7 ");
+    head.appendChild(meta);
+    if ((d.clusters_total || 0) > clusters.length) {
+      var more = document.createElement("span");
+      more.textContent = "showing the " + clusters.length + " largest groups";
+      head.appendChild(more);
+    }
+    el.pagehead.appendChild(head);
+    el.pagehead.classList.remove("hidden");
+
+    if (people.length === 0 && clusters.length === 0) {
+      showState("", "No faces yet.",
+        (pr.visual && pr.done < pr.visual)
+          ? "Detection runs in the background, one item at a time \u2014 this fills in as it goes."
+          : "Nothing recognisable was found. Check the recognition service is reachable (see the startup log).");
+      return;
+    }
+    people.forEach(function (p) { el.people.appendChild(peopleCard(p)); });
+    clusters.forEach(function (c) { el.people.appendChild(peopleCard(c)); });
+  }
+
+  function noFace() {
+    var d = document.createElement("div");
+    d.className = "pface noface";
+    d.textContent = "\u25cb";
+    return d;
+  }
+
+  function peopleCard(p) {
+    var card = document.createElement("div");
+    card.className = "pcard";
+    card.title = p.name ? ("Show everything with " + p.name) : "Show this group's items";
+    card.addEventListener("click", function () { showPerson(p.ref, false, p.name); });
+
+    if (p.cover_url) {
+      var img = document.createElement("img");
+      img.className = "pface";
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.alt = p.name || "unnamed face";
+      // Crops are cut on demand, so a missing one means the source frame can no
+      // longer be read — degrade to the placeholder rather than a broken image.
+      img.addEventListener("error", function () { img.replaceWith(noFace()); });
+      img.src = p.cover_url;
+      card.appendChild(img);
+    } else {
+      card.appendChild(noFace());
+    }
+
+    var nm = document.createElement("div");
+    nm.className = "pname" + (p.name ? "" : " unnamed");
+    nm.textContent = p.name || "Unnamed";
+    card.appendChild(nm);
+
+    var meta = document.createElement("div");
+    meta.className = "pmeta";
+    meta.textContent = p.items + (p.items === 1 ? " item" : " items") + " \u00b7 " + p.faces + " faces";
+    card.appendChild(meta);
+
+    var acts = document.createElement("div");
+    acts.className = "pacts";
+    var rename = document.createElement("button");
+    rename.className = "cardbtn";
+    rename.type = "button";
+    rename.textContent = p.name ? "Rename" : "Name\u2026";
+    rename.addEventListener("click", function (e) { e.stopPropagation(); namePerson(p); });
+    acts.appendChild(rename);
+    if (p.name) {
+      var forget = document.createElement("button");
+      forget.className = "cardbtn";
+      forget.type = "button";
+      forget.textContent = "Forget";
+      forget.title = "Remove the name. The faces stay, and the group can be named again.";
+      forget.addEventListener("click", function (e) { e.stopPropagation(); forgetPerson(p); });
+      acts.appendChild(forget);
+    }
+    card.appendChild(acts);
+    return card;
+  }
+
+  // Naming with a name that already exists merges into that person — which is
+  // also how you join two groups the clustering split apart, so the prompt says so.
+  function namePerson(p) {
+    var name = window.prompt(p.name
+      ? "New name for " + p.name + ":"
+      : "Who is this? (an existing name merges this group into that person)", p.name || "");
+    if (name === null) return;
+    name = name.trim();
+    if (!name) return;
+    fetch("/api/people", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ref: p.ref, name: name })
+    }).then(function (r) {
+      return r.text().then(function (body) {
+        if (!r.ok) throw new Error((body || "").trim() || ("HTTP " + r.status));
+      });
+    }).then(function () { showPeople(true); })
+      .catch(function (e) { window.alert("Couldn't save that name: " + e.message); });
+  }
+
+  function forgetPerson(p) {
+    if (!window.confirm("Forget \u201c" + p.name + "\u201d? Their faces stay and can be named again.")) return;
+    fetch("/api/people?ref=" + encodeURIComponent(p.ref), { method: "DELETE" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); })
+      .then(function () { showPeople(true); })
+      .catch(function (e) { window.alert("Couldn't forget: " + e.message); });
+  }
+
+  // One person's (or group's) items, in the normal grid — so the viewer, the
+  // arrows and the tag editor all work exactly as they do everywhere else.
+  function showPerson(ref, noHist, name) {
+    S.mode = "person";
+    S.personRef = ref;
+    reset();
+    el.sentinel.classList.add("hidden");
+    S.doneOlder = true; // one page; there is no "older" cursor to follow
+    if (!noHist) history.pushState({}, "", "#person=" + encodeURIComponent(ref));
+    renderPersonHead(ref, name);
+    api("/api/people/items?ref=" + encodeURIComponent(ref) + "&limit=300").then(function (d) {
+      if (S.mode !== "person" || S.personRef !== ref) return;
+      var batch = d.items || [];
+      batch.forEach(appendItem);
+      if (batch.length === 0) {
+        showState("", "Nothing here.", "These faces are no longer attached to any item \u2014 try reloading People.");
+      }
+    }).catch(function (e) {
+      if (S.mode !== "person" || S.personRef !== ref) return;
+      showState("err", "Couldn't load that person.", "(" + e.message + ")");
+    });
+  }
+
+  function renderPersonHead(ref, name) {
+    el.pagehead.innerHTML = "";
+    var back = document.createElement("button");
+    back.className = "cardbtn";
+    back.type = "button";
+    back.textContent = "\u2039 People";
+    back.style.marginTop = "0";
+    back.addEventListener("click", function () { showPeople(false); });
+    var title = document.createElement("span");
+    title.className = "title";
+    title.textContent = name || (ref.charAt(0) === "p" ? "Person" : "Unnamed group");
+    var sub = document.createElement("span");
+    sub.className = "sub";
+    sub.textContent = ref.charAt(0) === "p" ? "named person" : "unnamed group of faces";
+    el.pagehead.appendChild(back);
+    el.pagehead.appendChild(title);
+    el.pagehead.appendChild(sub);
+    el.pagehead.classList.remove("hidden");
+    // Deep-linked straight to a person: the name isn't in hand, so go and get it
+    // rather than leaving the heading reading "Person".
+    if (!name && ref.charAt(0) === "p") {
+      api("/api/people").then(function (d) {
+        if (S.mode !== "person" || S.personRef !== ref) return;
+        (d.people || []).forEach(function (p) { if (p.ref === ref && p.name) title.textContent = p.name; });
+      }).catch(function () {});
+    }
+  }
+
+  el.peoplebtn.addEventListener("click", function () { showPeople(false); });
+
+  el.resetFaces.addEventListener("click", function () {
+    if (!confirm("Clear every face detection and run the recognition service over the library again? Names are kept and re-attached as it goes.")) return;
+    el.facesMsg.textContent = " working\u2026";
+    fetch("/api/faces/reset", { method: "POST" })
+      .then(function (r) { if (!r.ok) throw 0; el.facesMsg.textContent = " cleared \u2014 re-detecting in the background."; })
+      .catch(function () { el.facesMsg.textContent = " failed."; });
+  });
 
   // ---- viewer ----
   function showViewer() {
@@ -1461,6 +1742,20 @@
     if (item.width && item.height && item.type !== "audio") el.card.appendChild(row("Dimensions", item.width + " \u00d7 " + item.height));
     if ((item.type === "video" || item.type === "audio") && item.duration) el.card.appendChild(row("Duration", fmtDuration(item.duration)));
     el.card.appendChild(row("Views", String(item.views || 0)));
+
+    // Who is in it. Hidden until the item fetch below says there are faces, so a
+    // library with recognition off — or a photo of a landscape — shows no
+    // empty section.
+    var facesRow = document.createElement("div");
+    facesRow.className = "row hidden";
+    var fk = document.createElement("div");
+    fk.className = "k";
+    fk.textContent = "People";
+    var fwrap = document.createElement("div");
+    fwrap.className = "facechips";
+    facesRow.appendChild(fk);
+    facesRow.appendChild(fwrap);
+    el.card.appendChild(facesRow);
     // Description (AI caption). Always shown so you can judge quality; the text
     // is refreshed from the live item fetch below, because the grid copy may
     // predate captioning and be stale/empty.
@@ -1718,6 +2013,7 @@
     api("/api/item?path=" + encodeURIComponent(item.relpath)).then(function (d) {
       if (S.viewList[S.viewIndex] !== item) return; // user moved on
       if (d.item) setDesc(d.item.description);
+      renderItemFaces(facesRow, fwrap, d.faces || []);
       (d.tags || []).forEach(function (t) {
         if (t.source === "ai") ai.push({ namespace: t.namespace, name: t.name });
         else manual.push(tagStr(t));
@@ -1768,6 +2064,35 @@
     stripSection("More like this (tags)",
       "/api/recommend?path=" + encodeURIComponent(item.relpath) + "&limit=12",
       function () { return (manual.length + ai.length) ? "No tag-based matches yet." : "Add tags to get recommendations."; });
+  }
+
+  // Face chips for the item on screen: a crop each, clicking through to that
+  // person's (or group's) items. Reads like the tag chips above it on purpose.
+  function renderItemFaces(rowEl, wrap, list) {
+    wrap.innerHTML = "";
+    if (!list.length) { rowEl.classList.add("hidden"); return; }
+    rowEl.classList.remove("hidden");
+    list.forEach(function (f) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "fchip" + (f.name ? "" : " unnamed");
+      b.title = f.name ? ("Show everything with " + f.name) : "Show the group this face belongs to";
+      if (f.cover_url) {
+        var im = document.createElement("img");
+        im.loading = "lazy";
+        im.alt = f.name || "unnamed face";
+        im.src = f.cover_url;
+        b.appendChild(im);
+      }
+      var lb = document.createElement("span");
+      lb.textContent = f.name || "unnamed";
+      b.appendChild(lb);
+      b.addEventListener("click", function () {
+        closeViewer();
+        showPerson(f.ref, false, f.name);
+      });
+      wrap.appendChild(b);
+    });
   }
 
   function closeViewer() {
@@ -1837,7 +2162,9 @@
     el.logout.classList.toggle("hidden", !S.authEnabled);
 
     var h = parseHash();
-    if (h.q) { el.q.value = h.q; applySearch(h.q, true); }
+    if (h.person) showPerson(h.person, true);
+    else if (h.people) showPeople(true);
+    else if (h.q) { el.q.value = h.q; applySearch(h.q, true); }
     else { loadInitial().then(fillViewport); }
     if (h.v) openItemByPath(h.v);
 

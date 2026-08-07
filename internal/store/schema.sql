@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS items (
     preview_ready INTEGER NOT NULL DEFAULT 0, -- 0/1; animated preview exists
     views         INTEGER NOT NULL DEFAULT 0, -- times opened in the viewer (popularity signal)
     description   TEXT,                        -- AI caption (optional); indexed into items_fts
+    faces_done    INTEGER NOT NULL DEFAULT 0, -- 0/1; face detection has run (0 faces is a valid result)
     indexed_at    INTEGER NOT NULL,           -- unix s
     seen_at       INTEGER NOT NULL,           -- unix s; last scan that saw this file
     missing_since INTEGER                     -- set when a scan stops seeing it (soft delete)
@@ -104,5 +105,31 @@ CREATE TABLE IF NOT EXISTS item_embeddings (
     dim     INTEGER NOT NULL,
     vec     BLOB    NOT NULL
 );
+
+-- A named person. DERIVED, like everything else here: the durable record of who
+-- is who is people.json next to the tag sidecars (see internal/sidecar). These
+-- rows are re-created from that file, and the name is only mirrored here so
+-- queries can join on it.
+CREATE TABLE IF NOT EXISTS people (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+
+-- One row per face found in one item, from the optional recognition service.
+-- person_id is the clustering/labelling result, NULL while a face is unnamed.
+CREATE TABLE IF NOT EXISTS faces (
+    id        INTEGER PRIMARY KEY,
+    item_id   INTEGER NOT NULL REFERENCES items(id)  ON DELETE CASCADE,
+    person_id INTEGER          REFERENCES people(id) ON DELETE SET NULL,
+    x         REAL NOT NULL,               -- box as fractions of the frame, so it
+    y         REAL NOT NULL,               -- stays valid if FACE_FRAME_PX changes
+    w         REAL NOT NULL,
+    h         REAL NOT NULL,
+    score     REAL,                        -- detector confidence
+    dim       INTEGER NOT NULL,
+    vec       BLOB    NOT NULL             -- little-endian float32s, L2-normalized
+);
+CREATE INDEX IF NOT EXISTS idx_faces_item   ON faces(item_id);
+CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(relpath, tags);

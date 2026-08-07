@@ -40,7 +40,10 @@ mediavault/
 │   ├── media/                # ffprobe (probe) + ffmpeg (thumbnail) + mime
 │   ├── sidecar/              # read/write sidecars + chain.json
 │   ├── scan/                 # THE worker pool (walk → workers → single writer)
+│   ├── face/                 # client for the optional recognition service
+│   ├── faces/                # face worker: detect, cluster, name (People page)
 │   └── server/               # minimal HTTP API
+├── facerec/                  # the recognition service itself (separate container)
 ├── Dockerfile                # multi-stage, CGO-free, ffmpeg in runtime
 ├── docker-compose.yml        # media :ro + writable data volume
 └── go.mod                    # only dep: modernc.org/sqlite (pure Go)
@@ -107,6 +110,10 @@ docker compose up --build
 | `PREVIEW_SPEED` | `1`      | Burst speed; `1` = real time, `2` = 2x (time-lapse)  |
 | `PREVIEW_QUALITY`| `55`    | WebP quality 0–100 (ignored for gif)                 |
 | `PREVIEW_MIN_DUR`| `5`     | Skip videos shorter than this (seconds)              |
+| `FACE_URL`      | *(empty)*| Face-recognition service (own container); empty disables the People page |
+| `FACE_MATCH`    | *(empty)*| Cosine threshold for "same person"; empty = use what the service advertises |
+| `FACE_FRAME_PX` | `1280`   | Frame size sent to the detector (bigger finds smaller faces) |
+| `FACE_MAX_PER_ITEM` | `20` | Keep at most this many faces per item (highest-scoring) |
 | `FFMPEG`        | `ffmpeg` | ffmpeg binary                                       |
 | `FFPROBE`       | `ffprobe`| ffprobe binary                                      |
 
@@ -237,6 +244,13 @@ with TLS.
   session (unauthenticated; reveals nothing about the library)
 - `POST /api/auth` — `{ "key": "..." }`; sets the session cookie
 - `DELETE /api/auth` — clears the session cookie on this device
+- `GET  /api/people` — named people + unnamed face groups (People page)
+- `GET  /api/people/items?ref=` — the items one person / group appears in
+- `PUT  /api/people` — `{ "ref": "f42", "name": "Jane" }` names a group (or renames
+  `"ref": "p3"`); an existing name merges
+- `DELETE /api/people?ref=p3` — forget a name (the faces stay)
+- `GET  /api/face/{id}` — cropped face thumbnail (cut on first request, then cached)
+- `POST /api/faces/reset` — clear detections and re-run the recognition service
 - `GET  /api/stats` — collection size + latest scan (drives the live UI)
 - `POST /api/scan` — trigger a rescan (returns 202; overlapping calls collapse)
 - `GET  /api/thumb/{path...}` — cached thumbnail
@@ -572,6 +586,79 @@ slow or down you simply fall back to keyword results. The background worker
 embeds captions as it goes (and backfills existing captions if you turn the
 embedding model on later); matching is a brute-force cosine scan in memory,
 reusing the vector search already in place — still no external vector DB.
+
+## People (optional, via a recognition container)
+
+Set `FACE_URL` and the header grows a **People** button: a page of everyone in
+your library, each with a face thumbnail and a count, clicking through to
+everything they appear in. The viewer's card also gains a **People** row — the
+faces found in the item on screen, each linking to that person.
+
+```yaml
+    environment:
+      - FACE_URL=http://facerec:8000
+```
+
+Recognition itself runs in a **separate container**, because face models mean
+Python, native wheels and often a GPU — none of which belongs in a static Go
+binary whose only other dependency is ffmpeg. `facerec/` is a working one (dlib,
+CPU-only); `docker compose up -d --build facerec` after uncommenting its block.
+It needs no media mount: mediavault extracts a frame with ffmpeg and posts the
+JPEG. The HTTP contract is two endpoints and is documented in
+`facerec/README.md` — implement it and you can swap in InsightFace, a GPU
+service, or a hosted API without touching mediavault.
+
+How it works:
+
+- A background worker sends one frame per item to the service (the same
+  poster-frame offset the thumbnail uses, so a video is recognised on the frame
+  you see in the grid) and stores a box plus an embedding per face. It is the
+  same shape as captioning: slow, resumable, and harmless when the service is
+  down — the startup log says so and the page just stays empty.
+- **Grouping** is greedy clustering by cosine similarity over those embeddings.
+  It errs toward splitting one person into two groups rather than merging two
+  people, because splitting is repairable in one click and merging isn't: naming
+  two groups with the same name joins them.
+- **The threshold is the whole behaviour**, and the right value belongs to the
+  model — dlib wants ≈0.82 where ArcFace wants ≈0.4 for the same photographs. So
+  the service advertises its own via `/health`, and `FACE_MATCH` overrides it if
+  you disagree. Two people merged into one group means raise it; one person in
+  four groups means lower it.
+- **Names are durable, groups are not.** A name is a human judgement, so it goes
+  in `people.json` next to the tag sidecars — the same volume, the same backup
+  story. Faces, groups and labels are cache: drop `index.db` and re-detection
+  plus that file put every name back (each person's example faces are matched
+  again, and everyone who looks like them is relabelled). Back up `people.json`
+  along with your sidecars; the database you don't need to.
+- **Forget** removes a name but keeps the faces, so the group is offered again.
+- Face crops are cut on first view into `DATA_DIR/faces`; delete that directory
+  and they are re-cut on demand.
+
+`people.json` is a plain file you can read and repair by hand:
+
+```json
+{
+  "people": [
+    { "name": "Jane",
+      "faces": [ { "path": "2019/beach/img_0042.jpg", "box": [0.31, 0.12, 0.18, 0.24] } ] }
+  ]
+}
+```
+
+`box` is `[x, y, w, h]` as fractions of the frame, so it survives a change of
+`FACE_FRAME_PX`. Removing a person from this file removes them from the app on
+the next pass; up to 32 example faces are kept per person (64 after a merge),
+which is what re-attaches a name after a cache rebuild — anyone beyond that is
+re-labelled by resemblance to the examples instead.
+
+Changed the recognition model? Embeddings from different models aren't
+comparable, so use **Re-detect all faces** in the search-help panel (or
+`POST /api/faces/reset`). Names are kept and re-attached as detection catches up.
+
+Not built, and worth knowing before you rely on this: there is no way to say
+"this face is not that person" — a wrong grouping can only be dissolved with
+**Forget** and renamed. Person names are also not folded into the search box; use
+the People page (or add a `person:jane` tag yourself if you want that).
 
 ## Regenerating captions
 
