@@ -57,6 +57,10 @@ services:
   # Commented out because it is opt-in and the first build compiles dlib (5-15
   # minutes). To enable: uncomment this block AND FACE_URL above, then
   #   docker compose up -d --build
+  #
+  # `build:` only works from a clone. A TrueNAS custom app has no checkout to
+  # build from, so build the image first and use `image:` instead — see
+  # facerec/README.md, "Running it as a TrueNAS custom app".
   # facerec:
   #   build: ./facerec
   #   restart: unless-stopped
