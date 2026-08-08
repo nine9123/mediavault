@@ -925,12 +925,24 @@
     }).finally(function () { S.busyOlder = false; });
   }
 
+  // The next page of whichever list the grid is showing. Browse and a person's
+  // items page the same way — newest first, "before=<smallest id shown>" — so
+  // the observer, the scroll backstop and the viewer's next arrow all drive this
+  // one function regardless of which of the two is on screen.
   function loadOlder() {
-    if (S.mode !== "browse" || S.busyOlder || S.doneOlder || S.minId === null) return null;
+    if (S.busyOlder || S.doneOlder || S.minId === null) return null;
+    var url;
+    if (S.mode === "browse") url = "/api/items?before=" + S.minId + "&limit=" + PAGE;
+    else if (S.mode === "person") url = personItemsURL(S.personRef, S.minId);
+    else return null;
+    var mode = S.mode, ref = S.personRef;
     S.busyOlder = true;
     el.sentinel.classList.remove("hidden");
     el.sentinel.textContent = "loading";
-    return api("/api/items?before=" + S.minId + "&limit=" + PAGE).then(function (d) {
+    return api(url).then(function (d) {
+      // The page may have been left (or a different person opened) while this
+      // was in flight; those items belong to a grid that no longer exists.
+      if (S.mode !== mode || S.personRef !== ref) return;
       var batch = d.items || [];
       batch.forEach(appendItem);
       if (batch.length < PAGE) S.doneOlder = true;
@@ -944,7 +956,7 @@
   // exhausted, or a load makes no progress (e.g. a failed request), so it never
   // busy-loops.
   function fillViewport() {
-    if (S.mode !== "browse" || S.doneOlder) return;
+    if ((S.mode !== "browse" && S.mode !== "person") || S.doneOlder) return;
     if (document.body.scrollHeight > window.innerHeight + 1000) return;
     var before = S.items.length;
     var p = loadOlder();
@@ -1612,27 +1624,43 @@
       .catch(function (e) { window.alert("Couldn't forget: " + e.message); });
   }
 
+  function personItemsURL(ref, before) {
+    var u = "/api/people/items?ref=" + encodeURIComponent(ref) + "&limit=" + PAGE;
+    if (before !== null && before !== undefined) u += "&before=" + before;
+    return u;
+  }
+
   // One person's (or group's) items, in the normal grid — so the viewer, the
-  // arrows and the tag editor all work exactly as they do everywhere else.
+  // arrows and the tag editor all work exactly as they do everywhere else. Paged
+  // like the grid too: somebody who appears in thousands of items gets the same
+  // infinite scroll as browse, not one truncated page.
   function showPerson(ref, noHist, name) {
     S.mode = "person";
     S.personRef = ref;
     S.mergeFrom = null; // leaving the page abandons a half-finished merge
     reset();
-    el.sentinel.classList.add("hidden");
-    S.doneOlder = true; // one page; there is no "older" cursor to follow
     if (!noHist) history.pushState({}, "", "#person=" + encodeURIComponent(ref));
     renderPersonHead(ref, name);
-    api("/api/people/items?ref=" + encodeURIComponent(ref) + "&limit=300").then(function (d) {
+    S.busyOlder = true; // hold the observer off until the first page has landed
+    el.sentinel.classList.remove("hidden");
+    el.sentinel.textContent = "loading";
+    api(personItemsURL(ref, null)).then(function (d) {
       if (S.mode !== "person" || S.personRef !== ref) return;
       var batch = d.items || [];
       batch.forEach(appendItem);
+      if (batch.length < PAGE) S.doneOlder = true;
+      el.sentinel.classList.toggle("hidden", S.doneOlder);
       if (batch.length === 0) {
         showState("", "Nothing here.", "These faces are no longer attached to any item \u2014 try reloading People.");
       }
     }).catch(function (e) {
       if (S.mode !== "person" || S.personRef !== ref) return;
+      S.doneOlder = true;
+      el.sentinel.classList.add("hidden");
       showState("err", "Couldn't load that person.", "(" + e.message + ")");
+    }).finally(function () {
+      S.busyOlder = false;
+      if (S.mode === "person" && S.personRef === ref) fillViewport();
     });
   }
 

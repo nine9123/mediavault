@@ -560,13 +560,20 @@ func (s *Store) ListPeople(ctx context.Context) ([]Person, error) {
 }
 
 // ItemsForPerson returns the items a named person appears in, newest first.
-func (s *Store) ItemsForPerson(ctx context.Context, personID int64, limit int) ([]model.Item, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+prefixCols("i")+` FROM items i
+// beforeID pages: pass the smallest id already shown to get the next page, or 0
+// for the first one (the same cursor ItemsOlder takes).
+func (s *Store) ItemsForPerson(ctx context.Context, personID, beforeID int64, limit int) ([]model.Item, error) {
+	q := `SELECT ` + prefixCols("i") + ` FROM items i
 		 JOIN faces f ON f.item_id = i.id
-		 WHERE f.person_id = ? AND i.missing_since IS NULL
-		 GROUP BY i.id
-		 ORDER BY i.id DESC LIMIT ?`, personID, limit)
+		 WHERE f.person_id = ? AND i.missing_since IS NULL`
+	args := []any{personID}
+	if beforeID > 0 {
+		q += ` AND i.id < ?`
+		args = append(args, beforeID)
+	}
+	q += ` GROUP BY i.id ORDER BY i.id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -575,24 +582,28 @@ func (s *Store) ItemsForPerson(ctx context.Context, personID int64, limit int) (
 }
 
 // ItemsForFaces returns the items a given set of faces belongs to, newest first.
-// Used for an unnamed cluster, which has no id to join on.
-func (s *Store) ItemsForFaces(ctx context.Context, faceIDs []int64, limit int) ([]model.Item, error) {
+// Used for an unnamed cluster, which has no id to join on. beforeID pages the
+// same way ItemsForPerson does.
+func (s *Store) ItemsForFaces(ctx context.Context, faceIDs []int64, beforeID int64, limit int) ([]model.Item, error) {
 	if len(faceIDs) == 0 {
 		return nil, nil
 	}
 	ph := make([]string, len(faceIDs))
-	args := make([]any, 0, len(faceIDs)+1)
+	args := make([]any, 0, len(faceIDs)+2)
 	for i, id := range faceIDs {
 		ph[i] = "?"
 		args = append(args, id)
 	}
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+prefixCols("i")+` FROM items i
+	q := `SELECT ` + prefixCols("i") + ` FROM items i
 		 JOIN faces f ON f.item_id = i.id
-		 WHERE f.id IN (`+strings.Join(ph, ",")+`) AND i.missing_since IS NULL
-		 GROUP BY i.id
-		 ORDER BY i.id DESC LIMIT ?`, args...)
+		 WHERE f.id IN (` + strings.Join(ph, ",") + `) AND i.missing_since IS NULL`
+	if beforeID > 0 {
+		q += ` AND i.id < ?`
+		args = append(args, beforeID)
+	}
+	q += ` GROUP BY i.id ORDER BY i.id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

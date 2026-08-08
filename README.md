@@ -245,7 +245,8 @@ with TLS.
 - `POST /api/auth` — `{ "key": "..." }`; sets the session cookie
 - `DELETE /api/auth` — clears the session cookie on this device
 - `GET  /api/people` — named people + unnamed face groups (People page)
-- `GET  /api/people/items?ref=` — the items one person / group appears in
+- `GET  /api/people/items?ref=` — the items one person / group appears in, newest
+  first; pages with `&before=<id>` exactly like `/api/items`
 - `PUT  /api/people` — `{ "ref": "f42", "name": "Jane" }` names a group (or renames
   `"ref": "p3"`); an existing name merges
 - `DELETE /api/people?ref=p3` — forget a name (the faces stay)
