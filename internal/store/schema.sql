@@ -142,4 +142,15 @@ CREATE TABLE IF NOT EXISTS face_group_match (
     match   REAL NOT NULL              -- cosine threshold, below the global one
 );
 
+-- Manual joins: "whatever the embeddings think, these groups are one person".
+-- Every face of every group in one merge carries the same merge_id, so the join
+-- survives the grouping underneath shifting as detection continues — a group has
+-- no id to record instead. Cache, like face_group_match: a merge is a step
+-- towards naming the group, and the name is what reaches people.json.
+CREATE TABLE IF NOT EXISTS face_group_merge (
+    face_id  INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
+    merge_id INTEGER NOT NULL          -- shared by every face in the merge
+);
+CREATE INDEX IF NOT EXISTS idx_face_group_merge ON face_group_merge(merge_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(relpath, tags);

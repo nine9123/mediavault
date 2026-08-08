@@ -385,6 +385,8 @@
   .people{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;padding:6px 0 24px}
   .pcard{display:flex;flex-direction:column;gap:8px;background:var(--ink-raised);border:1px solid var(--ink-line);padding:10px;cursor:pointer}
   .pcard:hover{border-color:var(--ink-line-2)}
+  /* The group picked for a merge, while the page waits for the other one. */
+  .pcard.mergepick{border-color:var(--brass)}
   .pcard .pface{width:100%;aspect-ratio:1/1;object-fit:cover;display:block;background:var(--ink);border:1px solid var(--ink-line)}
   .pcard .pface.noface{display:flex;align-items:center;justify-content:center;font-size:2rem;color:var(--bone-faint)}
   .pcard .pname{font-family:var(--mono);font-size:12.5px;color:var(--bone);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -394,6 +396,7 @@
   .pcard .pacts .cardbtn{margin-top:0}
   .peoplehead{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;padding:10px 0 4px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--bone-faint)}
   .peoplehead .lead{color:var(--brass);letter-spacing:.2em}
+  .peoplehead .mergebar{color:var(--brass)}
   .pagehead{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 2px 12px;font-family:var(--mono)}
   .pagehead .title{font-size:13px;letter-spacing:.06em;color:var(--bone)}
   .pagehead .sub{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--bone-faint)}
@@ -501,6 +504,7 @@
     query: "",
     personRef: null,  // "p<id>" (named person) or "f<face id>" (unnamed group)
     facesOn: false,   // a recognition service is configured (from /api/stats)
+    mergeFrom: null,  // group picked for merging, waiting for the one to join it to
     items: [],        // display order: newest id first
     maxId: null,      // highest id loaded (top of grid)
     minId: null,      // lowest id loaded (bottom of grid)
@@ -1326,6 +1330,17 @@
       more.textContent = "showing the " + clusters.length + " largest groups";
       head.appendChild(more);
     }
+    // A merge takes two clicks on two different cards, so between them the page
+    // has to say what it is waiting for — and offer a way out that isn't guessing
+    // which card the first click landed on.
+    if (S.mergeFrom && !clusters.some(function (c) { return c.ref === S.mergeFrom; })) S.mergeFrom = null;
+    if (S.mergeFrom) {
+      var bar = document.createElement("span");
+      bar.className = "mergebar";
+      bar.textContent = "merging — pick the group that is the same person";
+      head.appendChild(bar);
+      head.appendChild(backBtn("Cancel", function () { S.mergeFrom = null; showPeople(true); }));
+    }
     el.pagehead.appendChild(head);
     el.pagehead.classList.remove("hidden");
 
@@ -1361,6 +1376,7 @@
   }
 
   function showBrowse() {
+    S.mergeFrom = null;
     history.pushState({}, "", baseURL());
     el.q.value = "";
     applySearch("", true);
@@ -1398,10 +1414,22 @@
     // A widened group is grouped at its own number, so say which \u2014 otherwise the
     // only sign that this group behaves differently is that it got bigger.
     if (p.match) meta.textContent += " \u00b7 match " + p.match.toFixed(2);
+    // Merged by hand, so the counts are not something the model would agree with.
+    if (p.merged) meta.textContent += " \u00b7 merged";
     card.appendChild(meta);
 
     var acts = document.createElement("div");
     acts.className = "pacts";
+
+    // Mid-merge, an unnamed card has exactly one thing it can do, and showing
+    // anything else invites a click that quietly abandons the merge.
+    if (S.mergeFrom && !p.name) {
+      if (S.mergeFrom === p.ref) card.classList.add("mergepick");
+      acts.appendChild(mergeBtn(p));
+      card.appendChild(acts);
+      return card;
+    }
+
     var rename = document.createElement("button");
     rename.className = "cardbtn";
     rename.type = "button";
@@ -1427,6 +1455,16 @@
       wider.title = "Same person in two groups? Lower the match for this one group by 0.1 and re-check just here — nothing is re-detected, and the rest of the page is unaffected.";
       wider.addEventListener("click", function (e) { e.stopPropagation(); widenGroup(p); });
       acts.appendChild(wider);
+      acts.appendChild(mergeBtn(p));
+      if (p.merged) {
+        var unmerge = document.createElement("button");
+        unmerge.className = "cardbtn";
+        unmerge.type = "button";
+        unmerge.textContent = "Unmerge";
+        unmerge.title = "Undo the merges on this group and hand the faces back to the grouping.";
+        unmerge.addEventListener("click", function (e) { e.stopPropagation(); unmergeGroup(p); });
+        acts.appendChild(unmerge);
+      }
       if (p.match) {
         var narrower = document.createElement("button");
         narrower.className = "cardbtn";
@@ -1439,6 +1477,72 @@
     }
     card.appendChild(acts);
     return card;
+  }
+
+  // The one button on an unnamed card that changes with the merge in progress:
+  // start one, cancel it, or be the group it lands on. Three labels rather than
+  // three buttons, because at any moment only one of them is the thing to click.
+  function mergeBtn(p) {
+    var b = document.createElement("button");
+    b.className = "cardbtn";
+    b.type = "button";
+    if (S.mergeFrom === p.ref) {
+      b.textContent = "Cancel";
+      b.title = "Stop merging and leave this group alone.";
+      b.addEventListener("click", function (e) {
+        e.stopPropagation();
+        S.mergeFrom = null;
+        showPeople(true);
+      });
+    } else if (S.mergeFrom) {
+      var from = S.mergeFrom;
+      b.textContent = "Merge here";
+      b.title = "Join the picked group to this one. Nothing is compared — you said they are the same person.";
+      b.addEventListener("click", function (e) { e.stopPropagation(); mergeGroups(from, p.ref); });
+    } else {
+      b.textContent = "Merge…";
+      b.title = "The same person, and widening won't reach? Pick this group, then click “Merge here” on the other one.";
+      b.addEventListener("click", function (e) {
+        e.stopPropagation();
+        S.mergeFrom = p.ref;
+        showPeople(true);
+      });
+    }
+    return b;
+  }
+
+  // "I can see it's the same person." Widening puts the question back to the
+  // embeddings and can only reach so far; merging doesn't ask them at all, and is
+  // applied after grouping, so nothing else on the page can move as a result.
+  function mergeGroups(fromRef, intoRef) {
+    fetch("/api/people/merge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ref: fromRef, into: intoRef })
+    }).then(function (r) {
+      return r.text().then(function (body) {
+        if (!r.ok) throw new Error((body || "").trim() || ("HTTP " + r.status));
+        return JSON.parse(body || "{}");
+      });
+    }).then(function (d) {
+      S.mergeFrom = null;
+      showPeople(true);
+      // The merged group sorts by size, so it may not be where either half was —
+      // saying how big it got is how you know which card is yours.
+      window.alert("Merged — " + d.faces + " faces in " + d.items + (d.items === 1 ? " item" : " items") +
+        ".\nName it to make it permanent; “Unmerge” puts it back.");
+    }).catch(function (e) {
+      S.mergeFrom = null;
+      showPeople(true);
+      window.alert("Couldn't merge those groups: " + e.message);
+    });
+  }
+
+  function unmergeGroup(p) {
+    fetch("/api/people/merge?ref=" + encodeURIComponent(p.ref), { method: "DELETE" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); })
+      .then(function () { showPeople(true); })
+      .catch(function (e) { window.alert("Couldn't unmerge that group: " + e.message); });
   }
 
   // Naming with a name that already exists merges into that person — which is
@@ -1484,7 +1588,7 @@
       // hearing about while "Reset match" is still the obvious next click.
       if (!d.absorbed) {
         window.alert("Nothing new joined at match " + (d.match || 0).toFixed(2) +
-          ".\nWiden again, or name both groups the same thing to merge them.");
+          ".\nWiden again, or use “Merge…” to join the other group by hand.");
       } else {
         window.alert(d.absorbed + (d.absorbed === 1 ? " group joined" : " groups joined") +
           " at match " + (d.match || 0).toFixed(2) + ", giving " + d.faces + " faces." +
@@ -1513,6 +1617,7 @@
   function showPerson(ref, noHist, name) {
     S.mode = "person";
     S.personRef = ref;
+    S.mergeFrom = null; // leaving the page abandons a half-finished merge
     reset();
     el.sentinel.classList.add("hidden");
     S.doneOlder = true; // one page; there is no "older" cursor to follow

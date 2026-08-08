@@ -215,6 +215,16 @@ func (s *Store) ensureColumns() error {
 	)`); err != nil {
 		return fmt.Errorf("create face_group_match: %w", err)
 	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS face_group_merge (
+		face_id  INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
+		merge_id INTEGER NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create face_group_merge: %w", err)
+	}
+	if _, err := s.db.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_face_group_merge ON face_group_merge(merge_id)`); err != nil {
+		return fmt.Errorf("index face_group_merge: %w", err)
+	}
 	return nil
 }
 

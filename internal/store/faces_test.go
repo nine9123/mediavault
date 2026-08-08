@@ -27,7 +27,7 @@ func TestClusterUnnamedGroupsAlikeFacesAndSeparatesOthers(t *testing.T) {
 		face(5, 14, unitVec(0.02, 0.98, 0, 0)),
 		face(6, 15, unitVec(0, 0, 1, 0)),
 	}
-	got := ClusterUnnamed(faces, 0.8, nil)
+	got := ClusterUnnamed(faces, 0.8, Grouping{})
 	if len(got) != 3 {
 		t.Fatalf("got %d groups, want 3: %+v", len(got), got)
 	}
@@ -54,10 +54,10 @@ func TestClusterUnnamedRespectsTheThreshold(t *testing.T) {
 		face(1, 10, unitVec(1, 0, 0, 0)),
 		face(2, 11, unitVec(1, 1, 0, 0)), // cosine 0.707 from face 1
 	}
-	if got := ClusterUnnamed(faces, 0.6, nil); len(got) != 1 {
+	if got := ClusterUnnamed(faces, 0.6, Grouping{}); len(got) != 1 {
 		t.Errorf("threshold 0.6: got %d groups, want them merged", len(got))
 	}
-	if got := ClusterUnnamed(faces, 0.9, nil); len(got) != 2 {
+	if got := ClusterUnnamed(faces, 0.9, Grouping{}); len(got) != 2 {
 		t.Errorf("threshold 0.9: got %d groups, want them apart", len(got))
 	}
 }
@@ -69,7 +69,7 @@ func TestClusterUnnamedSkipsNamedFaces(t *testing.T) {
 		face(3, 12, unitVec(1, 0, 0, 0)),
 	}
 	faces[0].PersonID, faces[0].PersonName = 7, "Jane"
-	got := ClusterUnnamed(faces, 0.8, nil)
+	got := ClusterUnnamed(faces, 0.8, Grouping{})
 	if len(got) != 1 {
 		t.Fatalf("got %d groups, want 1", len(got))
 	}
@@ -86,13 +86,13 @@ func TestClusterUnnamedPicksTheBestCover(t *testing.T) {
 		face(2, 11, unitVec(1, 0, 0, 0)),
 	}
 	faces[1].W, faces[1].H = 0.5, 0.5
-	got := ClusterUnnamed(faces, 0.8, nil)
+	got := ClusterUnnamed(faces, 0.8, Grouping{})
 	if len(got) != 1 || got[0].CoverFaceID != 2 {
 		t.Errorf("cover = %+v, want the bigger face 2", got)
 	}
 	// A real confidence beats size.
 	faces[0].Score = 2
-	got = ClusterUnnamed(faces, 0.8, nil)
+	got = ClusterUnnamed(faces, 0.8, Grouping{})
 	if got[0].CoverFaceID != 1 {
 		t.Errorf("cover = %d, want the higher-scoring face 1", got[0].CoverFaceID)
 	}
@@ -105,7 +105,7 @@ func TestClusterUnnamedNeverMixesDimensions(t *testing.T) {
 		face(1, 10, unitVec(1, 0, 0, 0)),
 		face(2, 11, []float32{1, 0}),
 	}
-	if got := ClusterUnnamed(faces, 0.1, nil); len(got) != 2 {
+	if got := ClusterUnnamed(faces, 0.1, Grouping{}); len(got) != 2 {
 		t.Errorf("got %d groups, want vectors of different dimension kept apart", len(got))
 	}
 }
@@ -131,7 +131,7 @@ func TestWidenJoinsASplitGroupFromEitherHalf(t *testing.T) {
 	// faces — widening the second half would silently do nothing.
 	for _, key := range []int64{1, 3} {
 		faces := split()
-		got := ClusterUnnamed(faces, 0.8, Widened{key: 0.7})
+		got := ClusterUnnamed(faces, 0.8, Grouping{Widened: Widened{key: 0.7}})
 		if len(got) != 3 {
 			t.Fatalf("widening on face %d: got %d groups, want 3 (the joined pair + the other two)", key, len(got))
 		}
@@ -151,10 +151,10 @@ func TestWidenJoinsASplitGroupFromEitherHalf(t *testing.T) {
 // else stays grouped the way they were.
 func TestWidenLeavesEveryOtherGroupAlone(t *testing.T) {
 	faces := split()
-	if got := ClusterUnnamed(faces, 0.8, nil); len(got) != 4 {
+	if got := ClusterUnnamed(faces, 0.8, Grouping{}); len(got) != 4 {
 		t.Fatalf("baseline: got %d groups, want 4", len(got))
 	}
-	got := ClusterUnnamed(faces, 0.8, Widened{1: 0.7})
+	got := ClusterUnnamed(faces, 0.8, Grouping{Widened: Widened{1: 0.7}})
 	if len(got) != 3 {
 		t.Fatalf("got %d groups, want 3", len(got))
 	}
@@ -168,7 +168,7 @@ func TestWidenLeavesEveryOtherGroupAlone(t *testing.T) {
 	}
 	// The same faces at a library-wide 0.7 would join the second person too —
 	// which is exactly the collateral damage widening avoids.
-	if all := ClusterUnnamed(faces, 0.7, nil); len(all) != 2 {
+	if all := ClusterUnnamed(faces, 0.7, Grouping{}); len(all) != 2 {
 		t.Errorf("sanity: at a global 0.7 got %d groups, want both pairs joined", len(all))
 	}
 }
@@ -190,15 +190,15 @@ func TestWidenComparesGroupsInFaceSimilarity(t *testing.T) {
 		face(3, 12, unitVec(0.92718, 0.37461, 0, 0)),
 		face(4, 13, unitVec(0.72, 0, 0.69397, 0)),
 	}
-	if got := ClusterUnnamed(faces, 0.8, nil); len(got) != 2 {
+	if got := ClusterUnnamed(faces, 0.8, Grouping{}); len(got) != 2 {
 		t.Fatalf("baseline: got %d groups, want the three-face group and the lone face", len(got))
 	}
 	// 0.72 to the centroid, but 0.685 to the faces: widening to 0.7 must not
 	// reach it, or the number on the card is not the number being applied.
-	if got := ClusterUnnamed(faces, 0.8, Widened{1: 0.7}); len(got) != 2 {
+	if got := ClusterUnnamed(faces, 0.8, Grouping{Widened: Widened{1: 0.7}}); len(got) != 2 {
 		t.Errorf("widening to 0.7 pulled in a group only 0.685 alike: got %d groups, want 2", len(got))
 	}
-	if got := ClusterUnnamed(faces, 0.8, Widened{1: 0.68}); len(got) != 1 {
+	if got := ClusterUnnamed(faces, 0.8, Grouping{Widened: Widened{1: 0.68}}); len(got) != 1 {
 		t.Errorf("widening to 0.68 left a group 0.685 alike out: got %d groups, want 1", len(got))
 	}
 }
@@ -240,14 +240,14 @@ func library(seed int64, people, perPerson, dim int) []Face {
 // returned a single group.
 func TestWidenDoesNotSwallowTheLibrary(t *testing.T) {
 	faces := library(1, 60, 4, 32)
-	base := ClusterUnnamed(faces, 0.5, nil)
+	base := ClusterUnnamed(faces, 0.5, Grouping{})
 	if len(base) < 20 {
 		t.Fatalf("fixture: %d groups, want a library with plenty of groups to swallow", len(base))
 	}
 	// The biggest group and a middling one: the bug got worse the bigger the
 	// group, but was never confined to big ones.
 	for _, c := range []FaceCluster{base[0], base[len(base)/2]} {
-		got := ClusterUnnamed(faces, 0.5, Widened{c.KeyFaceID: 0.4})
+		got := ClusterUnnamed(faces, 0.5, Grouping{Widened: Widened{c.KeyFaceID: 0.4}})
 		widest := 0
 		for _, g := range got {
 			if g.Match < 0.5 && g.Faces > widest {
@@ -267,7 +267,7 @@ func TestWidenDoesNotSwallowTheLibrary(t *testing.T) {
 
 func TestWidenIgnoresOverridesOnFacesThatAreGone(t *testing.T) {
 	faces := split()
-	got := ClusterUnnamed(faces, 0.8, Widened{99: 0.1})
+	got := ClusterUnnamed(faces, 0.8, Grouping{Widened: Widened{99: 0.1}})
 	if len(got) != 4 {
 		t.Errorf("got %d groups, want the ungrouped 4: an override on an unknown face means nothing", len(got))
 	}
@@ -277,9 +277,101 @@ func TestWidenIgnoresOverridesOnFacesThatAreGone(t *testing.T) {
 // subset the library-wide threshold would have found.
 func TestClusterContainingFollowsAWidening(t *testing.T) {
 	faces := split()
-	got := ClusterContaining(faces, 0.8, Widened{3: 0.7}, 3)
+	got := ClusterContaining(faces, 0.8, Grouping{Widened: Widened{3: 0.7}}, 3)
 	if len(got) != 4 {
 		t.Errorf("got %v, want all four faces of the widened group", got)
+	}
+}
+
+// The case merging exists for, and the one widening cannot reach: two groups a
+// user says are one person, however far apart the embeddings put them. Faces 1
+// and 5 here are orthogonal — no threshold above nothing would join them — and
+// the second person is left where they were.
+func TestMergeJoinsGroupsNoThresholdWould(t *testing.T) {
+	faces := split()
+	got := ClusterUnnamed(faces, 0.8, Grouping{Merged: Merged{1: 1, 2: 1, 5: 1}})
+	if len(got) != 3 {
+		t.Fatalf("got %d groups, want 3 (the merged pair + the two untouched)", len(got))
+	}
+	if got[0].Faces != 3 || got[0].KeyFaceID != 1 {
+		t.Errorf("merged group = %+v, want faces 1, 2 and 5 keyed on face 1", got[0])
+	}
+	if !got[0].Merged {
+		t.Errorf("merged group = %+v, want it to report that it was merged by hand", got[0])
+	}
+	// Merging is not a widening: the group is still grouped at the library's
+	// number, and the card must not claim otherwise.
+	if got[0].Match != 0.8 {
+		t.Errorf("merged group reports match %v, want the library's 0.8", got[0].Match)
+	}
+	for _, c := range got[1:] {
+		if c.Merged {
+			t.Errorf("untouched group %+v reports a merge", c)
+		}
+	}
+}
+
+// Two independent merges stay independent...
+func TestMergeKeepsSeparateMergesSeparate(t *testing.T) {
+	faces := split()
+	got := ClusterUnnamed(faces, 0.8, Grouping{Merged: Merged{1: 1, 2: 1, 3: 1, 4: 1, 5: 5, 6: 5}})
+	if len(got) != 2 {
+		t.Fatalf("got %d groups, want one per merge", len(got))
+	}
+	if got[0].Faces != 4 || got[1].Faces != 2 {
+		t.Errorf("groups = %+v, want the two merges intact and unjoined", got)
+	}
+}
+
+// ...until a group carries both, which is how a merge chains onto another one.
+// The store folds ids together when it can, but it cannot when the grouping
+// underneath moves — and it does, as detection keeps finding faces. So the pass
+// has to union whole groups rather than bucket faces by merge id.
+func TestMergeChainsThroughAGroupInTwoMerges(t *testing.T) {
+	faces := split()
+	// Face 4 was merged with 5 and 6, and its group-mate face 3 with 1 and 2.
+	got := ClusterUnnamed(faces, 0.8, Grouping{Merged: Merged{1: 1, 2: 1, 3: 1, 4: 5, 5: 5, 6: 5}})
+	if len(got) != 1 {
+		t.Fatalf("got %d groups, want the chain collapsed into one", len(got))
+	}
+	if got[0].Faces != 6 || got[0].KeyFaceID != 1 {
+		t.Errorf("group = %+v, want all six faces keyed on face 1", got[0])
+	}
+}
+
+// A merge on a face that is gone (or has since been named) means nothing, the
+// same way a widening on one does.
+func TestMergeIgnoresRowsOnFacesThatAreGone(t *testing.T) {
+	faces := split()
+	got := ClusterUnnamed(faces, 0.8, Grouping{Merged: Merged{1: 1, 99: 1}})
+	if len(got) != 4 {
+		t.Errorf("got %d groups, want the ungrouped 4: one live face in a merge joins nothing", len(got))
+	}
+}
+
+// A widening and a merge on the same page have to compose: the merge takes the
+// halves as widening left them, rather than one correction undoing the other.
+func TestMergeAppliesOnTopOfAWidening(t *testing.T) {
+	faces := split()
+	manual := Grouping{Widened: Widened{1: 0.7}, Merged: Merged{1: 1, 5: 1}}
+	got := ClusterUnnamed(faces, 0.8, manual)
+	if len(got) != 2 {
+		t.Fatalf("got %d groups, want the widened-and-merged group plus face 6", len(got))
+	}
+	if got[0].Faces != 5 || got[0].KeyFaceID != 1 {
+		t.Errorf("group = %+v, want the four widened faces plus the merged one", got[0])
+	}
+	if got[0].Match != 0.7 || !got[0].Merged {
+		t.Errorf("group = %+v, want it to report both the widening and the merge", got[0])
+	}
+}
+
+// Naming a merged group has to label everything the card claimed was in it.
+func TestClusterContainingFollowsAMerge(t *testing.T) {
+	faces := split()
+	got := ClusterContaining(faces, 0.8, Grouping{Merged: Merged{1: 1, 5: 1}}, 5)
+	if len(got) != 3 {
+		t.Errorf("got %v, want all three faces of the merged group from either side", got)
 	}
 }
 
@@ -289,15 +381,15 @@ func TestClusterContaining(t *testing.T) {
 		face(2, 11, unitVec(0.99, 0.01, 0, 0)),
 		face(3, 12, unitVec(0, 1, 0, 0)),
 	}
-	got := ClusterContaining(faces, 0.8, nil, 2)
+	got := ClusterContaining(faces, 0.8, Grouping{}, 2)
 	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
 		t.Errorf("got %v, want the group [1 2] that face 2 belongs to", got)
 	}
-	if got := ClusterContaining(faces, 0.8, nil, 99); got != nil {
+	if got := ClusterContaining(faces, 0.8, Grouping{}, 99); got != nil {
 		t.Errorf("unknown face returned %v, want nil", got)
 	}
 	faces[0].PersonID = 5
-	if got := ClusterContaining(faces, 0.8, nil, 1); got != nil {
+	if got := ClusterContaining(faces, 0.8, Grouping{}, 1); got != nil {
 		t.Errorf("an already-named face returned %v, want nil", got)
 	}
 }

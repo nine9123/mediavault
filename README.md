@@ -253,6 +253,10 @@ with TLS.
   0.1 (`"step"` overrides) and re-groups just there, pulling in a group that was
   the same person. Nothing is re-detected
 - `DELETE /api/people/regroup?ref=f42` — put that group back under the global match
+- `POST /api/people/merge` — `{ "ref": "f42", "into": "f77" }` joins two unnamed
+  groups by hand, however far apart the embeddings put them. Nothing is compared
+  and no other group moves
+- `DELETE /api/people/merge?ref=f42` — undo the merges on that group
 - `GET  /api/face/{id}` — cropped face thumbnail (cut on first request, then cached)
 - `POST /api/faces/reset` — clear detections and re-run the recognition service
 - `GET  /api/stats` — collection size + latest scan (drives the live UI)
@@ -623,8 +627,9 @@ How it works:
   down — the startup log says so and the page just stays empty.
 - **Grouping** is greedy clustering by cosine similarity over those embeddings.
   It errs toward splitting one person into two groups rather than merging two
-  people, because splitting is repairable in one click and merging isn't: naming
-  two groups with the same name joins them.
+  people, because splitting is repairable in one click and merging isn't:
+  **Merge** joins two groups, and naming both the same name does too, but there
+  is no equivalent for pulling a group that swallowed a stranger apart.
 - **The threshold is the whole behaviour**, and the right value belongs to the
   model — dlib wants ≈0.82 where ArcFace wants ≈0.4 for the same photographs. So
   the service advertises its own via `/health`, and `FACE_MATCH` overrides it if
@@ -643,6 +648,15 @@ How it works:
   the groups it is actually that alike to join it.
   The widening is cache like the grouping it produces; naming the joined group is
   what makes the judgement durable.
+- **Merge** is for when widening can't reach. Widening is still a question put to
+  the model, and sometimes the answer stays no: the same face twenty years and
+  two haircuts apart is genuinely not close in the embedding, and each further
+  click of **Widen** is a bigger bet on the rest of the page. **Merge…** on a
+  card picks it, **Merge here** on another joins the two, and that is all it is —
+  no threshold, no comparison, and it is applied after grouping, so no group you
+  didn't point at can move. Merge a third group into the result and you get one
+  group of three, not two overlapping pairs. **Unmerge** hands the faces back to
+  the grouping. Cache, like a widening: name the group to make it durable.
 - **Names are durable, groups are not.** A name is a human judgement, so it goes
   in `people.json` next to the tag sidecars — the same volume, the same backup
   story. Faces, groups and labels are cache: drop `index.db` and re-detection

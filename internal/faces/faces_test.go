@@ -100,7 +100,7 @@ func TestNamingAGroupLabelsItAndRecordsItOnDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	group := pick(t, all, store.ClusterContaining(all, rec.Match(), nil, all[0].ID))
+	group := pick(t, all, store.ClusterContaining(all, rec.Match(), store.Grouping{}, all[0].ID))
 	if len(group) != 2 {
 		t.Fatalf("the group has %d faces, want the two alike ones", len(group))
 	}
@@ -154,7 +154,7 @@ func TestNamesSurviveLosingTheCache(t *testing.T) {
 	}
 	detected(t, st, first)
 	all, _ := st.AllFaces(ctx)
-	if _, err := rec.Name(ctx, "Jane", pick(t, all, store.ClusterContaining(all, rec.Match(), nil, all[0].ID))); err != nil {
+	if _, err := rec.Name(ctx, "Jane", pick(t, all, store.ClusterContaining(all, rec.Match(), store.Grouping{}, all[0].ID))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -268,7 +268,7 @@ func TestForgetKeepsTheFacesButDropsTheName(t *testing.T) {
 		t.Errorf("people.json still holds %+v", doc.People)
 	}
 	// And the group is offered again, so it can be named differently.
-	if groups := store.ClusterUnnamed(after, rec.Match(), nil); len(groups) != 1 {
+	if groups := store.ClusterUnnamed(after, rec.Match(), store.Grouping{}); len(groups) != 1 {
 		t.Errorf("got %d unnamed groups, want the face back on the People page", len(groups))
 	}
 }
@@ -290,7 +290,7 @@ func TestWideningStopsCountingOnceTheGroupIsNamed(t *testing.T) {
 		"b.jpg": vec(1, 1, 0, 0),
 	})
 	all, _ := st.AllFaces(ctx)
-	if got := store.ClusterUnnamed(all, rec.Match(), nil); len(got) != 2 {
+	if got := store.ClusterUnnamed(all, rec.Match(), store.Grouping{}); len(got) != 2 {
 		t.Fatalf("got %d groups, want the person split in two to begin with", len(got))
 	}
 
@@ -301,7 +301,7 @@ func TestWideningStopsCountingOnceTheGroupIsNamed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	joined := store.ClusterUnnamed(all, rec.Match(), widened)
+	joined := store.ClusterUnnamed(all, rec.Match(), store.Grouping{Widened: widened})
 	if len(joined) != 1 || joined[0].Faces != 2 {
 		t.Fatalf("after widening: got %+v, want one group of both faces", joined)
 	}
