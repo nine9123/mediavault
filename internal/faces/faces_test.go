@@ -128,7 +128,7 @@ func TestNamingAGroupLabelsItAndRecordsItOnDisk(t *testing.T) {
 		t.Errorf("Jane has %d example faces on disk, want 2", len(doc.People[0].Faces))
 	}
 
-	items, err := st.ItemsForPerson(ctx, mustPerson(t, st, "Jane"), 10)
+	items, err := st.ItemsForPerson(ctx, mustPerson(t, st, "Jane"), 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}

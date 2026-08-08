@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -89,6 +90,40 @@ func clusterRefs(t *testing.T, h http.Handler) []map[string]any {
 		out = append(out, m)
 	}
 	return out
+}
+
+// pageThrough walks a ref's items the way the grid does: a first page, then
+// before=<smallest id shown> until a short page ends it. Returns the relpaths in
+// the order they arrived, and fails rather than looping forever if the cursor is
+// ignored.
+func pageThrough(t *testing.T, h http.Handler, ref string, perPage int) []string {
+	t.Helper()
+	var out []string
+	before := int64(0)
+	for page := 0; ; page++ {
+		if page > 20 {
+			t.Fatalf("still paging after %d requests: the before cursor is being ignored", page)
+		}
+		url := "/api/people/items?ref=" + ref + "&limit=" + strconv.Itoa(perPage)
+		if before > 0 {
+			url += "&before=" + strconv.FormatInt(before, 10)
+		}
+		code, d := do(t, h, "GET", url, "")
+		if code != http.StatusOK {
+			t.Fatalf("GET %s: status %d", url, code)
+		}
+		raw, _ := d["items"].([]any)
+		for _, it := range raw {
+			m, _ := it.(map[string]any)
+			out = append(out, m["relpath"].(string))
+			if id := int64(m["id"].(float64)); before == 0 || id < before {
+				before = id
+			}
+		}
+		if len(raw) < perPage {
+			return out
+		}
+	}
 }
 
 // The whole point of the endpoint: one person shown as two groups becomes one,
@@ -296,4 +331,55 @@ func TestWidenGroupRejectsBadRefsAndStopsAtTheFloor(t *testing.T) {
 	if code != http.StatusConflict {
 		t.Errorf("widening past the floor got status %d, want 409", code)
 	}
+}
+
+// Somebody who appears in more items than one page holds has to be reachable
+// past that page — before this, the grid asked for a single page and the person
+// view stopped there however much was behind it.
+func TestPeopleItemsPageBeyondTheFirstPage(t *testing.T) {
+	_, st, h := peopleServer(t)
+	const total = 5
+	for i := 0; i < total; i++ {
+		detect(t, st, strconv.Itoa(i)+".jpg", 1, 0, 0, 0)
+	}
+
+	// An unnamed group first: it has no id, so its faces are resolved per request
+	// and the cursor has to survive that.
+	ref := clusterRefs(t, h)[0]["ref"].(string)
+	got := pageThrough(t, h, ref, 2)
+	if len(got) != total || len(uniq(got)) != total {
+		t.Errorf("paged %d items (%d distinct) for the group, want %d each", len(got), len(uniq(got)), total)
+	}
+
+	// And the same for a named person, which is the ref the People page hands
+	// over once the group has a name.
+	if code, d := do(t, h, "PUT", "/api/people", `{"ref":"`+ref+`","name":"Jane"}`); code != http.StatusOK {
+		t.Fatalf("name: status %d (%v)", code, d)
+	}
+	code, d := do(t, h, "GET", "/api/people", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/people: status %d", code)
+	}
+	people, _ := d["people"].([]any)
+	if len(people) != 1 {
+		t.Fatalf("got %d people, want Jane", len(people))
+	}
+	pref := people[0].(map[string]any)["ref"].(string)
+	got = pageThrough(t, h, pref, 2)
+	if len(got) != total || len(uniq(got)) != total {
+		t.Errorf("paged %d items (%d distinct) for Jane, want %d each", len(got), len(uniq(got)), total)
+	}
+}
+
+func uniq(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }

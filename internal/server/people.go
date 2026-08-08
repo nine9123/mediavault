@@ -137,9 +137,15 @@ func (s *Server) handlePeopleItems(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := clampAtoi(r.URL.Query().Get("limit"), 200, 1, 500)
 	ref := strings.TrimSpace(r.URL.Query().Get("ref"))
+	// before=<id>: the next page, older than the cursor. Same shape as
+	// /api/items, so the grid's infinite scroll works here unchanged.
+	var before int64
+	if b := r.URL.Query().Get("before"); b != "" {
+		before, _ = strconv.ParseInt(b, 10, 64)
+	}
 
 	if id, ok := personRef(ref); ok {
-		items, err := s.store.ItemsForPerson(r.Context(), id, limit)
+		items, err := s.store.ItemsForPerson(r.Context(), id, before, limit)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -157,7 +163,7 @@ func (s *Server) handlePeopleItems(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	items, err := s.store.ItemsForFaces(r.Context(), ids, limit)
+	items, err := s.store.ItemsForFaces(r.Context(), ids, before, limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
