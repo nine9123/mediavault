@@ -581,78 +581,120 @@ func group(faces []Face, threshold float64) [][]Face {
 // split groups would do nothing at all — and which half a user clicks is not
 // something they should have to reason about. Comparing settled groups is
 // symmetric: either half pulls the other in.
+//
+// Every comparison is against the groups as clustering left them, and each group
+// is judged against the widened one only. Both matter: a widened group that took
+// its new members into account before looking again would drift towards the
+// average of everything it had swallowed, and the average of two people looks a
+// little like a third — on a library of hundreds of groups, one click ran that
+// feedback loop to its conclusion and returned a single group.
 func widen(groups [][]Face, threshold float64, widened Widened) [][]Face {
 	if len(widened) == 0 {
 		return groups
 	}
-	type cl struct {
-		members  []Face
-		sum      []float64 // running total; centroid = normalized sum
-		centroid []float32
-		thr      float64
-	}
-	cls := make([]*cl, 0, len(groups))
+	sums := make([][]float64, len(groups))
+	thr := make([]float64, len(groups))
 	any := false
-	for _, g := range groups {
+	for i, g := range groups {
 		// group only ever puts same-dimension vectors together, so one length
 		// covers the whole group.
-		c := &cl{members: g, sum: make([]float64, len(g[0].Vec)), thr: threshold}
+		s := make([]float64, len(g[0].Vec))
+		thr[i] = threshold
 		for _, f := range g {
-			for i, x := range f.Vec {
-				c.sum[i] += float64(x)
+			for k, x := range f.Vec {
+				s[k] += float64(x)
 			}
-			if t, ok := widened[f.ID]; ok && t < c.thr {
-				c.thr = t
+			if t, ok := widened[f.ID]; ok && t < thr[i] {
+				thr[i] = t
 			}
 		}
-		c.centroid = unit(c.sum)
-		any = any || c.thr < threshold
-		cls = append(cls, c)
+		sums[i] = s
+		any = any || thr[i] < threshold
 	}
 	// Every override named a face that has since been labelled or deleted.
 	if !any {
 		return groups
 	}
 
-	// Repeat to a fixed point: absorbing a group moves the centroid, which can
-	// bring a third one within reach. Each round strictly reduces the group
-	// count, so this terminates.
-	for merged := true; merged; {
-		merged = false
-		for i, a := range cls {
-			if a == nil || a.thr >= threshold {
-				continue // not widened: only the marked groups go looking
+	// Which group each one ends up in, by index. Merging is recorded here rather
+	// than done in place, so that what a later comparison sees is unaffected by
+	// an earlier one.
+	joined := make([]int, len(groups))
+	for i := range joined {
+		joined[i] = i
+	}
+	var root func(int) int
+	root = func(i int) int {
+		for joined[i] != i {
+			joined[i] = joined[joined[i]]
+			i = joined[i]
+		}
+		return i
+	}
+	for i := range groups {
+		if thr[i] >= threshold {
+			continue // not widened: only the marked groups go looking
+		}
+		for j := range groups {
+			if i == j || len(sums[j]) != len(sums[i]) {
+				continue
 			}
-			for j, b := range cls {
-				if i == j || b == nil || len(b.centroid) != len(a.centroid) {
-					continue
+			t := math.Min(thr[i], thr[j])
+			if meanSim(sums[i], sums[j], len(groups[i]), len(groups[j])) < t {
+				continue
+			}
+			if a, b := root(i), root(j); a != b {
+				// Lower index wins, so the merged group keeps the earliest
+				// members and the whole pass stays order-independent.
+				if a < b {
+					joined[b] = a
+				} else {
+					joined[a] = b
 				}
-				t := math.Min(a.thr, b.thr)
-				if media.Cosine(a.centroid, b.centroid) < t {
-					continue
-				}
-				a.members = append(a.members, b.members...)
-				for k, x := range b.sum {
-					a.sum[k] += x
-				}
-				a.centroid, a.thr = unit(a.sum), t
-				cls[j] = nil
-				merged = true
 			}
 		}
 	}
 
-	out := make([][]Face, 0, len(cls))
-	for _, c := range cls {
-		if c == nil {
+	out := make([][]Face, 0, len(groups))
+	at := make(map[int]int, len(groups)) // group index -> where it landed in out
+	for i, g := range groups {
+		r := root(i)
+		if r == i {
+			at[i] = len(out)
+			// Clipped, so absorbing into it copies rather than writing over
+			// whatever spare capacity the grouping pass left on the end.
+			out = append(out, g[:len(g):len(g)])
 			continue
 		}
+		out[at[r]] = append(out[at[r]], g...)
+	}
+	for _, g := range out {
 		// Back into id order, so the group is still identified by its lowest
 		// face id however the merging got there.
-		sort.Slice(c.members, func(i, j int) bool { return c.members[i].ID < c.members[j].ID })
-		out = append(out, c.members)
+		sort.Slice(g, func(i, j int) bool { return g[i].ID < g[j].ID })
 	}
 	return out
+}
+
+// meanSim is the average cosine similarity over every pair of faces with one
+// face from each group — which falls out of the sums the groups are already
+// summarized by, since the mean of a·b over the pairs is (Σa)·(Σb)/(na·nb).
+//
+// The obvious alternative is the cosine of the two normalized centroids, and it
+// is the wrong measure to compare against a threshold that was chosen for faces:
+// normalizing divides out the shrinkage that averaging causes, and how much a
+// sum shrinks depends on how varied the group is and how many faces are in it.
+// So the bigger a group got, the more similar its centroid read to everything —
+// widening a large group by as little as 0.001 pulled in dozens of strangers.
+func meanSim(a, b []float64, na, nb int) float64 {
+	if len(a) != len(b) || na == 0 || nb == 0 {
+		return -1
+	}
+	var d float64
+	for i := range a {
+		d += a[i] * b[i]
+	}
+	return d / float64(na*nb)
 }
 
 // MatchPerson returns the id of the person whose example faces best match vec,

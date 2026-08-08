@@ -2,6 +2,7 @@ package store
 
 import (
 	"math"
+	"math/rand"
 	"testing"
 )
 
@@ -169,6 +170,98 @@ func TestWidenLeavesEveryOtherGroupAlone(t *testing.T) {
 	// which is exactly the collateral damage widening avoids.
 	if all := ClusterUnnamed(faces, 0.7, nil); len(all) != 2 {
 		t.Errorf("sanity: at a global 0.7 got %d groups, want both pairs joined", len(all))
+	}
+}
+
+// The number a group is widened to has to mean what the library-wide threshold
+// means — how alike two faces are. The cosine of two normalized centroids does
+// not: normalizing divides out the shrinkage that averaging causes, by an amount
+// that depends on how varied the group is, so a spread-out group reads as
+// similar to everything.
+func TestWidenComparesGroupsInFaceSimilarity(t *testing.T) {
+	// Three faces 22 degrees apart along one plane. They are one group at 0.8,
+	// their centroid points along the first axis, and their sum is 5% shorter
+	// than the three unit vectors it adds up. Face 4 sits off in a third
+	// dimension, 0.72 from the middle one and 0.667 from the outer two — 0.685
+	// on average, which is what "how alike are these two groups" has to mean.
+	faces := []Face{
+		face(1, 10, unitVec(0.92718, -0.37461, 0, 0)),
+		face(2, 11, unitVec(1, 0, 0, 0)),
+		face(3, 12, unitVec(0.92718, 0.37461, 0, 0)),
+		face(4, 13, unitVec(0.72, 0, 0.69397, 0)),
+	}
+	if got := ClusterUnnamed(faces, 0.8, nil); len(got) != 2 {
+		t.Fatalf("baseline: got %d groups, want the three-face group and the lone face", len(got))
+	}
+	// 0.72 to the centroid, but 0.685 to the faces: widening to 0.7 must not
+	// reach it, or the number on the card is not the number being applied.
+	if got := ClusterUnnamed(faces, 0.8, Widened{1: 0.7}); len(got) != 2 {
+		t.Errorf("widening to 0.7 pulled in a group only 0.685 alike: got %d groups, want 2", len(got))
+	}
+	if got := ClusterUnnamed(faces, 0.8, Widened{1: 0.68}); len(got) != 1 {
+		t.Errorf("widening to 0.68 left a group 0.685 alike out: got %d groups, want 1", len(got))
+	}
+}
+
+// library is a synthetic collection with the shape a real one has: many people,
+// a shared direction every face embedding leans on (they are all faces), and
+// enough variation per person that the grouping pass leaves some groups far
+// bigger than others. Seeded, so it is the same library every run.
+func library(seed int64, people, perPerson, dim int) []Face {
+	rng := rand.New(rand.NewSource(seed))
+	shared := make([]float64, dim)
+	for i := range shared {
+		shared[i] = rng.NormFloat64()
+	}
+	var faces []Face
+	var id int64
+	for p := 0; p < people; p++ {
+		person := make([]float64, dim)
+		for i := range person {
+			person[i] = 0.55*shared[i] + rng.NormFloat64()
+		}
+		for k := 0; k < perPerson; k++ {
+			v := make([]float64, dim)
+			for i := range v {
+				v[i] = person[i] + 0.3*rng.NormFloat64()
+			}
+			id++
+			faces = append(faces, Face{ID: id, ItemID: id, Relpath: "x.jpg", W: 0.2, H: 0.2, Score: 1, Vec: unit(v)})
+		}
+	}
+	return faces
+}
+
+// Widening one group is a repair for one group, and the damage it can do has to
+// stay in proportion to the 0.1 the user asked for. It did not: each group the
+// widened one absorbed moved it towards the average of everything it had
+// swallowed, the average of two people looks a little like a third, and on a
+// library of hundreds of groups one click ran that to its conclusion and
+// returned a single group.
+func TestWidenDoesNotSwallowTheLibrary(t *testing.T) {
+	faces := library(1, 60, 4, 32)
+	base := ClusterUnnamed(faces, 0.5, nil)
+	if len(base) < 20 {
+		t.Fatalf("fixture: %d groups, want a library with plenty of groups to swallow", len(base))
+	}
+	// The biggest group and a middling one: the bug got worse the bigger the
+	// group, but was never confined to big ones.
+	for _, c := range []FaceCluster{base[0], base[len(base)/2]} {
+		got := ClusterUnnamed(faces, 0.5, Widened{c.KeyFaceID: 0.4})
+		widest := 0
+		for _, g := range got {
+			if g.Match < 0.5 && g.Faces > widest {
+				widest = g.Faces
+			}
+		}
+		if widest > len(faces)/5 {
+			t.Errorf("widening a %d-face group by 0.1 left it holding %d of %d faces",
+				c.Faces, widest, len(faces))
+		}
+		if len(base)-len(got) > 5 {
+			t.Errorf("widening a %d-face group by 0.1 took the page from %d groups to %d",
+				c.Faces, len(base), len(got))
+		}
 	}
 }
 
