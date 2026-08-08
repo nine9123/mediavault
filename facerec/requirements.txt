@@ -7,4 +7,4 @@ Pillow==11.0.0
 # ever shows up as an ephemeral build-isolation dependency for the wheels
 # above (it's in their build-system.requires, not their install_requires),
 # so it never lands in --prefix=/install unless it's listed here explicitly.
-setuptools
+setuptools<70
