@@ -60,14 +60,31 @@ func FaceCrop(ctx context.Context, cfg config.Config, src string, typ model.Medi
 
 	frame := func(seekArgs ...string) []string {
 		a := append([]string{"-nostdin", "-v", "error"}, seekArgs...)
-		return append(a, "-i", src, "-frames:v", "1", "-vf", vf, "-y", dst)
+		// The encoder and muxer are named rather than left to ffmpeg's guess from
+		// the file name: callers crop to a temp name and rename into place, so dst
+		// does not end in .jpg and guessing fails outright ("unable to choose an
+		// output format").
+		return append(a, "-i", src, "-frames:v", "1", "-vf", vf,
+			"-c:v", "mjpeg", "-f", "image2", "-y", dst)
+	}
+	// Seeking past the end of a short clip encodes nothing and still exits 0, so
+	// whether a frame was actually written is the real test — the same check
+	// FrameJPEG makes on its pipe, and what makes the retry below reachable.
+	run := func(seekArgs ...string) error {
+		if err := runFFmpeg(ctx, cfg, frame(seekArgs...)); err != nil {
+			return err
+		}
+		if fi, err := os.Stat(dst); err != nil || fi.Size() == 0 {
+			return fmt.Errorf("ffmpeg wrote no frame")
+		}
+		return nil
 	}
 	if seek := PosterSeek(typ, offset); seek != nil {
-		if err := runFFmpeg(ctx, cfg, frame(seek...)); err == nil {
+		if err := run(seek...); err == nil {
 			return nil
 		}
 	}
-	return runFFmpeg(ctx, cfg, frame())
+	return run()
 }
 
 // pad grows a box by frac of its own size on every side, clamped to the frame.
