@@ -8,6 +8,7 @@ on:
 env:
   REGISTRY: 192.168.178.40:30008
   IMAGE_NAME: nine9/mediavault
+  FACEREC_IMAGE_NAME: nine9/facerec
   WATCHTOWER_SCOPE: mediavault   # must match the watchtower.scope label on the app
 
 jobs:
@@ -36,6 +37,24 @@ jobs:
         run: |
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_SHORT }}
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Build facerec image
+        run: |
+          # -f/context pinned explicitly to facerec/ — this is a separate
+          # Dockerfile from the root one, don't let this silently drift back
+          # to building the main app under the facerec tag.
+          docker build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=${{ gitea.sha }}" \
+            -f facerec/Dockerfile \
+            -t ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:${{ env.SHA_SHORT }} \
+            -t ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:latest \
+            facerec/
+
+      - name: Push facerec image
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:${{ env.SHA_SHORT }}
+          docker push ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:latest
 
       - name: Trigger watchtower update
         run: |
