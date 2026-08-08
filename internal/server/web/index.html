@@ -1478,11 +1478,17 @@
       });
     }).then(function (d) {
       showPeople(true);
-      // Nothing came within reach, so say so rather than leaving the user to
-      // spot that only the number under the card changed.
+      // Say what happened either way. Nothing came within reach is otherwise
+      // invisible — only the number under the card changed — and a widening
+      // that pulled in more than the one group the user had in mind is worth
+      // hearing about while "Reset match" is still the obvious next click.
       if (!d.absorbed) {
         window.alert("Nothing new joined at match " + (d.match || 0).toFixed(2) +
           ".\nWiden again, or name both groups the same thing to merge them.");
+      } else {
+        window.alert(d.absorbed + (d.absorbed === 1 ? " group joined" : " groups joined") +
+          " at match " + (d.match || 0).toFixed(2) + ", giving " + d.faces + " faces." +
+          "\nIf that pulled in someone else, \u201cReset match\u201d puts it back.");
       }
     }).catch(function (e) { window.alert("Couldn't widen that group: " + e.message); });
   }

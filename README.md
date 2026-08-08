@@ -638,6 +638,9 @@ How it works:
   stored and only the number they are compared at changes, so it is instant.
   Click it again to go looser (down to 0.1), or **Reset match** to undo. Either
   half of the split works — you don't have to guess which one is "the" group.
+  A widened group is compared to another group by the average similarity of
+  their faces, so the number on the card means what `FACE_MATCH` means, and only
+  the groups it is actually that alike to join it.
   The widening is cache like the grouping it produces; naming the joined group is
   what makes the judgement durable.
 - **Names are durable, groups are not.** A name is a human judgement, so it goes
