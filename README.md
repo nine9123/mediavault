@@ -602,7 +602,9 @@ faces found in the item on screen, each linking to that person.
 Recognition itself runs in a **separate container**, because face models mean
 Python, native wheels and often a GPU — none of which belongs in a static Go
 binary whose only other dependency is ffmpeg. `facerec/` is a working one (dlib,
-CPU-only); `docker compose up -d --build facerec` after uncommenting its block.
+CPU-only); `docker compose up -d --build facerec` after uncommenting its block —
+or, on TrueNAS, build the image once and reference the tag, because a custom app
+has no checkout to build from (`facerec/README.md` has the walkthrough).
 It needs no media mount: mediavault extracts a frame with ffmpeg and posts the
 JPEG. The HTTP contract is two endpoints and is documented in
 `facerec/README.md` — implement it and you can swap in InsightFace, a GPU
