@@ -249,6 +249,10 @@ with TLS.
 - `PUT  /api/people` — `{ "ref": "f42", "name": "Jane" }` names a group (or renames
   `"ref": "p3"`); an existing name merges
 - `DELETE /api/people?ref=p3` — forget a name (the faces stay)
+- `POST /api/people/regroup` — `{ "ref": "f42" }` lowers *that one group's* match by
+  0.1 (`"step"` overrides) and re-groups just there, pulling in a group that was
+  the same person. Nothing is re-detected
+- `DELETE /api/people/regroup?ref=f42` — put that group back under the global match
 - `GET  /api/face/{id}` — cropped face thumbnail (cut on first request, then cached)
 - `POST /api/faces/reset` — clear detections and re-run the recognition service
 - `GET  /api/stats` — collection size + latest scan (drives the live UI)
@@ -626,6 +630,16 @@ How it works:
   the service advertises its own via `/health`, and `FACE_MATCH` overrides it if
   you disagree. Two people merged into one group means raise it; one person in
   four groups means lower it.
+- **Widen** repairs a split without touching that global number. When one person
+  is in two groups but everyone else is grouped correctly, lowering `FACE_MATCH`
+  trades this split for merged strangers elsewhere — so **Widen** on the card
+  drops *that group's* match by 0.1 and re-groups only there, pulling in any
+  group now close enough. Nothing is re-detected: the embeddings are already
+  stored and only the number they are compared at changes, so it is instant.
+  Click it again to go looser (down to 0.1), or **Reset match** to undo. Either
+  half of the split works — you don't have to guess which one is "the" group.
+  The widening is cache like the grouping it produces; naming the joined group is
+  what makes the judgement durable.
 - **Names are durable, groups are not.** A name is a human judgement, so it goes
   in `people.json` next to the tag sidecars — the same volume, the same backup
   story. Faces, groups and labels are cache: drop `index.db` and re-detection

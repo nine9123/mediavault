@@ -209,6 +209,12 @@ func (s *Store) ensureColumns() error {
 			return fmt.Errorf("index faces: %w", err)
 		}
 	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS face_group_match (
+		face_id INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
+		match   REAL NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create face_group_match: %w", err)
+	}
 	return nil
 }
 

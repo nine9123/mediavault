@@ -100,7 +100,7 @@ func TestNamingAGroupLabelsItAndRecordsItOnDisk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	group := pick(t, all, store.ClusterContaining(all, rec.Match(), all[0].ID))
+	group := pick(t, all, store.ClusterContaining(all, rec.Match(), nil, all[0].ID))
 	if len(group) != 2 {
 		t.Fatalf("the group has %d faces, want the two alike ones", len(group))
 	}
@@ -154,7 +154,7 @@ func TestNamesSurviveLosingTheCache(t *testing.T) {
 	}
 	detected(t, st, first)
 	all, _ := st.AllFaces(ctx)
-	if _, err := rec.Name(ctx, "Jane", pick(t, all, store.ClusterContaining(all, rec.Match(), all[0].ID))); err != nil {
+	if _, err := rec.Name(ctx, "Jane", pick(t, all, store.ClusterContaining(all, rec.Match(), nil, all[0].ID))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -268,8 +268,54 @@ func TestForgetKeepsTheFacesButDropsTheName(t *testing.T) {
 		t.Errorf("people.json still holds %+v", doc.People)
 	}
 	// And the group is offered again, so it can be named differently.
-	if groups := store.ClusterUnnamed(after, rec.Match()); len(groups) != 1 {
+	if groups := store.ClusterUnnamed(after, rec.Match(), nil); len(groups) != 1 {
 		t.Errorf("got %d unnamed groups, want the face back on the People page", len(groups))
+	}
+}
+
+// Widening a group is a nudge toward naming it, so it is only worth keeping
+// until the name lands: the name is the durable form of the same judgement and
+// goes to people.json, where the override could never follow it (face ids are
+// cache, and re-detection mints new ones).
+func TestWideningStopsCountingOnceTheGroupIsNamed(t *testing.T) {
+	ctx := context.Background()
+	_, st, rec := setup(t)
+
+	for _, rel := range []string{"a.jpg", "b.jpg"} {
+		addItem(t, st, rel)
+	}
+	// Two halves of one person: 0.707 apart, so the library's 0.8 splits them.
+	detected(t, st, map[string][]float32{
+		"a.jpg": vec(1, 0, 0, 0),
+		"b.jpg": vec(1, 1, 0, 0),
+	})
+	all, _ := st.AllFaces(ctx)
+	if got := store.ClusterUnnamed(all, rec.Match(), nil); len(got) != 2 {
+		t.Fatalf("got %d groups, want the person split in two to begin with", len(got))
+	}
+
+	if err := st.WidenFaceGroup(ctx, all[0].ID, 0.7); err != nil {
+		t.Fatal(err)
+	}
+	widened, err := st.FaceGroupMatches(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := store.ClusterUnnamed(all, rec.Match(), widened)
+	if len(joined) != 1 || joined[0].Faces != 2 {
+		t.Fatalf("after widening: got %+v, want one group of both faces", joined)
+	}
+
+	// Naming it retires the override rather than leaving a row that would widen
+	// whatever the next unnamed group keyed on that face turns out to be.
+	if _, err := rec.Name(ctx, "Jane", pick(t, all, joined[0].FaceIDs)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.FaceGroupMatches(ctx); err != nil || len(got) != 0 {
+		t.Errorf("widenings after naming = %v (err %v), want none", got, err)
+	}
+	if got := namesOf(t, st); got["a.jpg"] != "Jane" || got["b.jpg"] != "Jane" {
+		t.Errorf("labels = %v, want both halves under Jane", got)
 	}
 }
 

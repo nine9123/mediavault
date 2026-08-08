@@ -62,8 +62,20 @@ type FaceCluster struct {
 	CoverFaceID int64
 	Faces       int
 	Items       int
+	Match       float64 // threshold this group was grouped at; below the library's if widened
 	FaceIDs     []int64
 }
+
+// Widened is the per-group similarity overrides in force: a face id -> the
+// lowered threshold the group containing it is clustered at.
+//
+// It exists because the one number that controls grouping is global, and the
+// mistake it makes is local: one person whose photographs vary a lot lands in
+// two groups while everybody else is grouped correctly. Lowering FACE_MATCH for
+// the whole library to fix that merges strangers elsewhere. So a widening is
+// recorded against the group the user pointed at — keyed on its key face, the
+// same handle the UI addresses it by — and applies only there.
+type Widened map[int64]float64
 
 const faceCols = `f.id, f.item_id, i.relpath, i.type, COALESCE(i.offset_s,0),
 	COALESCE(f.person_id,0), COALESCE(p.name,''), f.x, f.y, f.w, f.h, COALESCE(f.score,0), f.vec`
@@ -220,7 +232,65 @@ func (s *Store) ResetFaces(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE items SET faces_done=0`); err != nil {
 		return err
 	}
+	// The face ids these are keyed on are gone, and re-detection mints new ones —
+	// so a widening cannot survive this even in principle.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM face_group_match`); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// ---- widened groups ----
+
+// FaceGroupMatches returns the per-group thresholds still in force. Rows whose
+// face has since been named or deleted are left out: naming is the durable form
+// of the same judgement (it goes to people.json), so once a widened group has a
+// name the override has nothing left to say.
+func (s *Store) FaceGroupMatches(ctx context.Context) (Widened, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT g.face_id, g.match FROM face_group_match g
+		JOIN faces f ON f.id = g.face_id
+		JOIN items i ON i.id = f.item_id
+		WHERE f.person_id IS NULL AND i.missing_since IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := Widened{}
+	for rows.Next() {
+		var id int64
+		var m float64
+		if err := rows.Scan(&id, &m); err != nil {
+			return nil, err
+		}
+		out[id] = m
+	}
+	return out, rows.Err()
+}
+
+// WidenFaceGroup records the lowered threshold for the group keyed on faceID.
+func (s *Store) WidenFaceGroup(ctx context.Context, faceID int64, match float64) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO face_group_match(face_id,match) VALUES(?,?)
+		 ON CONFLICT(face_id) DO UPDATE SET match=excluded.match`, faceID, match)
+	return err
+}
+
+// ResetFaceGroup drops the widening on a set of faces, putting them back under
+// the library-wide threshold. It takes the whole group rather than its key
+// because merging moves the key: the face the user widened may no longer be it.
+func (s *Store) ResetFaceGroup(ctx context.Context, faceIDs []int64) error {
+	if len(faceIDs) == 0 {
+		return nil
+	}
+	ph := make([]string, len(faceIDs))
+	args := make([]any, len(faceIDs))
+	for i, id := range faceIDs {
+		ph[i], args[i] = "?", id
+	}
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM face_group_match WHERE face_id IN (`+strings.Join(ph, ",")+`)`, args...)
+	return err
 }
 
 // ---- people ----
@@ -380,23 +450,28 @@ func (s *Store) ItemsForFaces(ctx context.Context, faceIDs []int64, limit int) (
 // ClusterUnnamed groups the faces nobody has named yet, biggest group first.
 // Groups of one are included (a person photographed once is still a person), but
 // they sort last, so the page leads with the faces worth naming.
-func ClusterUnnamed(faces []Face, threshold float64) []FaceCluster {
+//
+// widened may be nil; see Widened for what a non-empty one does.
+func ClusterUnnamed(faces []Face, threshold float64, widened Widened) []FaceCluster {
 	var pool []Face
 	for _, f := range faces {
 		if f.PersonID == 0 && len(f.Vec) > 0 {
 			pool = append(pool, f)
 		}
 	}
-	groups := group(pool, threshold)
+	groups := widen(group(pool, threshold), threshold, widened)
 
 	out := make([]FaceCluster, 0, len(groups))
 	for _, g := range groups {
-		c := FaceCluster{KeyFaceID: g[0].ID, CoverFaceID: g[0].ID, FaceIDs: make([]int64, 0, len(g))}
+		c := FaceCluster{KeyFaceID: g[0].ID, CoverFaceID: g[0].ID, Match: threshold, FaceIDs: make([]int64, 0, len(g))}
 		items := make(map[int64]struct{}, len(g))
 		bestScore, bestArea := -1.0, -1.0
 		for _, f := range g {
 			c.FaceIDs = append(c.FaceIDs, f.ID)
 			items[f.ItemID] = struct{}{}
+			if t, ok := widened[f.ID]; ok && t < c.Match {
+				c.Match = t
+			}
 			// Highest confidence, breaking ties on size — a detector that reports
 			// no confidence (they exist; see facerec/) would otherwise always make
 			// the first face the cover, however small.
@@ -422,15 +497,25 @@ func ClusterUnnamed(faces []Face, threshold float64) []FaceCluster {
 // ClusterContaining returns the group the given face belongs to — the faces that
 // get labelled when you name that cluster. Empty if the face is already named or
 // no longer exists.
-func ClusterContaining(faces []Face, threshold float64, faceID int64) []int64 {
-	for _, c := range ClusterUnnamed(faces, threshold) {
+func ClusterContaining(faces []Face, threshold float64, widened Widened, faceID int64) []int64 {
+	if c, ok := ClusterOf(ClusterUnnamed(faces, threshold, widened), faceID); ok {
+		return c.FaceIDs
+	}
+	return nil
+}
+
+// ClusterOf finds the group containing a face in an already-computed listing —
+// for callers that need the group's counts and threshold too, or that are about
+// to look at the other groups as well and shouldn't cluster twice to do it.
+func ClusterOf(clusters []FaceCluster, faceID int64) (FaceCluster, bool) {
+	for _, c := range clusters {
 		for _, id := range c.FaceIDs {
 			if id == faceID {
-				return c.FaceIDs
+				return c, true
 			}
 		}
 	}
-	return nil
+	return FaceCluster{}, false
 }
 
 // group is greedy single-pass agglomeration: walk the faces in id order and put
@@ -480,6 +565,91 @@ func group(faces []Face, threshold float64) [][]Face {
 
 	out := make([][]Face, 0, len(cls))
 	for _, c := range cls {
+		out = append(out, c.members)
+	}
+	return out
+}
+
+// widen re-joins whole groups that a lowered threshold says are the same person.
+// It is the repair for the split described on group: instead of re-running the
+// library at a looser number, only the groups the user pointed at go looking for
+// a partner, and they compare against finished groups rather than loose faces.
+//
+// After the greedy pass rather than inside it, because a group's key face is not
+// necessarily the first one the pass sees. Lowering the threshold as faces
+// arrive would only ever pull in higher face ids, so widening the second of two
+// split groups would do nothing at all — and which half a user clicks is not
+// something they should have to reason about. Comparing settled groups is
+// symmetric: either half pulls the other in.
+func widen(groups [][]Face, threshold float64, widened Widened) [][]Face {
+	if len(widened) == 0 {
+		return groups
+	}
+	type cl struct {
+		members  []Face
+		sum      []float64 // running total; centroid = normalized sum
+		centroid []float32
+		thr      float64
+	}
+	cls := make([]*cl, 0, len(groups))
+	any := false
+	for _, g := range groups {
+		// group only ever puts same-dimension vectors together, so one length
+		// covers the whole group.
+		c := &cl{members: g, sum: make([]float64, len(g[0].Vec)), thr: threshold}
+		for _, f := range g {
+			for i, x := range f.Vec {
+				c.sum[i] += float64(x)
+			}
+			if t, ok := widened[f.ID]; ok && t < c.thr {
+				c.thr = t
+			}
+		}
+		c.centroid = unit(c.sum)
+		any = any || c.thr < threshold
+		cls = append(cls, c)
+	}
+	// Every override named a face that has since been labelled or deleted.
+	if !any {
+		return groups
+	}
+
+	// Repeat to a fixed point: absorbing a group moves the centroid, which can
+	// bring a third one within reach. Each round strictly reduces the group
+	// count, so this terminates.
+	for merged := true; merged; {
+		merged = false
+		for i, a := range cls {
+			if a == nil || a.thr >= threshold {
+				continue // not widened: only the marked groups go looking
+			}
+			for j, b := range cls {
+				if i == j || b == nil || len(b.centroid) != len(a.centroid) {
+					continue
+				}
+				t := math.Min(a.thr, b.thr)
+				if media.Cosine(a.centroid, b.centroid) < t {
+					continue
+				}
+				a.members = append(a.members, b.members...)
+				for k, x := range b.sum {
+					a.sum[k] += x
+				}
+				a.centroid, a.thr = unit(a.sum), t
+				cls[j] = nil
+				merged = true
+			}
+		}
+	}
+
+	out := make([][]Face, 0, len(cls))
+	for _, c := range cls {
+		if c == nil {
+			continue
+		}
+		// Back into id order, so the group is still identified by its lowest
+		// face id however the merging got there.
+		sort.Slice(c.members, func(i, j int) bool { return c.members[i].ID < c.members[j].ID })
 		out = append(out, c.members)
 	}
 	return out
