@@ -63,6 +63,7 @@ type FaceCluster struct {
 	Faces       int
 	Items       int
 	Match       float64 // threshold this group was grouped at; below the library's if widened
+	Merged      bool    // holds faces a user joined by hand; see Merged
 	FaceIDs     []int64
 }
 
@@ -76,6 +77,32 @@ type FaceCluster struct {
 // recorded against the group the user pointed at — keyed on its key face, the
 // same handle the UI addresses it by — and applies only there.
 type Widened map[int64]float64
+
+// Merged is the manual joins in force: a face id -> the id of the merge it
+// belongs to. Every face of every group in one merge carries the same id, and
+// any two groups that share one are put back together after clustering.
+//
+// It exists because widening is still a question put to the embeddings, and some
+// of the time the answer is no however far the threshold drops: the same person
+// twenty years and two haircuts apart is not close in the model, and lowering
+// their group's number until it is only means the group reaches everyone else
+// first. Somebody looking at the two covers can see what the model cannot, and a
+// merge is how they say so — no comparison, no threshold.
+//
+// Keyed on every face rather than on the group's key face, which is what a
+// widening is keyed on: merging moves the key, and the grouping underneath keeps
+// shifting as detection finds more faces. Recorded against the faces, the join
+// survives all of that.
+type Merged map[int64]int64
+
+// Grouping is the manual corrections in force when the unnamed faces are
+// grouped. They travel together because they are applied together: grouping the
+// page with one set and naming a group with another would label a different set
+// of faces than the one on screen.
+type Grouping struct {
+	Widened Widened
+	Merged  Merged
+}
 
 const faceCols = `f.id, f.item_id, i.relpath, i.type, COALESCE(i.offset_s,0),
 	COALESCE(f.person_id,0), COALESCE(p.name,''), f.x, f.y, f.w, f.h, COALESCE(f.score,0), f.vec`
@@ -237,6 +264,9 @@ func (s *Store) ResetFaces(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM face_group_match`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM face_group_merge`); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -290,6 +320,131 @@ func (s *Store) ResetFaceGroup(ctx context.Context, faceIDs []int64) error {
 	}
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM face_group_match WHERE face_id IN (`+strings.Join(ph, ",")+`)`, args...)
+	return err
+}
+
+// ---- merged groups ----
+
+// FaceGroupMerges returns the manual joins still in force, filtered the same way
+// FaceGroupMatches is: once a face has a name, the name is the durable form of
+// the same judgement and the row has nothing left to say.
+func (s *Store) FaceGroupMerges(ctx context.Context) (Merged, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT g.face_id, g.merge_id FROM face_group_merge g
+		JOIN faces f ON f.id = g.face_id
+		JOIN items i ON i.id = f.item_id
+		WHERE f.person_id IS NULL AND i.missing_since IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := Merged{}
+	for rows.Next() {
+		var id, m int64
+		if err := rows.Scan(&id, &m); err != nil {
+			return nil, err
+		}
+		out[id] = m
+	}
+	return out, rows.Err()
+}
+
+// MergeFaceGroups records that two groups of faces are one person, stamping both
+// with a single merge id. The id is the lowest face id involved: arbitrary, but
+// derived from the faces themselves, so merging the same two groups twice is a
+// no-op rather than a second merge.
+//
+// Any merge either side already belongs to is folded in first. Merging A with B
+// and then B with C has to leave one group of three — a user who has to say
+// "same person" twice about the same face is being asked to do the union-find by
+// hand.
+func (s *Store) MergeFaceGroups(ctx context.Context, a, b []int64) error {
+	if len(a) == 0 || len(b) == 0 {
+		return fmt.Errorf("a merge needs two groups of faces")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	ids := make([]int64, 0, len(a)+len(b))
+	ids = append(append(ids, a...), b...)
+	target := ids[0]
+	for _, id := range ids {
+		if id < target {
+			target = id
+		}
+	}
+	// The whole table, because it is one row per manually merged face and there
+	// are never many of those — cheaper than building an IN clause the width of
+	// two groups just to ask which merges they touch.
+	rows, err := tx.QueryContext(ctx, `SELECT face_id, merge_id FROM face_group_merge`)
+	if err != nil {
+		return err
+	}
+	existing := map[int64]int64{}
+	for rows.Next() {
+		var id, m int64
+		if err := rows.Scan(&id, &m); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[id] = m
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	touched := map[int64]bool{}
+	for _, id := range ids {
+		if m, ok := existing[id]; ok {
+			touched[m] = true
+			if m < target {
+				target = m
+			}
+		}
+	}
+	for m := range touched {
+		if m == target {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE face_group_merge SET merge_id=? WHERE merge_id=?`, target, m); err != nil {
+			return err
+		}
+	}
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO face_group_merge(face_id,merge_id) VALUES(?,?)
+		 ON CONFLICT(face_id) DO UPDATE SET merge_id=excluded.merge_id`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, id := range ids {
+		if _, err := stmt.ExecContext(ctx, id, target); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// UnmergeFaceGroup drops the manual joins on a set of faces, handing them back to
+// the clustering. Like ResetFaceGroup it takes the whole group rather than a key,
+// because merging is exactly what moves the key.
+func (s *Store) UnmergeFaceGroup(ctx context.Context, faceIDs []int64) error {
+	if len(faceIDs) == 0 {
+		return nil
+	}
+	ph := make([]string, len(faceIDs))
+	args := make([]any, len(faceIDs))
+	for i, id := range faceIDs {
+		ph[i], args[i] = "?", id
+	}
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM face_group_merge WHERE face_id IN (`+strings.Join(ph, ",")+`)`, args...)
 	return err
 }
 
@@ -451,15 +606,15 @@ func (s *Store) ItemsForFaces(ctx context.Context, faceIDs []int64, limit int) (
 // Groups of one are included (a person photographed once is still a person), but
 // they sort last, so the page leads with the faces worth naming.
 //
-// widened may be nil; see Widened for what a non-empty one does.
-func ClusterUnnamed(faces []Face, threshold float64, widened Widened) []FaceCluster {
+// manual may be zero; see Widened and Merged for what a non-empty one does.
+func ClusterUnnamed(faces []Face, threshold float64, manual Grouping) []FaceCluster {
 	var pool []Face
 	for _, f := range faces {
 		if f.PersonID == 0 && len(f.Vec) > 0 {
 			pool = append(pool, f)
 		}
 	}
-	groups := widen(group(pool, threshold), threshold, widened)
+	groups := merge(widen(group(pool, threshold), threshold, manual.Widened), manual.Merged)
 
 	out := make([]FaceCluster, 0, len(groups))
 	for _, g := range groups {
@@ -469,8 +624,11 @@ func ClusterUnnamed(faces []Face, threshold float64, widened Widened) []FaceClus
 		for _, f := range g {
 			c.FaceIDs = append(c.FaceIDs, f.ID)
 			items[f.ItemID] = struct{}{}
-			if t, ok := widened[f.ID]; ok && t < c.Match {
+			if t, ok := manual.Widened[f.ID]; ok && t < c.Match {
 				c.Match = t
+			}
+			if _, ok := manual.Merged[f.ID]; ok {
+				c.Merged = true
 			}
 			// Highest confidence, breaking ties on size — a detector that reports
 			// no confidence (they exist; see facerec/) would otherwise always make
@@ -497,8 +655,8 @@ func ClusterUnnamed(faces []Face, threshold float64, widened Widened) []FaceClus
 // ClusterContaining returns the group the given face belongs to — the faces that
 // get labelled when you name that cluster. Empty if the face is already named or
 // no longer exists.
-func ClusterContaining(faces []Face, threshold float64, widened Widened, faceID int64) []int64 {
-	if c, ok := ClusterOf(ClusterUnnamed(faces, threshold, widened), faceID); ok {
+func ClusterContaining(faces []Face, threshold float64, manual Grouping, faceID int64) []int64 {
+	if c, ok := ClusterOf(ClusterUnnamed(faces, threshold, manual), faceID); ok {
 		return c.FaceIDs
 	}
 	return nil
@@ -526,9 +684,9 @@ func ClusterOf(clusters []FaceCluster, faceID int64) (FaceCluster, bool) {
 //
 // The trade-off versus a proper hierarchical clustering is that it can split one
 // person across two groups when their photos vary a lot (different lighting, ten
-// years apart). That direction of error is the safe one: naming both groups with
-// the same name merges them, whereas a wrong merge would need per-face surgery
-// the UI doesn't offer.
+// years apart). That direction of error is the safe one: widen, merge and naming
+// both groups the same thing all put two groups back together, whereas a wrong
+// merge would need per-face surgery the UI doesn't offer.
 func group(faces []Face, threshold float64) [][]Face {
 	type cl struct {
 		members  []Face
@@ -616,49 +774,99 @@ func widen(groups [][]Face, threshold float64, widened Widened) [][]Face {
 		return groups
 	}
 
-	// Which group each one ends up in, by index. Merging is recorded here rather
-	// than done in place, so that what a later comparison sees is unaffected by
-	// an earlier one.
-	joined := make([]int, len(groups))
-	for i := range joined {
-		joined[i] = i
-	}
-	var root func(int) int
-	root = func(i int) int {
-		for joined[i] != i {
-			joined[i] = joined[joined[i]]
-			i = joined[i]
-		}
-		return i
-	}
+	j := newJoiner(len(groups))
 	for i := range groups {
 		if thr[i] >= threshold {
 			continue // not widened: only the marked groups go looking
 		}
-		for j := range groups {
-			if i == j || len(sums[j]) != len(sums[i]) {
+		for k := range groups {
+			if i == k || len(sums[k]) != len(sums[i]) {
 				continue
 			}
-			t := math.Min(thr[i], thr[j])
-			if meanSim(sums[i], sums[j], len(groups[i]), len(groups[j])) < t {
+			t := math.Min(thr[i], thr[k])
+			if meanSim(sums[i], sums[k], len(groups[i]), len(groups[k])) < t {
 				continue
 			}
-			if a, b := root(i), root(j); a != b {
-				// Lower index wins, so the merged group keeps the earliest
-				// members and the whole pass stays order-independent.
-				if a < b {
-					joined[b] = a
-				} else {
-					joined[a] = b
-				}
+			j.join(i, k)
+		}
+	}
+	return j.apply(groups)
+}
+
+// merge puts back together the groups a user said were one person, however far
+// apart the embeddings put them. Nothing is compared: the whole point of a merge
+// is that the judgement came from someone who can see the photographs, so there
+// is no threshold to reach and no way for it to reach anybody who wasn't named.
+//
+// After widen, so the two corrections compose rather than one overriding the
+// other: a merged group is whatever widening had already made of each half.
+func merge(groups [][]Face, merged Merged) [][]Face {
+	if len(merged) == 0 {
+		return groups
+	}
+	// A group can carry several merge ids — it may already be the result of one,
+	// or clustering may have moved its faces since — so this is a union-find over
+	// group indices rather than a bucketing by id.
+	j := newJoiner(len(groups))
+	first := make(map[int64]int, len(merged))
+	for i, g := range groups {
+		for _, f := range g {
+			m, ok := merged[f.ID]
+			if !ok {
+				continue
+			}
+			if seen, ok := first[m]; ok {
+				j.join(i, seen)
+			} else {
+				first[m] = i
 			}
 		}
 	}
+	return j.apply(groups)
+}
 
+// joiner is the union-find that widen and merge both record their decisions in.
+// Deciding which groups combine without combining them matters for widen — what
+// a later comparison sees has to be unaffected by an earlier one — and it is what
+// lets merge fold three groups into one from two separate merges.
+type joiner struct{ up []int }
+
+func newJoiner(n int) *joiner {
+	up := make([]int, n)
+	for i := range up {
+		up[i] = i
+	}
+	return &joiner{up: up}
+}
+
+func (j *joiner) root(i int) int {
+	for j.up[i] != i {
+		j.up[i] = j.up[j.up[i]]
+		i = j.up[i]
+	}
+	return i
+}
+
+// join puts two groups together. The lower index wins, so the combined group
+// keeps the earliest members and the pass stays order-independent.
+func (j *joiner) join(a, b int) {
+	ra, rb := j.root(a), j.root(b)
+	if ra == rb {
+		return
+	}
+	if ra < rb {
+		j.up[rb] = ra
+	} else {
+		j.up[ra] = rb
+	}
+}
+
+// apply collapses the groups onto their roots, in group order.
+func (j *joiner) apply(groups [][]Face) [][]Face {
 	out := make([][]Face, 0, len(groups))
 	at := make(map[int]int, len(groups)) // group index -> where it landed in out
 	for i, g := range groups {
-		r := root(i)
+		r := j.root(i)
 		if r == i {
 			at[i] = len(out)
 			// Clipped, so absorbing into it copies rather than writing over
@@ -671,7 +879,7 @@ func widen(groups [][]Face, threshold float64, widened Widened) [][]Face {
 	for _, g := range out {
 		// Back into id order, so the group is still identified by its lowest
 		// face id however the merging got there.
-		sort.Slice(g, func(i, j int) bool { return g[i].ID < g[j].ID })
+		sort.Slice(g, func(i, k int) bool { return g[i].ID < g[k].ID })
 	}
 	return out
 }

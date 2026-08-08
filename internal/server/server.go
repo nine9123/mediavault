@@ -95,6 +95,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("DELETE /api/people", s.handleForgetPerson)
 	mux.HandleFunc("POST /api/people/regroup", s.handleWidenGroup)
 	mux.HandleFunc("DELETE /api/people/regroup", s.handleResetGroup)
+	mux.HandleFunc("POST /api/people/merge", s.handleMergeGroups)
+	mux.HandleFunc("DELETE /api/people/merge", s.handleUnmergeGroup)
 	mux.HandleFunc("POST /api/faces/reset", s.handleResetFaces)
 	mux.HandleFunc("GET /api/face/{id}", s.handleFaceCrop)
 	mux.HandleFunc("GET /api/stats", s.handleStats)

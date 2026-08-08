@@ -161,6 +161,118 @@ func TestNamingAWidenedGroupLabelsAllOfIt(t *testing.T) {
 	}
 }
 
+// Merging is for the split widening cannot repair. These three faces are
+// mutually orthogonal — no threshold down to the floor would bring any two of
+// them together — so the only thing that can join two of them is somebody saying
+// so, and the third must not move.
+func TestMergeGroupsFusesTwoGroupsNoWideningWouldReach(t *testing.T) {
+	_, st, h := peopleServer(t)
+	detect(t, st, "a.jpg", 1, 0, 0, 0)
+	detect(t, st, "b.jpg", 0, 1, 0, 0) // the same person, as far as the user is concerned
+	detect(t, st, "c.jpg", 0, 0, 1, 0) // somebody else
+
+	before := clusterRefs(t, h)
+	if len(before) != 3 {
+		t.Fatalf("got %d groups, want one per face: nothing here looks alike", len(before))
+	}
+	code, d := do(t, h, "POST", "/api/people/merge",
+		`{"ref":"`+before[0]["ref"].(string)+`","into":"`+before[1]["ref"].(string)+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("merge: status %d (%v)", code, d)
+	}
+	if d["faces"].(float64) != 2 || d["items"].(float64) != 2 {
+		t.Errorf("merged group = %v, want 2 faces in 2 items", d)
+	}
+
+	after := clusterRefs(t, h)
+	if len(after) != 2 {
+		t.Fatalf("got %d groups after merging, want 2", len(after))
+	}
+	if after[0]["faces"].(float64) != 2 || after[0]["merged"] != true {
+		t.Errorf("merged group = %v, want 2 faces flagged as merged", after[0])
+	}
+	// A merge compares nothing, so the group is still grouped at the library's
+	// number and the card must not imply it was widened.
+	if _, widened := after[0]["match"]; widened {
+		t.Errorf("merged group reports a match of its own: %v", after[0])
+	}
+	if _, merged := after[1]["merged"]; merged {
+		t.Errorf("the bystander was caught up in the merge: %v", after[1])
+	}
+
+	// Naming it labels both halves — being able to name them once is the point.
+	code, d = do(t, h, "PUT", "/api/people", `{"ref":"`+after[0]["ref"].(string)+`","name":"Jane"}`)
+	if code != http.StatusOK {
+		t.Fatalf("name: status %d (%v)", code, d)
+	}
+	if d["faces"].(float64) != 2 {
+		t.Errorf("named %v faces, want both halves of the merge", d["faces"])
+	}
+}
+
+func TestMergingAThirdGroupInAndUnmergingThemAll(t *testing.T) {
+	_, st, h := peopleServer(t)
+	detect(t, st, "a.jpg", 1, 0, 0, 0)
+	detect(t, st, "b.jpg", 0, 1, 0, 0)
+	detect(t, st, "c.jpg", 0, 0, 1, 0)
+
+	refs := clusterRefs(t, h)
+	if code, d := do(t, h, "POST", "/api/people/merge",
+		`{"ref":"`+refs[0]["ref"].(string)+`","into":"`+refs[1]["ref"].(string)+`"}`); code != http.StatusOK {
+		t.Fatalf("first merge: status %d (%v)", code, d)
+	}
+	// The biggest group sorts first, so refs[0] is now the pair and refs[1] the
+	// straggler being added to it.
+	refs = clusterRefs(t, h)
+	code, d := do(t, h, "POST", "/api/people/merge",
+		`{"ref":"`+refs[1]["ref"].(string)+`","into":"`+refs[0]["ref"].(string)+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("second merge: status %d (%v)", code, d)
+	}
+	if d["faces"].(float64) != 3 {
+		t.Errorf("merged group = %v, want all three: merging onto a merge is one group, not two", d)
+	}
+	joined := clusterRefs(t, h)
+	if len(joined) != 1 {
+		t.Fatalf("got %d groups, want them all in one", len(joined))
+	}
+
+	// One undo rather than one per merge: once three groups are fused there is no
+	// "last merge" the page could offer to take back.
+	if code, _ := do(t, h, "DELETE", "/api/people/merge?ref="+joined[0]["ref"].(string), ""); code != http.StatusOK {
+		t.Fatalf("unmerge: status %d", code)
+	}
+	if got := clusterRefs(t, h); len(got) != 3 {
+		t.Errorf("got %d groups after unmerging, want the original 3", len(got))
+	}
+}
+
+func TestMergeGroupsRejectsAnythingThatIsntTwoGroups(t *testing.T) {
+	_, st, h := peopleServer(t)
+	detect(t, st, "a.jpg", 1, 0, 0, 0)
+	detect(t, st, "b.jpg", 0, 1, 0, 0)
+	ref := clusterRefs(t, h)[0]["ref"].(string)
+
+	if code, _ := do(t, h, "POST", "/api/people/merge", `{"ref":"`+ref+`","into":"p1"}`); code != http.StatusBadRequest {
+		t.Errorf("a named person as the target got status %d, want 400", code)
+	}
+	if code, _ := do(t, h, "POST", "/api/people/merge", `{"ref":"`+ref+`","into":"f9999"}`); code != http.StatusConflict {
+		t.Errorf("an unknown group got status %d, want 409", code)
+	}
+	if code, _ := do(t, h, "POST", "/api/people/merge", `{"ref":"`+ref+`","into":"`+ref+`"}`); code != http.StatusConflict {
+		t.Errorf("merging a group with itself got status %d, want 409", code)
+	}
+	// None of those should have written anything.
+	for _, c := range clusterRefs(t, h) {
+		if _, merged := c["merged"]; merged {
+			t.Errorf("a rejected merge still marked %v as merged", c)
+		}
+	}
+	if code, _ := do(t, h, "DELETE", "/api/people/merge?ref=p1", ""); code != http.StatusBadRequest {
+		t.Errorf("unmerging a person ref got status %d, want 400", code)
+	}
+}
+
 func TestWidenGroupRejectsBadRefsAndStopsAtTheFloor(t *testing.T) {
 	_, st, h := peopleServer(t)
 	detect(t, st, "a.jpg", 1, 0, 0, 0)
