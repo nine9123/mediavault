@@ -1288,6 +1288,10 @@
     S.personRef = null;
     reset();
     el.sentinel.classList.add("hidden");
+    // Rendered before the fetch, not with the results: if /api/people fails there
+    // would otherwise be nothing on the page to click.
+    el.pagehead.appendChild(backBtn("\u2039 Library", showBrowse));
+    el.pagehead.classList.remove("hidden");
     if (!noHist) history.pushState({}, "", "#people=1");
     el.people.classList.remove("hidden");
     api("/api/people").then(function (d) {
@@ -1341,6 +1345,25 @@
     d.className = "pface noface";
     d.textContent = "\u25cb";
     return d;
+  }
+
+  // The way out of People and of a person. Both pages replace the grid entirely,
+  // so there is nothing behind them to click, and arriving from a bookmark leaves
+  // no history entry to go Back to either — the button is the only exit.
+  function backBtn(label, onClick) {
+    var b = document.createElement("button");
+    b.className = "cardbtn";
+    b.type = "button";
+    b.textContent = label;
+    b.style.marginTop = "0";
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function showBrowse() {
+    history.pushState({}, "", baseURL());
+    el.q.value = "";
+    applySearch("", true);
   }
 
   function peopleCard(p) {
@@ -1449,12 +1472,7 @@
 
   function renderPersonHead(ref, name) {
     el.pagehead.innerHTML = "";
-    var back = document.createElement("button");
-    back.className = "cardbtn";
-    back.type = "button";
-    back.textContent = "\u2039 People";
-    back.style.marginTop = "0";
-    back.addEventListener("click", function () { showPeople(false); });
+    var back = backBtn("\u2039 People", function () { showPeople(false); });
     var title = document.createElement("span");
     title.className = "title";
     title.textContent = name || (ref.charAt(0) === "p" ? "Person" : "Unnamed group");

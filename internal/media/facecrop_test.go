@@ -1,8 +1,14 @@
 package media
 
 import (
+	"context"
 	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
+
+	"mediavault/internal/model"
 )
 
 // The crop cache is keyed on (relpath, box) rather than on the face's database id
@@ -47,5 +53,67 @@ func TestPadStaysInsideTheFrame(t *testing.T) {
 	_, _, w, _ := pad(0.4, 0.4, 0.2, 0.2, faceMargin)
 	if math.Abs(w-0.2*(1+faceMargin)) > 1e-9 {
 		t.Errorf("padded width %.4f, want %.4f", w, 0.2*(1+faceMargin))
+	}
+}
+
+// The People page's covers are cut to a temp name and renamed into place, so dst
+// carries no image extension. ffmpeg guesses its output format from that name
+// unless told otherwise, and guessing on ".tmp" fails outright — which showed up
+// as every face card on the page falling back to its placeholder.
+func TestFaceCropIgnoresTheDestinationExtension(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed; skipping integration test")
+	}
+	cfg := testCfg(t)
+	ctx := context.Background()
+
+	src := filepath.Join(cfg.DataDir, "fixture.png")
+	mk := exec.CommandContext(ctx, "ffmpeg", "-nostdin", "-v", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=640x480", "-frames:v", "1", "-y", src)
+	if out, err := mk.CombinedOutput(); err != nil {
+		t.Fatalf("building fixture: %v: %s", err, out)
+	}
+
+	dst := filepath.Join(cfg.DataDir, "faces", "abc123.jpg.7.tmp")
+	if err := FaceCrop(ctx, cfg, src, model.MediaImage, 0, 0.3, 0.3, 0.2, 0.2, dst); err != nil {
+		t.Fatalf("FaceCrop: %v", err)
+	}
+	b, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) < 2 || b[0] != 0xFF || b[1] != 0xD8 {
+		t.Errorf("crop is not a JPEG (%d bytes)", len(b))
+	}
+}
+
+// A clip shorter than its poster offset yields no frame at the seek point, and
+// ffmpeg reports that by writing nothing and exiting 0 — so the retry from the
+// start has to be triggered by the missing file, not by the exit status.
+func TestFaceCropFallsBackOnAClipShorterThanTheSeek(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed; skipping integration test")
+	}
+	cfg := testCfg(t)
+	ctx := context.Background()
+
+	src := filepath.Join(cfg.DataDir, "short.mp4")
+	mk := exec.CommandContext(ctx, "ffmpeg", "-nostdin", "-v", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-t", "1",
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-y", src)
+	if out, err := mk.CombinedOutput(); err != nil {
+		t.Fatalf("building fixture: %v: %s", err, out)
+	}
+
+	dst := filepath.Join(cfg.DataDir, "faces", "short.jpg.1.tmp")
+	if err := FaceCrop(ctx, cfg, src, model.MediaVideo, 0, 0.3, 0.3, 0.2, 0.2, dst); err != nil {
+		t.Fatalf("FaceCrop: %v", err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("no crop written: %v", err)
+	}
+	if fi.Size() == 0 {
+		t.Error("crop is empty")
 	}
 }
