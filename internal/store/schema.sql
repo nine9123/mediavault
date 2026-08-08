@@ -132,4 +132,14 @@ CREATE TABLE IF NOT EXISTS faces (
 CREATE INDEX IF NOT EXISTS idx_faces_item   ON faces(item_id);
 CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);
 
+-- Per-group similarity overrides: "this group was split from another; group it
+-- at a lower threshold than the rest of the library". face_id is the group's key
+-- face — groups have no id, so that is the only handle they have. Cache, like
+-- everything else here: a widening is a step towards naming the group, and the
+-- name is what gets written to people.json.
+CREATE TABLE IF NOT EXISTS face_group_match (
+    face_id INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
+    match   REAL NOT NULL              -- cosine threshold, below the global one
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(relpath, tags);

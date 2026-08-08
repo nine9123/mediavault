@@ -1395,6 +1395,9 @@
     var meta = document.createElement("div");
     meta.className = "pmeta";
     meta.textContent = p.items + (p.items === 1 ? " item" : " items") + " \u00b7 " + p.faces + " faces";
+    // A widened group is grouped at its own number, so say which \u2014 otherwise the
+    // only sign that this group behaves differently is that it got bigger.
+    if (p.match) meta.textContent += " \u00b7 match " + p.match.toFixed(2);
     card.appendChild(meta);
 
     var acts = document.createElement("div");
@@ -1413,6 +1416,26 @@
       forget.title = "Remove the name. The faces stay, and the group can be named again.";
       forget.addEventListener("click", function (e) { e.stopPropagation(); forgetPerson(p); });
       acts.appendChild(forget);
+    } else {
+      // Only unnamed groups get these: a named person's faces are matched
+      // against their examples, not clustered, so there is no threshold of
+      // theirs to widen.
+      var wider = document.createElement("button");
+      wider.className = "cardbtn";
+      wider.type = "button";
+      wider.textContent = "Widen";
+      wider.title = "Same person in two groups? Lower the match for this one group by 0.1 and re-check just here — nothing is re-detected, and the rest of the page is unaffected.";
+      wider.addEventListener("click", function (e) { e.stopPropagation(); widenGroup(p); });
+      acts.appendChild(wider);
+      if (p.match) {
+        var narrower = document.createElement("button");
+        narrower.className = "cardbtn";
+        narrower.type = "button";
+        narrower.textContent = "Reset match";
+        narrower.title = "Put this group back under the library-wide match.";
+        narrower.addEventListener("click", function (e) { e.stopPropagation(); resetGroup(p); });
+        acts.appendChild(narrower);
+      }
     }
     card.appendChild(acts);
     return card;
@@ -1437,6 +1460,38 @@
       });
     }).then(function () { showPeople(true); })
       .catch(function (e) { window.alert("Couldn't save that name: " + e.message); });
+  }
+
+  // "The same person, in two groups." Widening lowers the match for this one
+  // group and re-groups only there, so the other half is pulled in without
+  // re-detecting anything or changing how the rest of the library is grouped.
+  // Repeatable: each click goes another 0.1 looser, down to a floor.
+  function widenGroup(p) {
+    fetch("/api/people/regroup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ref: p.ref })
+    }).then(function (r) {
+      return r.text().then(function (body) {
+        if (!r.ok) throw new Error((body || "").trim() || ("HTTP " + r.status));
+        return JSON.parse(body || "{}");
+      });
+    }).then(function (d) {
+      showPeople(true);
+      // Nothing came within reach, so say so rather than leaving the user to
+      // spot that only the number under the card changed.
+      if (!d.absorbed) {
+        window.alert("Nothing new joined at match " + (d.match || 0).toFixed(2) +
+          ".\nWiden again, or name both groups the same thing to merge them.");
+      }
+    }).catch(function (e) { window.alert("Couldn't widen that group: " + e.message); });
+  }
+
+  function resetGroup(p) {
+    fetch("/api/people/regroup?ref=" + encodeURIComponent(p.ref), { method: "DELETE" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); })
+      .then(function () { showPeople(true); })
+      .catch(function (e) { window.alert("Couldn't reset that group: " + e.message); });
   }
 
   function forgetPerson(p) {

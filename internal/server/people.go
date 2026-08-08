@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -45,12 +46,24 @@ func (s *Server) requireFaces(w http.ResponseWriter) bool {
 // silently truncating.
 const maxClusters = 120
 
+// How far a single group can be widened, and by how much per click.
+//
+// The floor is not a property of the model the way the threshold is — it is the
+// point past which "these look alike" stops meaning anything for any model, and
+// one group swallows the page. A user who really wants everything in one group
+// has a better tool for it: name them all the same thing.
+const (
+	widenStep = 0.1
+	minMatch  = 0.1
+)
+
 type personDTO struct {
-	Ref      string `json:"ref"`
-	Name     string `json:"name,omitempty"`
-	Faces    int    `json:"faces"`
-	Items    int    `json:"items"`
-	CoverURL string `json:"cover_url,omitempty"`
+	Ref      string  `json:"ref"`
+	Name     string  `json:"name,omitempty"`
+	Faces    int     `json:"faces"`
+	Items    int     `json:"items"`
+	CoverURL string  `json:"cover_url,omitempty"`
+	Match    float64 `json:"match,omitempty"` // set only on a widened group
 }
 
 // handlePeople lists named people first, then the unnamed groups worth naming.
@@ -63,12 +76,13 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	faces, err := s.store.AllFaces(r.Context())
+	faces, widened, err := s.faceGrouping(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	clusters := store.ClusterUnnamed(faces, s.rec.Match())
+	match := s.rec.Match()
+	clusters := store.ClusterUnnamed(faces, match, widened)
 
 	outPeople := make([]personDTO, 0, len(people))
 	for _, p := range people {
@@ -86,19 +100,25 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 	}
 	outClusters := make([]personDTO, 0, len(shown))
 	for _, c := range shown {
-		outClusters = append(outClusters, personDTO{
+		d := personDTO{
 			Ref:      clusterPrefix + strconv.FormatInt(c.KeyFaceID, 10),
 			Faces:    c.Faces,
 			Items:    c.Items,
 			CoverURL: faceURL(c.CoverFaceID),
-		})
+		}
+		// Only when it differs, so the page can tell "widened" from "normal"
+		// without knowing the library-wide number.
+		if c.Match < match {
+			d.Match = c.Match
+		}
+		outClusters = append(outClusters, d)
 	}
 
 	resp := map[string]any{
 		"people":         outPeople,
 		"clusters":       outClusters,
 		"clusters_total": len(clusters),
-		"match":          s.rec.Match(),
+		"match":          match,
 	}
 	if visual, done, nfaces, named, err := s.store.FaceCounts(r.Context()); err == nil {
 		resp["progress"] = map[string]any{
@@ -181,12 +201,12 @@ func (s *Server) handleNamePerson(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad ref", http.StatusBadRequest)
 		return
 	}
-	faces, err := s.store.AllFaces(r.Context())
+	faces, widened, err := s.faceGrouping(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	ids := store.ClusterContaining(faces, s.rec.Match(), faceID)
+	ids := store.ClusterContaining(faces, s.rec.Match(), widened, faceID)
 	if len(ids) == 0 {
 		// The group dissolved under us — someone else named it, or a rescan
 		// changed the face set. Saying so beats silently creating an empty person.
@@ -229,6 +249,127 @@ func (s *Server) handleForgetPerson(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.rec.Forget(r.Context(), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+// handleWidenGroup lowers one group's similarity threshold and re-groups just
+// there, so the other half of a person split in two gets pulled in.
+//
+// This is the cheap repair for the error clustering deliberately makes (see
+// store.group): everything else on the page is grouped correctly, so re-running
+// the library at a looser number would trade this split for merged strangers
+// elsewhere. Nothing is re-detected — the embeddings are already stored, and the
+// only thing that changes is the number they are compared at.
+func (s *Server) handleWidenGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFaces(w) {
+		return
+	}
+	var req struct {
+		Ref  string  `json:"ref"`
+		Step float64 `json:"step"` // optional; how far to lower it
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	faceID, ok := clusterRef(strings.TrimSpace(req.Ref))
+	if !ok {
+		// A named person has no threshold of their own: their faces are matched
+		// against their examples, not clustered.
+		http.Error(w, "widening applies to unnamed groups only", http.StatusBadRequest)
+		return
+	}
+	step := req.Step
+	if step <= 0 {
+		step = widenStep
+	}
+	if step > 0.5 {
+		step = 0.5
+	}
+
+	faces, widened, err := s.faceGrouping(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	match := s.rec.Match()
+	before := store.ClusterUnnamed(faces, match, widened)
+	cur, ok := store.ClusterOf(before, faceID)
+	if !ok {
+		http.Error(w, "that group of faces no longer exists — reload the People page", http.StatusConflict)
+		return
+	}
+	// Rounded, because this number is shown on the card and stored: repeated
+	// subtraction of 0.1 in binary floating point reaches 0.7000000000000001,
+	// and two hundredths is finer than any threshold anyone reasons about.
+	next := math.Round((cur.Match-step)*100) / 100
+	if next < minMatch {
+		next = minMatch
+	}
+	if next >= cur.Match {
+		http.Error(w, "this group is already as wide as it goes — name both groups the same thing to merge them",
+			http.StatusConflict)
+		return
+	}
+
+	if err := s.store.WidenFaceGroup(r.Context(), cur.KeyFaceID, next); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Re-group with the new number in hand rather than making the page ask again:
+	// what the user wants to know is whether anything joined.
+	widened[cur.KeyFaceID] = next
+	got, ok := store.ClusterOf(store.ClusterUnnamed(faces, match, widened), cur.KeyFaceID)
+	if !ok {
+		http.Error(w, "regrouping lost that group — reload the People page", http.StatusInternalServerError)
+		return
+	}
+	in := make(map[int64]bool, len(got.FaceIDs))
+	for _, id := range got.FaceIDs {
+		in[id] = true
+	}
+	absorbed := 0
+	for _, c := range before {
+		if c.KeyFaceID != cur.KeyFaceID && in[c.KeyFaceID] {
+			absorbed++
+		}
+	}
+	writeJSON(w, map[string]any{
+		"ok":       true,
+		"ref":      clusterPrefix + strconv.FormatInt(got.KeyFaceID, 10),
+		"match":    next,
+		"faces":    got.Faces,
+		"items":    got.Items,
+		"absorbed": absorbed, // how many other groups joined this one
+	})
+}
+
+// handleResetGroup puts a widened group back under the library-wide threshold.
+func (s *Server) handleResetGroup(w http.ResponseWriter, r *http.Request) {
+	if !s.requireFaces(w) {
+		return
+	}
+	faceID, ok := clusterRef(strings.TrimSpace(r.URL.Query().Get("ref")))
+	if !ok {
+		http.Error(w, "bad ref", http.StatusBadRequest)
+		return
+	}
+	faces, widened, err := s.faceGrouping(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	c, ok := store.ClusterOf(store.ClusterUnnamed(faces, s.rec.Match(), widened), faceID)
+	if !ok {
+		http.Error(w, "that group of faces no longer exists — reload the People page", http.StatusConflict)
+		return
+	}
+	// The whole group, not its key: widening merges groups, so the face the
+	// override was written against may be any member by now.
+	if err := s.store.ResetFaceGroup(r.Context(), c.FaceIDs); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -317,11 +458,26 @@ func faceURL(faceID int64) string {
 
 // clusterFaceIDs resolves an unnamed group's key face to the whole group.
 func (s *Server) clusterFaceIDs(r *http.Request, keyFaceID int64) ([]int64, error) {
-	faces, err := s.store.AllFaces(r.Context())
+	faces, widened, err := s.faceGrouping(r)
 	if err != nil {
 		return nil, err
 	}
-	return store.ClusterContaining(faces, s.rec.Match(), keyFaceID), nil
+	return store.ClusterContaining(faces, s.rec.Match(), widened, keyFaceID), nil
+}
+
+// faceGrouping fetches both inputs to clustering: every face, and the per-group
+// thresholds. Always together — grouping the page with one number and naming a
+// group with another would label a different set of faces than the one shown.
+func (s *Server) faceGrouping(r *http.Request) ([]store.Face, store.Widened, error) {
+	faces, err := s.store.AllFaces(r.Context())
+	if err != nil {
+		return nil, nil, err
+	}
+	widened, err := s.store.FaceGroupMatches(r.Context())
+	if err != nil {
+		return nil, nil, err
+	}
+	return faces, widened, nil
 }
 
 // faceDTO is one face in one item, as the viewer's card shows it. Deliberately
