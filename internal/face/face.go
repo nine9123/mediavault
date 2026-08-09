@@ -59,9 +59,16 @@ type Info struct {
 	Match float64 // recommended cosine threshold; 0 if the service doesn't say
 }
 
-// The generous cap is a backstop only; callers set real deadlines via ctx.
-// Detection on CPU can take a few seconds per frame.
-var client = &http.Client{Timeout: 2 * time.Minute}
+// client has no timeout of its own: each call below sets a deadline suited to
+// what it is doing, because they are not comparable. A health probe that takes
+// more than a moment is a service that isn't there; one frame through a CNN
+// detector on a busy CPU legitimately takes minutes, and cutting it off at some
+// number chosen here would quietly cost the user those faces.
+var client = &http.Client{}
+
+// healthTimeout bounds the startup probe. It is only there to keep an
+// unreachable service from wedging the worker before it starts.
+const healthTimeout = 15 * time.Second
 
 // StatusError is a non-200 reply from the recognition service.
 type StatusError struct {
@@ -84,6 +91,13 @@ func PermanentError(err error) bool {
 	return se.Code >= 400 && se.Code < 500 && se.Code != http.StatusTooManyRequests
 }
 
+// TimedOut reports whether err is this call running past its deadline, as
+// opposed to the service being unreachable or the app shutting down. Callers
+// treat it as a property of the frame rather than of the service: a frame that
+// takes longer than the budget will take longer than it again next time, and
+// retrying it forever is how a work queue stops moving.
+func TimedOut(err error) bool { return errors.Is(err, context.DeadlineExceeded) }
+
 type wireFace struct {
 	Box       []float64 `json:"box"`
 	Score     float64   `json:"score"`
@@ -95,6 +109,11 @@ type wireFace struct {
 func Detect(ctx context.Context, cfg config.Config, jpeg []byte) ([]Detection, error) {
 	if cfg.FaceURL == "" {
 		return nil, fmt.Errorf("FACE_URL not set")
+	}
+	if cfg.FaceTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.FaceTimeout)
+		defer cancel()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		strings.TrimRight(cfg.FaceURL, "/")+"/detect", bytes.NewReader(jpeg))
@@ -144,6 +163,8 @@ func Health(ctx context.Context, cfg config.Config) (Info, error) {
 	if cfg.FaceURL == "" {
 		return Info{}, fmt.Errorf("FACE_URL not set")
 	}
+	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		strings.TrimRight(cfg.FaceURL, "/")+"/health", nil)
 	if err != nil {

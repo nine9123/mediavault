@@ -37,6 +37,8 @@ services:
       # FACE_URL: "http://facerec:8000"
       # FACE_MATCH: "0.82"      # cosine threshold; unset = use what the service advertises
       # FACE_FRAME_PX: "1280"   # frame size sent to the detector; larger finds smaller faces
+      # FACE_WORKERS: "2"       # frames in flight; extraction and inference overlap
+      # FACE_TIMEOUT: "3m"      # a frame slower than this is skipped, not retried forever
     volumes:
       # Your NAS SMB mount = source of truth. READ-ONLY on purpose.
       - /mnt/nas/media:/media:ro
@@ -66,7 +68,13 @@ services:
   #   restart: unless-stopped
   #   environment:
   #     FACE_MODEL: "hog"       # or "cnn": better on small/turned faces, much slower
-  #     FACE_UPSAMPLE: "1"      # "2" finds smaller faces at ~4x the cost
+  #     # The rest default per-model and are usually best left alone. What they
+  #     # cost is not obvious: detection memory and time go with the pixel count
+  #     # of the frame AFTER upsampling, so each step of FACE_UPSAMPLE is 4x, and
+  #     # with cnn that reaches gigabytes. FACE_DETECT_PX is the ceiling on it.
+  #     # FACE_UPSAMPLE: "1"      # hog default; 0 for cnn. "2" finds smaller faces at ~4x the cost
+  #     # FACE_DETECT_PX: "2560"  # hog default; 960 for cnn. Lower it if this container is short of RAM
+  #     # FACE_CONCURRENCY: "2"   # hog default; 1 for cnn. Each one costs another copy of that memory
   #   # No ports published: only mediavault needs to reach it, over the compose
   #   # network. Publish 8000 only if you want to curl /health from the host.
 

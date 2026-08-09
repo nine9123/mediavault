@@ -3,9 +3,9 @@
 // service, plus the bookkeeping that turns detections into named people.
 //
 // It is entirely optional — nothing runs unless FACE_URL is set — and it follows
-// the same shape as internal/describe: one item at a time, because inference is
-// the bottleneck, retried on a ticker so an unreachable service is just slow
-// progress rather than an error state.
+// the same shape as internal/describe: a small number of items in flight (see
+// FACE_WORKERS) because inference is the bottleneck, retried on a ticker so an
+// unreachable service is just slow progress rather than an error state.
 //
 // The split of responsibility is the important part:
 //
@@ -29,6 +29,7 @@ import (
 	"mediavault/internal/config"
 	"mediavault/internal/face"
 	"mediavault/internal/media"
+	"mediavault/internal/model"
 	"mediavault/internal/sidecar"
 	"mediavault/internal/store"
 )
@@ -73,7 +74,7 @@ type Recognizer struct {
 
 	mu       sync.Mutex
 	match    float64             // resolved threshold; 0 until asked
-	failed   map[string]struct{} // frames we couldn't extract; skip for this run
+	failed   map[string]struct{} // items we couldn't get a detection for; skip for this run
 	peopleAt time.Time           // people.json mtime at the last sync
 	syncedAt time.Time           // when the last sync ran (rate-limits reconciling)
 	dirty    bool                // detections changed since the last sync
@@ -99,6 +100,32 @@ func (r *Recognizer) Match() float64 {
 		return r.match
 	}
 	return DefaultMatch
+}
+
+// Skipped is how many items this run has given up on: no frame came out of
+// them, or the detector wouldn't take the one that did. They keep their place in
+// the queue and are tried again after a restart; the People page reports the
+// number because otherwise a detection count that stops short of the total looks
+// like a worker that has stopped, which is the one thing it doesn't mean.
+func (r *Recognizer) Skipped() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.failed)
+}
+
+// skip marks an item as not worth trying again this run.
+func (r *Recognizer) skip(relpath string) {
+	r.mu.Lock()
+	r.failed[relpath] = struct{}{}
+	r.mu.Unlock()
+}
+
+// skipping reports whether an item has already been given up on.
+func (r *Recognizer) skipping(relpath string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.failed[relpath]
+	return ok
 }
 
 // learnMatch records the threshold the service recommends for its model.
@@ -143,15 +170,23 @@ func (r *Recognizer) Run(ctx context.Context) {
 // watch faces pile up with nobody's name on them until it finished. needsSync
 // rate-limits the reconcile, so this costs a full-face scan a minute, not one per
 // batch.
+//
+// skip is what keeps the pass moving. An item detection can't do anything with
+// keeps faces_done = 0 and so stays in the queue, at the same place, forever;
+// counting those and asking for the next batch past them is the difference
+// between "a few files in this library are unreadable" and a worker that stops
+// dead partway through and never says why.
 func (r *Recognizer) pass(ctx context.Context) {
+	skip := 0
 	for {
-		progressed := r.detectBatch(ctx)
+		examined, done := r.detectBatch(ctx, skip)
+		skip += examined
 		if r.needsSync() {
 			if err := r.Sync(ctx); err != nil {
 				log.Printf("faces: sync: %v", err)
 			}
 		}
-		if !progressed || ctx.Err() != nil {
+		if done || ctx.Err() != nil {
 			return
 		}
 	}
@@ -180,61 +215,151 @@ func (r *Recognizer) needsSync() bool {
 	return fi.ModTime().After(r.peopleAt)
 }
 
-// detectBatch sends one batch of not-yet-examined items to the service. It reports
-// whether anything was stored, which is also the "keep going" signal: false means
-// the queue is empty, everything in it was skipped, or the service failed in a way
-// that asks to be left alone for a while.
-func (r *Recognizer) detectBatch(ctx context.Context) bool {
+// detectBatch sends one batch of not-yet-examined items to the service, starting
+// skip items into the queue.
+//
+// It returns how many of them are still going to be in that queue afterwards —
+// the ones to step over next time — and whether the pass should stop, which means
+// the queue ran out or the service failed in a way that asks to be left alone for
+// a while.
+//
+// Extraction and inference run concurrently (FACE_WORKERS of them), because they
+// are not the same bottleneck: pulling a frame out of a video over a network
+// mount is seconds of waiting on ffmpeg and the NAS, during which the detector —
+// the expensive half — has nothing to do. The writes stay on this goroutine, in
+// queue order, so the store still sees one writer.
+func (r *Recognizer) detectBatch(ctx context.Context, skip int) (examined int, done bool) {
 	if ctx.Err() != nil {
-		return false
+		return 0, true
 	}
-	items, err := r.store.ItemsNeedingFaces(ctx, batch)
+	items, err := r.store.ItemsNeedingFaces(ctx, batch, skip)
 	if err != nil {
 		log.Printf("faces: list: %v", err)
-		return false
+		return 0, true
 	}
+	todo := make([]model.Item, 0, len(items))
+	for _, it := range items {
+		if r.skipping(it.Relpath) {
+			examined++ // still in the queue, still not going to work; step over it
+			continue
+		}
+		todo = append(todo, it)
+	}
+	if len(items) < batch {
+		done = true // the queue ends here
+	}
+	if len(todo) == 0 {
+		return examined, done
+	}
+
+	results := r.detectItems(ctx, todo)
 	progressed := false
 	defer func() {
 		if progressed {
 			r.markDirty()
 		}
 	}()
-	for _, it := range items {
-		if ctx.Err() != nil {
-			return progressed
+	unwell := 0 // transient failures this batch; they all have the same cause
+	for _, res := range results {
+		if !res.ran {
+			return examined, true // shutting down
 		}
-		if _, skip := r.failed[it.Relpath]; skip {
-			continue
-		}
-		abs := filepath.Join(r.cfg.MediaRoot, filepath.FromSlash(it.Relpath))
-		jpeg, err := media.FrameJPEG(ctx, r.cfg, abs, it.Type, it.Offset, r.cfg.FaceFramePx)
-		if err != nil {
-			r.failed[it.Relpath] = struct{}{} // no frame; skip this run
-			continue
-		}
-		dets, err := face.Detect(ctx, r.cfg, jpeg)
-		if err != nil {
-			// A 4xx is this frame being rejected; anything else is the service being
-			// unhappy, and hammering it makes that worse. Same split as the
-			// captioning worker, for the same reason: one bad input must not starve
-			// the queue behind it.
-			if face.PermanentError(err) {
-				log.Printf("faces: detect %s: %v (skipping)", it.Relpath, err)
-				r.failed[it.Relpath] = struct{}{}
+		switch {
+		case res.err != nil && res.frame:
+			// No frame to send: an unreadable file, a codec ffmpeg won't decode, a
+			// mount that went away. Nothing about that changes this run.
+			r.skip(res.item.Relpath)
+			examined++
+		case res.err != nil && face.PermanentError(res.err):
+			// A 4xx is this frame being rejected rather than the service being
+			// unwell. Same split as the captioning worker, for the same reason: one
+			// bad input must not starve the queue behind it.
+			log.Printf("faces: detect %s: %v (skipping)", res.item.Relpath, res.err)
+			r.skip(res.item.Relpath)
+			examined++
+		case res.err != nil && face.TimedOut(res.err):
+			// The service is alive but this frame took longer than FACE_TIMEOUT.
+			// Retrying it means spending that time again to fail again, and doing so
+			// at the head of the queue means nothing behind it is ever looked at —
+			// which is what a stuck detection count looks like from outside.
+			log.Printf("faces: detect %s: gave up after %s (skipping; raise FACE_TIMEOUT, "+
+				"or lower FACE_FRAME_PX / FACE_UPSAMPLE if this is most frames)",
+				res.item.Relpath, r.cfg.FaceTimeout)
+			r.skip(res.item.Relpath)
+			examined++
+		case res.err != nil:
+			// One line, not one per item in flight: they are all the same service
+			// having the same problem, and the tail of them says nothing new.
+			if unwell == 0 {
+				log.Printf("faces: detect: %v", res.err)
+			}
+			unwell++
+			examined++
+			done = true // the service is unhappy; hammering it makes that worse
+		default:
+			if err := r.store.SetFaces(ctx, res.item.Relpath, toWrites(res.dets, r.cfg.FaceMaxPerItem)); err != nil {
+				log.Printf("faces: save %s: %v", res.item.Relpath, err)
+				examined++
 				continue
 			}
-			log.Printf("faces: detect: %v", err)
-			return progressed
+			progressed = true
 		}
-		if err := r.store.SetFaces(ctx, it.Relpath, toWrites(dets, r.cfg.FaceMaxPerItem)); err != nil {
-			log.Printf("faces: save %s: %v", it.Relpath, err)
-			continue
-		}
-		progressed = true
 	}
-	// A batch of nothing but skips returns false, so the caller stops: none of
-	// those rows will gain a detection this run, and re-querying them is a loop.
-	return progressed
+	if unwell > 1 {
+		log.Printf("faces: detect: %d more frames failed the same way; leaving the service alone for a bit", unwell-1)
+	}
+	return examined, done
+}
+
+// attempt is one item's trip through extraction and detection.
+type attempt struct {
+	item  model.Item
+	dets  []face.Detection
+	err   error
+	frame bool // the error was extracting the frame, not detecting on it
+	ran   bool // false only if we shut down before getting to this item
+}
+
+// detectItems extracts and detects a batch's worth of items in parallel,
+// returning the outcomes in the order they were given.
+func (r *Recognizer) detectItems(ctx context.Context, items []model.Item) []attempt {
+	n := r.cfg.FaceWorkers
+	if n < 1 {
+		n = 1
+	}
+	if n > len(items) {
+		n = len(items)
+	}
+	out := make([]attempt, len(items))
+	queue := make(chan int, len(items))
+	for i := range items {
+		queue <- i
+	}
+	close(queue)
+
+	var wg sync.WaitGroup
+	for w := 0; w < n; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range queue {
+				if ctx.Err() != nil {
+					return
+				}
+				it := items[i]
+				out[i] = attempt{item: it, ran: true}
+				abs := filepath.Join(r.cfg.MediaRoot, filepath.FromSlash(it.Relpath))
+				jpeg, err := media.FrameJPEG(ctx, r.cfg, abs, it.Type, it.Offset, r.cfg.FaceFramePx)
+				if err != nil {
+					out[i].err, out[i].frame = err, true
+					continue
+				}
+				out[i].dets, out[i].err = face.Detect(ctx, r.cfg, jpeg)
+			}
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 // toWrites keeps the highest-scoring detections, up to max. A crowd shot can

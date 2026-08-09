@@ -166,11 +166,19 @@ func (s *Store) SetFaces(ctx context.Context, relpath string, faces []FaceWrite)
 
 // ItemsNeedingFaces returns present visual items that haven't been through the
 // detector yet, newest first (so newly-added media is recognised first).
-func (s *Store) ItemsNeedingFaces(ctx context.Context, limit int) ([]model.Item, error) {
+//
+// skip passes over that many of them. An item the worker could not do anything
+// with keeps faces_done = 0 and so stays at the head of this queue; without a way
+// past it, a handful of unreadable files at the front would be the only thing the
+// worker ever saw again.
+func (s *Store) ItemsNeedingFaces(ctx context.Context, limit, skip int) ([]model.Item, error) {
+	if skip < 0 {
+		skip = 0
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+itemCols+` FROM items
 		 WHERE missing_since IS NULL AND width > 0 AND faces_done = 0
-		 ORDER BY indexed_at DESC LIMIT ?`, limit)
+		 ORDER BY indexed_at DESC, id DESC LIMIT ? OFFSET ?`, limit, skip)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +198,29 @@ func (s *Store) AllFaces(ctx context.Context) ([]Face, error) {
 	}
 	defer rows.Close()
 	return scanFaces(rows)
+}
+
+// FaceFingerprint summarizes everything the grouping is computed from: which
+// faces exist, and who each one is currently labelled as. It is one aggregate
+// query over the faces table — a fraction of the cost of reading the embeddings
+// out of it, let alone grouping them — so a caller can hold on to a grouping and
+// find out cheaply whether it is still the right answer.
+type FaceFingerprint struct {
+	Count  int64
+	MaxID  int64
+	SumID  int64 // with Count and MaxID, catches any face added or removed
+	Labels int64 // Σ (face id x person id): changes on any (re)assignment
+}
+
+// FaceFingerprint returns the current fingerprint of the face table.
+func (s *Store) FaceFingerprint(ctx context.Context) (FaceFingerprint, error) {
+	var fp FaceFingerprint
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(f.id),0), COALESCE(SUM(f.id),0),
+		       COALESCE(SUM(f.id * COALESCE(f.person_id,0)),0)
+		FROM faces f JOIN items i ON i.id = f.item_id
+		WHERE i.missing_since IS NULL`).Scan(&fp.Count, &fp.MaxID, &fp.SumID, &fp.Labels)
+	return fp, err
 }
 
 // FaceByID fetches one face (for the crop endpoint).
@@ -698,46 +729,155 @@ func ClusterOf(clusters []FaceCluster, faceID int64) (FaceCluster, bool) {
 // years apart). That direction of error is the safe one: widen, merge and naming
 // both groups the same thing all put two groups back together, whereas a wrong
 // merge would need per-face surgery the UI doesn't offer.
+//
+// O(faces x groups) is the whole cost of the People page, and on a real library
+// most groups hold one face — so the number of groups tracks the number of faces
+// and this is quadratic in practice. It is split by embedding width and handed to
+// a grouper (which is where the work actually happens) for that reason: at eight
+// thousand faces the naive form takes seconds, and every request that names,
+// widens or merges anything runs it twice.
 func group(faces []Face, threshold float64) [][]Face {
-	type cl struct {
-		members  []Face
-		sum      []float64 // running total; centroid = normalized sum
-		centroid []float32
+	if len(faces) == 0 {
+		return nil
 	}
-	var cls []*cl
-
-	for _, f := range faces {
-		bestIdx, bestSim := -1, threshold
-		for i, c := range cls {
-			if len(c.centroid) != len(f.Vec) {
-				continue // a model change mid-library; incomparable vectors
-			}
-			if sim := media.Cosine(c.centroid, f.Vec); sim >= bestSim {
-				bestIdx, bestSim = i, sim
-			}
+	// Vectors of different widths are incomparable (a model change mid-library),
+	// so they can never share a group. Splitting by width up front means each
+	// grouper compares against one flat slab of same-width centroids.
+	bins := map[int]*grouper{}
+	order := make([]int, 0, 1)
+	for i, f := range faces {
+		g := bins[len(f.Vec)]
+		if g == nil {
+			g = newGrouper(len(f.Vec), threshold)
+			bins[len(f.Vec)] = g
+			order = append(order, len(f.Vec))
 		}
-		if bestIdx < 0 {
-			sum := make([]float64, len(f.Vec))
-			for i, x := range f.Vec {
-				sum[i] = float64(x)
-			}
-			cls = append(cls, &cl{members: []Face{f}, sum: sum, centroid: unit(sum)})
-			continue
-		}
-		c := cls[bestIdx]
-		c.members = append(c.members, f)
-		for i, x := range f.Vec {
-			c.sum[i] += float64(x)
-		}
-		c.centroid = unit(c.sum)
+		g.add(f, i)
 	}
-
-	out := make([][]Face, 0, len(cls))
-	for _, c := range cls {
-		out = append(out, c.members)
+	if len(order) == 1 {
+		return bins[order[0]].groups()
 	}
+	// More than one width, so the bins have to be interleaved again: a group is
+	// placed where a single pass over everything would have created it, which is
+	// at its first member. Callers rely on that order only for tie-breaking, but
+	// there is no reason to make them think about it.
+	out := make([][]Face, 0, len(faces))
+	firsts := make([]int, 0, len(faces))
+	for _, d := range order {
+		g := bins[d]
+		out = append(out, g.groups()...)
+		firsts = append(firsts, g.first...)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return firsts[i] < firsts[j] })
 	return out
 }
+
+// grouper does the agglomeration for one embedding width. Two things make it
+// faster than comparing against each group's centroid in turn, and neither
+// changes which groups come out:
+//
+//   - The centroids live in one flat slice rather than a slice per group, so a
+//     pass over them is sequential in memory instead of a pointer chase.
+//   - Each comparison stops early unless it could still win. The dot product is
+//     split in two, and by Cauchy-Schwarz the second half can add at most the
+//     product of the two halves' norms — so a centroid whose first half already
+//     falls short of the best-so-far by more than that cannot be the winner, and
+//     the rest of it is never read. With a threshold anywhere near where face
+//     models operate, that skips almost every comparison after a few dozen
+//     dimensions.
+type grouper struct {
+	dim   int
+	split int     // dimensions compared before the bound is checked
+	thr   float64 // similarity a face must reach to join an existing group
+	cent  []float32
+	tail  []float64 // per group: the norm of its centroid from split on
+	sums  [][]float64
+	mem   [][]Face
+	first []int // per group: index of its first member in the input
+}
+
+func newGrouper(dim int, threshold float64) *grouper {
+	// A third of the width, measured: less and the bound is too loose to reject
+	// anybody (the unread tail could always make up the difference), more and
+	// rejecting costs nearly as much as not bothering. Tiny vectors skip the
+	// split entirely — the bookkeeping would cost more than it saves.
+	split := dim
+	if dim >= 16 {
+		split = dim / 3
+	}
+	return &grouper{dim: dim, split: split, thr: threshold}
+}
+
+// simEpsilon is the slack on the early-exit bound. The bound is exact in real
+// arithmetic; this covers the last bits of the float32 norms it is computed
+// from, at a scale far below any similarity anyone reasons about.
+const simEpsilon = 1e-6
+
+func (g *grouper) add(f Face, idx int) {
+	best, bestSim := -1, g.thr
+	fTail := norm(f.Vec[g.split:])
+	for i := range g.mem {
+		c := g.cent[i*g.dim : (i+1)*g.dim]
+		sim := dot(c[:g.split], f.Vec[:g.split])
+		if sim+g.tail[i]*fTail+simEpsilon < bestSim {
+			continue // cannot reach bestSim however the rest turns out
+		}
+		if sim += dot(c[g.split:], f.Vec[g.split:]); sim >= bestSim {
+			best, bestSim = i, sim
+		}
+	}
+	if best < 0 {
+		sum := make([]float64, g.dim)
+		for i, x := range f.Vec {
+			sum[i] = float64(x)
+		}
+		g.sums = append(g.sums, sum)
+		g.mem = append(g.mem, []Face{f})
+		g.first = append(g.first, idx)
+		g.tail = append(g.tail, 0)
+		g.cent = append(g.cent, make([]float32, g.dim)...)
+		g.recentre(len(g.mem) - 1)
+		return
+	}
+	g.mem[best] = append(g.mem[best], f)
+	for i, x := range f.Vec {
+		g.sums[best][i] += float64(x)
+	}
+	g.recentre(best)
+}
+
+// recentre rewrites group i's centroid (and the tail norm the bound needs) from
+// its running sum, in place.
+func (g *grouper) recentre(i int) {
+	dst := g.cent[i*g.dim : (i+1)*g.dim]
+	unitInto(g.sums[i], dst)
+	g.tail[i] = norm(dst[g.split:])
+}
+
+func (g *grouper) groups() [][]Face { return g.mem }
+
+// dot is the inner product of two same-length float32 vectors, accumulated in
+// float64 — the same arithmetic as media.Cosine, unrolled because it is the hot
+// loop of the whole People page.
+func dot(a, b []float32) float64 {
+	var s0, s1, s2, s3 float64
+	i := 0
+	for ; i+4 <= len(a); i += 4 {
+		x := b[i : i+4 : i+4] // bounds-check once per group of four
+		s0 += float64(a[i]) * float64(x[0])
+		s1 += float64(a[i+1]) * float64(x[1])
+		s2 += float64(a[i+2]) * float64(x[2])
+		s3 += float64(a[i+3]) * float64(x[3])
+	}
+	s := s0 + s1 + s2 + s3
+	for ; i < len(a); i++ {
+		s += float64(a[i]) * float64(b[i])
+	}
+	return s
+}
+
+// norm is the L2 norm of a float32 vector.
+func norm(v []float32) float64 { return math.Sqrt(dot(v, v)) }
 
 // widen re-joins whole groups that a lowered threshold says are the same person.
 // It is the repair for the split described on group: instead of re-running the
@@ -941,17 +1081,27 @@ func MatchPerson(protos map[int64][][]float32, vec []float32, threshold float64)
 
 // unit returns the L2-normalized float32 form of v.
 func unit(v []float64) []float32 {
+	out := make([]float32, len(v))
+	unitInto(v, out)
+	return out
+}
+
+// unitInto writes the L2-normalized float32 form of v into dst, which must be
+// the same length. Separate from unit because grouping renormalizes a centroid
+// every time a face joins it, and those are the allocations that show up.
+func unitInto(v []float64, dst []float32) {
 	var s float64
 	for _, x := range v {
 		s += x * x
 	}
-	out := make([]float32, len(v))
 	if s <= 0 {
-		return out
+		for i := range dst {
+			dst[i] = 0
+		}
+		return
 	}
 	s = math.Sqrt(s)
 	for i, x := range v {
-		out[i] = float32(x / s)
+		dst[i] = float32(x / s)
 	}
-	return out
 }

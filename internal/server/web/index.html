@@ -1333,6 +1333,9 @@
     head.appendChild(lead);
     var bits = [people.length + " named", (d.clusters_total || clusters.length) + " unnamed"];
     if (pr.visual) bits.push("looked at " + (pr.done || 0).toLocaleString() + "/" + pr.visual.toLocaleString());
+    // Why the count above can stop short of the total: these are items no frame
+    // came out of, or the detector refused. They're retried on the next restart.
+    if (pr.skipped) bits.push(pr.skipped.toLocaleString() + " skipped");
     if (pr.faces) bits.push(pr.faces.toLocaleString() + " faces");
     var meta = document.createElement("span");
     meta.textContent = bits.join(" \u00b7 ");

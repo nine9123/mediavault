@@ -29,9 +29,13 @@ COPY app.py /app/app.py
 
 # hog is CPU-friendly; set FACE_MODEL=cnn if you have cores to spare and want
 # better recall on small or turned faces.
+#
+# Deliberately not setting FACE_UPSAMPLE, FACE_DETECT_PX or FACE_CONCURRENCY:
+# their defaults depend on FACE_MODEL (cnn wants far less of all three), and a
+# value baked in here would override that choice for everyone who only sets the
+# model. See app.py.
 ENV PORT=8000 \
     FACE_MODEL=hog \
-    FACE_UPSAMPLE=1 \
     PYTHONUNBUFFERED=1
 
 EXPOSE 8000

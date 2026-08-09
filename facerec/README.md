@@ -94,7 +94,9 @@ services:
     restart: unless-stopped
     environment:
       FACE_MODEL: "hog"       # or "cnn": better on small/turned faces, much slower
-      FACE_UPSAMPLE: "1"      # "2" finds smaller faces at ~4x the cost
+      # Everything else defaults per-model — see Tuning. If you set FACE_MODEL=cnn,
+      # read that section before adding FACE_UPSAMPLE here: it is the difference
+      # between a container that uses a gigabyte and one that uses ten.
     # No ports and no volumes on purpose: only mediavault needs to reach it, and
     # it never touches your library — mediavault posts the frame in the request.
 ```
@@ -184,10 +186,40 @@ GET /health
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `FACE_MODEL` | `hog` | `hog` (fast, CPU) or `cnn` (better on small/turned faces, much slower) |
-| `FACE_UPSAMPLE` | `1` | Detection upsampling; `2` finds smaller faces at ~4x the cost |
+| `FACE_UPSAMPLE` | `1`, or `0` for cnn | Detection upsampling; each step finds smaller faces at ~4x the cost |
+| `FACE_DETECT_PX` | `2560`, or `960` for cnn | Longest edge the detector may process, **after** upsampling. The frame is shrunk to fit before it is handed over |
+| `FACE_CONCURRENCY` | `2`, or `1` for cnn | Detections at a time. Each one holds its own copy of the memory below |
 | `FACE_MIN_SIZE` | `0.02` | Ignore faces narrower than this fraction of the frame — their embeddings are noise, and noise is what merges two people |
 | `FACE_MATCH` | computed | Override the advertised threshold |
 | `PORT` | `8000` | Listen port |
+
+### The one that decides how much this costs
+
+Detection time and memory go with the **pixel count the detector processes**,
+which is not the size of the frame that arrived: `FACE_UPSAMPLE` doubles each
+edge per step, so upsample 1 on a 1280px frame is a 2560px detection — four
+times the area. With `hog` that is seconds. With `cnn` it is minutes and *many*
+gigabytes, because dlib's CNN detector holds intermediate tensors for the whole
+image at once. Setting `FACE_MODEL=cnn` and leaving everything else alone is
+what puts this container at 10 GB and a few frames a minute.
+
+`FACE_DETECT_PX` is the ceiling on that number. The frame is shrunk to
+`FACE_DETECT_PX / 2^FACE_UPSAMPLE` before the detector sees it, so memory is
+bounded no matter what `FACE_FRAME_PX` and `FACE_UPSAMPLE` say. Faces are still
+*described* from the full-resolution frame — the descriptor works on a 150px chip
+of the face, so that costs almost nothing and keeps the embeddings good.
+
+The startup line tells you where you landed, and every frame logs what the
+detector actually looked at and how long it took:
+
+```
+facerec: listening on :8000 — model dlib-resnet-v1/cnn, upsample 0, up to 960 px of detector input (frames shrunk to 960 px first), 1 at a time, advertising match 0.82
+facerec: detect: 2 face(s) in 1.4s (960x540 x1)
+```
+
+If those lines say seconds, detection of a whole library is hours. If they say
+minutes, lower `FACE_DETECT_PX` (or use `hog`) — mediavault gives up on a frame
+after `FACE_TIMEOUT` and skips it, so a service this slow silently loses faces.
 
 Symptoms and which knob:
 
@@ -197,8 +229,12 @@ Symptoms and which knob:
 - **One person appears as several groups** — threshold too high, or their photos
   genuinely vary a lot. Lower `FACE_MATCH`, or simply give every group the same
   name: naming with an existing name merges into that person.
-- **Faces are missed** — raise `FACE_UPSAMPLE`, try `FACE_MODEL=cnn`, or raise
-  `FACE_FRAME_PX` on mediavault so the frame carries more pixels.
+- **Faces are missed** — raise `FACE_DETECT_PX`, then `FACE_UPSAMPLE`, then try
+  `FACE_MODEL=cnn`; and raise `FACE_FRAME_PX` on mediavault if the frame it sends
+  is now the smaller of the two.
+- **The container is enormous, or detection crawls** — lower `FACE_DETECT_PX`,
+  and check `FACE_UPSAMPLE` is 0 if you are on `cnn`. Halving the first roughly
+  quarters both.
 
 ## Changing models
 

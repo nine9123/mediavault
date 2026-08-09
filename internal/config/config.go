@@ -96,6 +96,19 @@ type Config struct {
 	// highest-scoring ones. A crowd shot can return dozens of low-quality
 	// detections that only add noise to clustering.
 	FaceMaxPerItem int
+	// FaceWorkers is how many items are extracted and sent to the detector at
+	// once. Extracting a frame is ffmpeg and the network mount; detecting on it is
+	// the recognition service — different machines, in the usual setup, so one at
+	// a time leaves both of them idle half the time. Raising it past what the
+	// service will do in parallel just queues requests there, which is harmless
+	// and still keeps it fed.
+	FaceWorkers int
+	// FaceTimeout bounds one /detect call. It exists to bound the damage a frame
+	// the detector chokes on can do: over this, the frame is skipped and the queue
+	// moves on (a CNN detector on a large frame is minutes of CPU, so the default
+	// is generous — but not infinite, because a queue that stops is worse than a
+	// face that is missed).
+	FaceTimeout time.Duration
 
 	// APIKey gates every /api/ route. Empty disables authentication, which is
 	// the old behaviour and fine on a trusted host, but is announced loudly at
@@ -197,6 +210,8 @@ func Load() Config {
 		FaceMatch:        envFloat("FACE_MATCH", 0),
 		FaceFramePx:      envInt("FACE_FRAME_PX", 1280),
 		FaceMaxPerItem:   envInt("FACE_MAX_PER_ITEM", 20),
+		FaceWorkers:      envInt("FACE_WORKERS", 2),
+		FaceTimeout:      envDur("FACE_TIMEOUT", 3*time.Minute),
 		APIKey:           env("API_KEY", ""),
 		AuthTTL:          envDur("AUTH_TTL", 30*24*time.Hour),
 		FFmpeg:           env("FFMPEG", "ffmpeg"),
