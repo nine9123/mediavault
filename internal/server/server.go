@@ -53,6 +53,8 @@ type Server struct {
 	// cropSeq makes each crop's temp filename unique, so two requests for the
 	// same face can't write the same partial file.
 	cropSeq atomic.Uint64
+	// groups caches the last face grouping; see clusterCache.
+	groups clusterCache
 }
 
 // maxCrops is how many face crops may be cut at once. Small: each one is an

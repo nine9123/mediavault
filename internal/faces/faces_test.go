@@ -2,8 +2,10 @@ package faces
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -59,11 +61,21 @@ func vec(a, b, c, d float64) []float32 {
 }
 
 // detected stands in for one pass of the worker: N items, one face each.
+//
+// In path order rather than map order: SetFaces mints face ids as it goes, and a
+// group is identified by the lowest id in it — so iterating the map directly made
+// "the group containing the first face" a different group from run to run, and
+// the tests below fail about one time in six.
 func detected(t *testing.T, st *store.Store, faces map[string][]float32) {
 	t.Helper()
-	for rel, v := range faces {
+	rels := make([]string, 0, len(faces))
+	for rel := range faces {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	for _, rel := range rels {
 		if err := st.SetFaces(context.Background(), rel, []store.FaceWrite{
-			{X: 0.25, Y: 0.2, W: 0.2, H: 0.3, Score: 1, Vec: v},
+			{X: 0.25, Y: 0.2, W: 0.2, H: 0.3, Score: 1, Vec: faces[rel]},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -472,4 +484,26 @@ func mustPerson(t *testing.T, st *store.Store, name string) int64 {
 	}
 	t.Fatalf("no person named %q", name)
 	return 0
+}
+
+// An item the worker can't do anything with keeps faces_done = 0, so it stays in
+// the queue — and the queue is asked for its head. A batch's worth of those at
+// the front used to be the end of detection: the same twenty items came back
+// every tick, forever, and nothing behind them was ever looked at. From outside
+// that is a face count that stops at some number and never moves again.
+//
+// Nothing here can be read (the paths don't exist and there is no ffmpeg
+// configured), so every item fails the same way a corrupt file would.
+func TestUnreadableItemsDoNotStopTheQueue(t *testing.T) {
+	_, st, rec := setup(t)
+	const total = batch + 5
+	for i := 0; i < total; i++ {
+		addItem(t, st, fmt.Sprintf("broken/%02d.jpg", i))
+	}
+
+	rec.pass(context.Background())
+
+	if got := rec.Skipped(); got != total {
+		t.Errorf("the pass gave up on %d items, want all %d tried", got, total)
+	}
 }

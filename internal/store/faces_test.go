@@ -417,3 +417,26 @@ func TestMatchPerson(t *testing.T) {
 		}
 	}
 }
+
+// Grouping is the whole cost of the People page, and the shape of the library
+// decides how bad it is: the pass compares each face against every group so far,
+// so a library that groups tidily is linear-ish and one full of faces nobody else
+// looks like is quadratic. Both are worth watching — the second is what a
+// freshly-detected collection actually looks like.
+//
+//	go test ./internal/store -run XXX -bench Cluster -benchtime 3x
+func BenchmarkClusterLibrary(b *testing.B) {
+	faces := library(7, 1000, 8, 128) // 8,000 faces in a thousand tidy groups
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ClusterUnnamed(faces, 0.82, Grouping{})
+	}
+}
+
+func BenchmarkClusterSingletons(b *testing.B) {
+	faces := library(9, 8000, 1, 128) // 8,000 faces, no two of them alike
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = ClusterUnnamed(faces, 0.82, Grouping{})
+	}
+}

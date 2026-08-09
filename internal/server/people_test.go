@@ -371,6 +371,41 @@ func TestPeopleItemsPageBeyondTheFirstPage(t *testing.T) {
 	}
 }
 
+// The grouping is cached between requests, so the thing to prove is that the
+// cache notices the two ways its inputs move underneath it: the detector finding
+// a face, and a face changing hands. Both are invisible to this layer — they
+// happen in the store — which is exactly why the fingerprint exists.
+func TestPeopleSeesFacesThatArriveAfterTheFirstRequest(t *testing.T) {
+	_, st, h := peopleServer(t)
+	detect(t, st, "a.jpg", 1, 0, 0, 0)
+	if got := clusterRefs(t, h); len(got) != 1 {
+		t.Fatalf("got %d groups, want the one face", len(got))
+	}
+
+	// A detection lands between requests.
+	detect(t, st, "b.jpg", 0, 1, 0, 0)
+	groups := clusterRefs(t, h)
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups after a second face arrived, want 2", len(groups))
+	}
+
+	// And a face changes hands: naming one group must take it off the page,
+	// leaving the other where it was.
+	if code, d := do(t, h, "PUT", "/api/people", `{"ref":"`+groups[0]["ref"].(string)+`","name":"Jane"}`); code != http.StatusOK {
+		t.Fatalf("name: status %d (%v)", code, d)
+	}
+	code, d := do(t, h, "GET", "/api/people", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/people: status %d", code)
+	}
+	if people, _ := d["people"].([]any); len(people) != 1 {
+		t.Errorf("got %d named people, want Jane", len(people))
+	}
+	if left, _ := d["clusters"].([]any); len(left) != 1 {
+		t.Errorf("got %d unnamed groups, want the one nobody named", len(left))
+	}
+}
+
 func uniq(in []string) []string {
 	seen := make(map[string]struct{}, len(in))
 	out := make([]string, 0, len(in))

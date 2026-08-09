@@ -114,6 +114,8 @@ docker compose up --build
 | `FACE_MATCH`    | *(empty)*| Cosine threshold for "same person"; empty = use what the service advertises |
 | `FACE_FRAME_PX` | `1280`   | Frame size sent to the detector (bigger finds smaller faces) |
 | `FACE_MAX_PER_ITEM` | `20` | Keep at most this many faces per item (highest-scoring) |
+| `FACE_WORKERS`  | `2`      | Frames in flight: extracting the next one overlaps detecting this one |
+| `FACE_TIMEOUT`  | `3m`     | Give up on one frame after this and move on (see People, below) |
 | `FFMPEG`        | `ffmpeg` | ffmpeg binary                                       |
 | `FFPROBE`       | `ffprobe`| ffprobe binary                                      |
 
@@ -625,7 +627,19 @@ How it works:
   poster-frame offset the thumbnail uses, so a video is recognised on the frame
   you see in the grid) and stores a box plus an embedding per face. It is the
   same shape as captioning: slow, resumable, and harmless when the service is
-  down — the startup log says so and the page just stays empty.
+  down — the startup log says so and the page just stays empty. `FACE_WORKERS`
+  items are in flight at once, because extracting a frame (ffmpeg, over the
+  network mount) and detecting on it (the other container) are different waits.
+- **Detection that stops before the end** is almost always one of two things,
+  and the log says which. A frame that takes longer than `FACE_TIMEOUT` is
+  skipped with a line naming the file — if that is most frames, the recognition
+  service is configured too expensively (see `facerec/README.md`, *Tuning*:
+  `FACE_MODEL=cnn` with upsampling on is the usual cause, and it is also what
+  makes that container use gigabytes). Anything else that fails — an unreadable
+  file, a codec ffmpeg won't decode — is skipped for the run and retried after a
+  restart. Neither blocks the items behind it any more, and the People page
+  header reports how many were skipped — which is what tells a count that has
+  stopped short of the total apart from a worker that has stopped.
 - **Grouping** is greedy clustering by cosine similarity over those embeddings.
   It errs toward splitting one person into two groups rather than merging two
   people, because splitting is repairable in one click and merging isn't:

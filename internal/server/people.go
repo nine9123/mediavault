@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"mediavault/internal/media"
 	"mediavault/internal/store"
@@ -77,13 +78,12 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	faces, manual, err := s.faceGrouping(r)
+	g, err := s.faceGrouping(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	match := s.rec.Match()
-	clusters := store.ClusterUnnamed(faces, match, manual)
+	match, clusters := s.rec.Match(), g.clusters
 
 	outPeople := make([]personDTO, 0, len(people))
 	for _, p := range people {
@@ -125,6 +125,10 @@ func (s *Server) handlePeople(w http.ResponseWriter, r *http.Request) {
 	if visual, done, nfaces, named, err := s.store.FaceCounts(r.Context()); err == nil {
 		resp["progress"] = map[string]any{
 			"visual": visual, "done": done, "faces": nfaces, "named": named,
+			// Items the worker gave up on this run. Without it, "looked at
+			// 3,500/8,000" that never moves again is the same picture as a worker
+			// that has died, and it isn't the same thing at all.
+			"skipped": s.rec.Skipped(),
 		}
 	}
 	writeJSON(w, resp)
@@ -209,24 +213,24 @@ func (s *Server) handleNamePerson(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad ref", http.StatusBadRequest)
 		return
 	}
-	faces, manual, err := s.faceGrouping(r)
+	g, err := s.faceGrouping(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	ids := store.ClusterContaining(faces, s.rec.Match(), manual, faceID)
-	if len(ids) == 0 {
+	c, ok := store.ClusterOf(g.clusters, faceID)
+	if !ok {
 		// The group dissolved under us — someone else named it, or a rescan
 		// changed the face set. Saying so beats silently creating an empty person.
 		http.Error(w, "that group of faces no longer exists — reload the People page", http.StatusConflict)
 		return
 	}
-	chosen := make([]store.Face, 0, len(ids))
-	want := make(map[int64]bool, len(ids))
-	for _, id := range ids {
+	chosen := make([]store.Face, 0, len(c.FaceIDs))
+	want := make(map[int64]bool, len(c.FaceIDs))
+	for _, id := range c.FaceIDs {
 		want[id] = true
 	}
-	for _, f := range faces {
+	for _, f := range g.faces {
 		if want[f.ID] {
 			chosen = append(chosen, f)
 		}
@@ -298,13 +302,12 @@ func (s *Server) handleWidenGroup(w http.ResponseWriter, r *http.Request) {
 		step = 0.5
 	}
 
-	faces, manual, err := s.faceGrouping(r)
+	g, err := s.faceGrouping(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	match := s.rec.Match()
-	before := store.ClusterUnnamed(faces, match, manual)
+	before := g.clusters
 	cur, ok := store.ClusterOf(before, faceID)
 	if !ok {
 		http.Error(w, "that group of faces no longer exists — reload the People page", http.StatusConflict)
@@ -329,12 +332,14 @@ func (s *Server) handleWidenGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	// Re-group with the new number in hand rather than making the page ask again:
 	// what the user wants to know is whether anything joined.
-	manual.Widened[cur.KeyFaceID] = next
-	got, ok := store.ClusterOf(store.ClusterUnnamed(faces, match, manual), cur.KeyFaceID)
+	g.manual.Widened[cur.KeyFaceID] = next
+	after := store.ClusterUnnamed(g.faces, g.key.match, g.manual)
+	got, ok := store.ClusterOf(after, cur.KeyFaceID)
 	if !ok {
 		http.Error(w, "regrouping lost that group — reload the People page", http.StatusInternalServerError)
 		return
 	}
+	s.keepGrouping(g, after)
 	in := make(map[int64]bool, len(got.FaceIDs))
 	for _, id := range got.FaceIDs {
 		in[id] = true
@@ -365,12 +370,12 @@ func (s *Server) handleResetGroup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad ref", http.StatusBadRequest)
 		return
 	}
-	faces, manual, err := s.faceGrouping(r)
+	g, err := s.faceGrouping(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	c, ok := store.ClusterOf(store.ClusterUnnamed(faces, s.rec.Match(), manual), faceID)
+	c, ok := store.ClusterOf(g.clusters, faceID)
 	if !ok {
 		http.Error(w, "that group of faces no longer exists — reload the People page", http.StatusConflict)
 		return
@@ -416,13 +421,12 @@ func (s *Server) handleMergeGroups(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
-	faces, manual, err := s.faceGrouping(r)
+	g, err := s.faceGrouping(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	match := s.rec.Match()
-	before := store.ClusterUnnamed(faces, match, manual)
+	before := g.clusters
 	from, ok := store.ClusterOf(before, fromID)
 	if !ok {
 		http.Error(w, "that group of faces no longer exists — reload the People page", http.StatusConflict)
@@ -451,12 +455,14 @@ func (s *Server) handleMergeGroups(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	manual.Merged = merged
-	got, ok := store.ClusterOf(store.ClusterUnnamed(faces, match, manual), from.KeyFaceID)
+	g.manual.Merged = merged
+	after := store.ClusterUnnamed(g.faces, g.key.match, g.manual)
+	got, ok := store.ClusterOf(after, from.KeyFaceID)
 	if !ok {
 		http.Error(w, "regrouping lost that group — reload the People page", http.StatusInternalServerError)
 		return
 	}
+	s.keepGrouping(g, after)
 	writeJSON(w, map[string]any{
 		"ok":    true,
 		"ref":   clusterPrefix + strconv.FormatInt(got.KeyFaceID, 10),
@@ -477,12 +483,12 @@ func (s *Server) handleUnmergeGroup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad ref", http.StatusBadRequest)
 		return
 	}
-	faces, manual, err := s.faceGrouping(r)
+	g, err := s.faceGrouping(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	c, ok := store.ClusterOf(store.ClusterUnnamed(faces, s.rec.Match(), manual), faceID)
+	c, ok := store.ClusterOf(g.clusters, faceID)
 	if !ok {
 		http.Error(w, "that group of faces no longer exists — reload the People page", http.StatusConflict)
 		return
@@ -576,30 +582,132 @@ func faceURL(faceID int64) string {
 
 // clusterFaceIDs resolves an unnamed group's key face to the whole group.
 func (s *Server) clusterFaceIDs(r *http.Request, keyFaceID int64) ([]int64, error) {
-	faces, manual, err := s.faceGrouping(r)
+	g, err := s.faceGrouping(r)
 	if err != nil {
 		return nil, err
 	}
-	return store.ClusterContaining(faces, s.rec.Match(), manual, keyFaceID), nil
+	c, _ := store.ClusterOf(g.clusters, keyFaceID)
+	return c.FaceIDs, nil
 }
 
-// faceGrouping fetches every input to clustering: all the faces, plus the manual
-// corrections in force. Always together — grouping the page one way and naming a
-// group another would label a different set of faces than the one shown.
-func (s *Server) faceGrouping(r *http.Request) ([]store.Face, store.Grouping, error) {
-	faces, err := s.store.AllFaces(r.Context())
+// grouped is what every handler on this page works from: the faces, the manual
+// corrections in force, and the grouping that falls out of the two. Always
+// together — grouping the page one way and naming a group another would label a
+// different set of faces than the one shown.
+type grouped struct {
+	faces    []store.Face
+	manual   store.Grouping
+	clusters []store.FaceCluster
+	key      clusterKey // what these faces and clusters were computed from
+}
+
+// clusterCache holds the last grouping computed. Grouping is by far the most
+// expensive thing this page does — every embedding in the library, compared
+// against every group so far — and its inputs change only when the detector
+// finds a face or somebody edits a person, neither of which happens between the
+// two groupings a single widen or merge needs. FaceFingerprint is the cheap
+// question "would this come out the same?", and answering it costs one aggregate
+// query against work measured in seconds.
+type clusterCache struct {
+	// Held across the grouping itself, not just the lookup: two tabs opening the
+	// page at once should mean one grouping and a wait, not two.
+	mu       sync.Mutex
+	key      clusterKey
+	valid    bool
+	faces    []store.Face
+	clusters []store.FaceCluster
+}
+
+// clusterKey identifies a grouping by everything that goes into it.
+type clusterKey struct {
+	fp      store.FaceFingerprint
+	match   float64
+	widened uint64 // order-independent hashes of the two override tables,
+	merged  uint64 // which are small and read on every request anyway
+}
+
+// faceGrouping returns the current grouping, computing it only if the cached one
+// is out of date. The manual corrections are read fresh every time and are the
+// caller's to modify (widening and merging both do, to re-group with the change
+// they just made in hand); the faces and clusters are shared and read-only.
+func (s *Server) faceGrouping(r *http.Request) (grouped, error) {
+	ctx := r.Context()
+	widened, err := s.store.FaceGroupMatches(ctx)
 	if err != nil {
-		return nil, store.Grouping{}, err
+		return grouped{}, err
 	}
-	widened, err := s.store.FaceGroupMatches(r.Context())
+	merged, err := s.store.FaceGroupMerges(ctx)
 	if err != nil {
-		return nil, store.Grouping{}, err
+		return grouped{}, err
 	}
-	merged, err := s.store.FaceGroupMerges(r.Context())
+	fp, err := s.store.FaceFingerprint(ctx)
 	if err != nil {
-		return nil, store.Grouping{}, err
+		return grouped{}, err
 	}
-	return faces, store.Grouping{Widened: widened, Merged: merged}, nil
+	g := grouped{
+		manual: store.Grouping{Widened: widened, Merged: merged},
+		key:    clusterKey{fp: fp, match: s.rec.Match(), widened: hashWidened(widened), merged: hashMerged(merged)},
+	}
+
+	s.groups.mu.Lock()
+	defer s.groups.mu.Unlock()
+	if s.groups.valid && s.groups.key == g.key {
+		g.faces, g.clusters = s.groups.faces, s.groups.clusters
+		return g, nil
+	}
+	faces, err := s.store.AllFaces(ctx)
+	if err != nil {
+		return grouped{}, err
+	}
+	g.faces = faces
+	g.clusters = store.ClusterUnnamed(faces, g.key.match, g.manual)
+	s.groups.key, s.groups.valid = g.key, true
+	s.groups.faces, s.groups.clusters = g.faces, g.clusters
+	return g, nil
+}
+
+// keepGrouping remembers a grouping a handler computed itself, after changing an
+// override and re-grouping to report what it did. The page reloads straight
+// after, and this is what makes that reload free.
+//
+// The key is the one the faces came with, with the changed overrides folded in:
+// it has to describe what is being stored, not what is true now. A detection
+// landing in between makes it describe an older library, which is a miss on the
+// next request — the right outcome, and the reason the fingerprint isn't re-read
+// here.
+func (s *Server) keepGrouping(g grouped, clusters []store.FaceCluster) {
+	key := g.key
+	key.widened, key.merged = hashWidened(g.manual.Widened), hashMerged(g.manual.Merged)
+	s.groups.mu.Lock()
+	defer s.groups.mu.Unlock()
+	s.groups.key, s.groups.valid = key, true
+	s.groups.faces, s.groups.clusters = g.faces, clusters
+}
+
+// hashWidened and hashMerged summarize the override tables for the cache key.
+// Order-independent (map iteration is not), and both tables are tiny — a
+// handful of rows against a library's worth of embeddings.
+func hashWidened(w store.Widened) uint64 {
+	var h uint64
+	for id, m := range w {
+		h += mixHash(uint64(id), math.Float64bits(m))
+	}
+	return h
+}
+
+func hashMerged(m store.Merged) uint64 {
+	var h uint64
+	for id, g := range m {
+		h += mixHash(uint64(id), uint64(g))
+	}
+	return h
+}
+
+// mixHash is FNV-1a over two words.
+func mixHash(a, b uint64) uint64 {
+	const prime = 1099511628211
+	h := (14695981039346656037 ^ a) * prime
+	return (h ^ b) * prime
 }
 
 // faceDTO is one face in one item, as the viewer's card shows it. Deliberately
