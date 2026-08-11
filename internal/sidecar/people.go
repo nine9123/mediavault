@@ -41,9 +41,17 @@ type Person struct {
 // FaceRef locates one example face: a media relpath plus the face box as
 // fractions of the frame ([x, y, w, h]), which is resolution-independent and so
 // survives a change of FACE_FRAME_PX.
+//
+// T is how many seconds into a video the face was found, and is what keeps two
+// people apart in one file: a video is sampled across its length, and in an
+// interview two speakers filmed alternately occupy the same box in the frame.
+// Absent (and zero) for stills, and for anything named before faces carried a
+// timestamp — where it means "wherever in this file the box matches", which is
+// what resolving used to do for everything.
 type FaceRef struct {
 	Path string     `json:"path"`
 	Box  [4]float64 `json:"box"`
+	T    float64    `json:"t,omitempty"`
 }
 
 // ReadPeople loads people.json. A missing file is not an error — it just means

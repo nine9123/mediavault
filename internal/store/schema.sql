@@ -117,6 +117,10 @@ CREATE TABLE IF NOT EXISTS people (
 
 -- One row per face found in one item, from the optional recognition service.
 -- person_id is the clustering/labelling result, NULL while a face is unnamed.
+--
+-- A video is sampled at several points and yields one row per PERSON, not one
+-- per sighting: the same face in thirty frames is one person who was there,
+-- and t says where to look at them (also where the crop is cut from).
 CREATE TABLE IF NOT EXISTS faces (
     id        INTEGER PRIMARY KEY,
     item_id   INTEGER NOT NULL REFERENCES items(id)  ON DELETE CASCADE,
@@ -126,6 +130,7 @@ CREATE TABLE IF NOT EXISTS faces (
     w         REAL NOT NULL,
     h         REAL NOT NULL,
     score     REAL,                        -- detector confidence
+    t         REAL,                        -- seconds into a video; NULL for stills
     dim       INTEGER NOT NULL,
     vec       BLOB    NOT NULL             -- little-endian float32s, L2-normalized
 );

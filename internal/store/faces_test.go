@@ -394,6 +394,32 @@ func TestClusterContaining(t *testing.T) {
 	}
 }
 
+// GroupVectors is what the face worker collapses a scrubbed video with — thirty
+// frames of the same three people down to three faces — so it has to give the
+// same answer the People page would, or a video would contribute groups the page
+// then shows as one.
+func TestGroupVectorsGroupsAsTheClusteringDoes(t *testing.T) {
+	vecs := [][]float32{
+		unitVec(1, 0, 0, 0),
+		unitVec(0, 1, 0, 0),
+		unitVec(0.98, 0.02, 0, 0),
+		nil, // a detection with no embedding: no direction, nothing to compare
+		unitVec(0.02, 0.98, 0, 0),
+	}
+	got := GroupVectors(vecs, 0.8)
+	if len(got) != 2 {
+		t.Fatalf("got %d groups, want 2: %v", len(got), got)
+	}
+	// The indices are the caller's own, which is what lets it map a group back to
+	// the frame and timestamp each detection came from.
+	if len(got[0]) != 2 || got[0][0] != 0 || got[0][1] != 2 {
+		t.Errorf("first group = %v, want inputs 0 and 2", got[0])
+	}
+	if len(got[1]) != 2 || got[1][0] != 1 || got[1][1] != 4 {
+		t.Errorf("second group = %v, want inputs 1 and 4", got[1])
+	}
+}
+
 func TestMatchPerson(t *testing.T) {
 	protos := map[int64][][]float32{
 		1: {unitVec(1, 0, 0, 0), unitVec(0, 0, 1, 0)}, // one person, two looks

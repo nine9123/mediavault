@@ -20,15 +20,14 @@ package faces
 import (
 	"context"
 	"log"
+	"math"
 	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
 	"mediavault/internal/config"
 	"mediavault/internal/face"
-	"mediavault/internal/media"
 	"mediavault/internal/model"
 	"mediavault/internal/sidecar"
 	"mediavault/internal/store"
@@ -56,6 +55,11 @@ const (
 	// frame, so they normally agree almost exactly; the tolerance is for a model
 	// upgrade that frames faces slightly differently.
 	refIoU = 0.5
+
+	// refSeconds is how far a people.json timestamp may be from a detected one
+	// and still be the same sighting. Tight, because both are computed from the
+	// same duration by the same code: this is float noise, not a search window.
+	refSeconds = 0.5
 )
 
 // Recognizer owns face detection and the people/face bookkeeping. The HTTP layer
@@ -314,14 +318,16 @@ func (r *Recognizer) detectBatch(ctx context.Context, skip int) (examined int, d
 // attempt is one item's trip through extraction and detection.
 type attempt struct {
 	item  model.Item
-	dets  []face.Detection
+	dets  []found
 	err   error
 	frame bool // the error was extracting the frame, not detecting on it
 	ran   bool // false only if we shut down before getting to this item
 }
 
 // detectItems extracts and detects a batch's worth of items in parallel,
-// returning the outcomes in the order they were given.
+// returning the outcomes in the order they were given. One item can be several
+// frames and several detections — see detect — but it is still one unit of work
+// here, because it is one row to write and one thing to skip.
 func (r *Recognizer) detectItems(ctx context.Context, items []model.Item) []attempt {
 	n := r.cfg.FaceWorkers
 	if n < 1 {
@@ -348,13 +354,7 @@ func (r *Recognizer) detectItems(ctx context.Context, items []model.Item) []atte
 				}
 				it := items[i]
 				out[i] = attempt{item: it, ran: true}
-				abs := filepath.Join(r.cfg.MediaRoot, filepath.FromSlash(it.Relpath))
-				jpeg, err := media.FrameJPEG(ctx, r.cfg, abs, it.Type, it.Offset, r.cfg.FaceFramePx)
-				if err != nil {
-					out[i].err, out[i].frame = err, true
-					continue
-				}
-				out[i].dets, out[i].err = face.Detect(ctx, r.cfg, jpeg)
+				out[i].dets, out[i].frame, out[i].err = r.detect(ctx, it)
 			}
 		}()
 	}
@@ -365,14 +365,20 @@ func (r *Recognizer) detectItems(ctx context.Context, items []model.Item) []atte
 // toWrites keeps the highest-scoring detections, up to max. A crowd shot can
 // return dozens of tiny, low-confidence faces whose embeddings are noise, and
 // noise is what makes clustering merge two people.
-func toWrites(dets []face.Detection, max int) []store.FaceWrite {
+//
+// The cap is per item, and a video is one item however many frames it was
+// sampled at — which it can afford to be, because by here the frames have
+// already been collapsed to one detection per person (see uniquePeople), so
+// twenty faces still means twenty people.
+func toWrites(dets []found, max int) []store.FaceWrite {
 	if max > 0 && len(dets) > max {
-		sort.SliceStable(dets, func(i, j int) bool { return dets[i].Score > dets[j].Score })
+		sort.SliceStable(dets, func(i, j int) bool { return dets[i].det.Score > dets[j].det.Score })
 		dets = dets[:max]
 	}
 	out := make([]store.FaceWrite, 0, len(dets))
-	for _, d := range dets {
-		out = append(out, store.FaceWrite{X: d.X, Y: d.Y, W: d.W, H: d.H, Score: d.Score, Vec: d.Vec})
+	for _, f := range dets {
+		d := f.det
+		out = append(out, store.FaceWrite{X: d.X, Y: d.Y, W: d.W, H: d.H, Score: d.Score, T: f.t, Vec: d.Vec})
 	}
 	return out
 }
@@ -435,7 +441,7 @@ func (r *Recognizer) sync(ctx context.Context) error {
 
 		var seed []int64
 		for _, ref := range p.Faces {
-			if f, ok := resolve(byPath[ref.Path], ref.Box); ok {
+			if f, ok := resolve(byPath[ref.Path], ref); ok {
 				seed = append(seed, f.ID)
 				protos[id] = append(protos[id], f.Vec)
 			}
@@ -627,7 +633,7 @@ func (r *Recognizer) remember(name string, faces []store.Face) error {
 	}
 	refs := make([]sidecar.FaceRef, 0, len(faces))
 	for _, f := range faces {
-		refs = append(refs, sidecar.FaceRef{Path: f.Relpath, Box: [4]float64{f.X, f.Y, f.W, f.H}})
+		refs = append(refs, sidecar.FaceRef{Path: f.Relpath, Box: [4]float64{f.X, f.Y, f.W, f.H}, T: f.T})
 	}
 	if i := doc.Find(name); i >= 0 {
 		doc.People[i].Faces = sample(dedupeRefs(append(doc.People[i].Faces, refs...)), protoCap)
@@ -640,10 +646,20 @@ func (r *Recognizer) remember(name string, faces []store.Face) error {
 // resolve finds the detected face matching a people.json reference. Overlap
 // rather than equality: the numbers were written by a detector and will be
 // re-produced by a detector, but not necessarily bit-for-bit.
-func resolve(candidates []store.Face, box [4]float64) (store.Face, bool) {
+//
+// A reference into a video also has to land in the right frame. Sampling is
+// deterministic — the same file yields the same points — so the timestamps
+// agree exactly and the tolerance is only there for what a round trip through
+// JSON and a re-probed duration can do to the last decimal. A reference with no
+// timestamp matches on the box alone, which is how everything named before this
+// existed carries on working.
+func resolve(candidates []store.Face, ref sidecar.FaceRef) (store.Face, bool) {
 	best, bestIoU := store.Face{}, refIoU
 	for _, f := range candidates {
-		if v := iou(box, [4]float64{f.X, f.Y, f.W, f.H}); v >= bestIoU {
+		if ref.T > 0 && math.Abs(f.T-ref.T) > refSeconds {
+			continue // the right box, somewhere else in the video: someone else
+		}
+		if v := iou(ref.Box, [4]float64{f.X, f.Y, f.W, f.H}); v >= bestIoU {
 			best, bestIoU = f, v
 		}
 	}
@@ -682,16 +698,20 @@ func sample[T any](in []T, n int) []T {
 	return out
 }
 
-// dedupeRefs drops duplicate (path, box) references, keeping the first of each.
+// dedupeRefs drops duplicate (path, timestamp, box) references, keeping the
+// first of each. The timestamp is part of the identity: two people filmed
+// alternately occupy the same box in the same file, and folding them together
+// would cost this person the example that is actually them.
 func dedupeRefs(in []sidecar.FaceRef) []sidecar.FaceRef {
 	type key struct {
 		p string
+		t float64
 		b [4]float64
 	}
 	seen := make(map[key]bool, len(in))
 	out := make([]sidecar.FaceRef, 0, len(in))
 	for _, r := range in {
-		k := key{r.Path, r.Box}
+		k := key{r.Path, r.T, r.Box}
 		if seen[k] {
 			continue
 		}

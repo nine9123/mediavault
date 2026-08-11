@@ -29,7 +29,7 @@ var schemaSQL string
 
 // schemaVersion is bumped whenever schema.sql changes in a way that requires a
 // rebuild. On mismatch the cache is dropped and recreated — no migrations.
-const schemaVersion = "1"
+const schemaVersion = "2"
 
 // itemCols is the canonical column order for every items SELECT, so a single
 // scanItem helper can decode any of them.

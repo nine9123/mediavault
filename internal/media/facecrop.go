@@ -23,26 +23,37 @@ const faceCropPx = 192
 // what make a thumbnail identifiable at 96px.
 const faceMargin = 0.35
 
-// FaceCropName maps a face (its item's relpath + its box) to a stable filename.
-// Keyed on the box rather than the face's row id because ids are not stable
-// across a cache rebuild, and re-cropping every face after every rebuild would
-// mean thousands of ffmpeg runs to produce byte-identical files.
-func FaceCropName(relpath string, x, y, w, h float64) string {
+// FaceCropName maps a face (its item's relpath, the point in it the face was
+// found at, and its box) to a stable filename. Keyed on those rather than on the
+// face's row id because ids are not stable across a cache rebuild, and
+// re-cropping every face after every rebuild would mean thousands of ffmpeg runs
+// to produce byte-identical files.
+//
+// at is seconds into a video, and is left out of the key when it is zero — which
+// is every still and every face found at a video's poster offset. So the crops
+// cached by earlier versions stay valid, and only faces that carry a timestamp
+// of their own get a new name.
+func FaceCropName(relpath string, at, x, y, w, h float64) string {
 	key := fmt.Sprintf("%s|%.4f,%.4f,%.4f,%.4f", relpath, x, y, w, h)
+	if at > 0 {
+		key = fmt.Sprintf("%s@%.3f|%.4f,%.4f,%.4f,%.4f", relpath, at, x, y, w, h)
+	}
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:8]) + ".jpg"
 }
 
 // FaceCropPath is the absolute path of a cached face crop.
-func FaceCropPath(dir, relpath string, x, y, w, h float64) string {
-	return filepath.Join(dir, FaceCropName(relpath, x, y, w, h))
+func FaceCropPath(dir, relpath string, at, x, y, w, h float64) string {
+	return filepath.Join(dir, FaceCropName(relpath, at, x, y, w, h))
 }
 
 // FaceCrop writes a cropped, downscaled JPEG of one face box to dst. The box is
 // in frame fractions (see internal/face), so the same numbers work whatever
-// resolution the detector was handed. Video seeks to the item's poster offset —
-// the frame faces were detected in — so the crop shows the face that was found.
-func FaceCrop(ctx context.Context, cfg config.Config, src string, typ model.MediaType, offset float64,
+// resolution the detector was handed. Video seeks to at — the point the face was
+// detected at, which for a video sampled across its length is that face's own
+// timestamp and otherwise the item's poster offset — so the crop shows the face
+// that was found rather than whoever is on screen at second two.
+func FaceCrop(ctx context.Context, cfg config.Config, src string, typ model.MediaType, at float64,
 	x, y, w, h float64, dst string) error {
 	if w <= 0 || h <= 0 {
 		return fmt.Errorf("empty face box")
@@ -79,7 +90,7 @@ func FaceCrop(ctx context.Context, cfg config.Config, src string, typ model.Medi
 		}
 		return nil
 	}
-	if seek := PosterSeek(typ, offset); seek != nil {
+	if seek := PosterSeek(typ, at); seek != nil {
 		if err := run(seek...); err == nil {
 			return nil
 		}

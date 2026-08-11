@@ -33,7 +33,18 @@ type Face struct {
 	PersonName string // "" when unassigned
 	X, Y, W, H float64
 	Score      float64
+	T          float64 // seconds into a video where this face was found; 0 for a still
 	Vec        []float32
+}
+
+// CropAt is the point in the item this face should be cut from: its own
+// timestamp for a video sampled across its length, and the item's poster offset
+// for everything else (a still, or a face detected before faces carried a time).
+func (f Face) CropAt() float64 {
+	if f.T > 0 {
+		return f.T
+	}
+	return f.Offset
 }
 
 // FaceWrite is one detection the worker hands us. It mirrors face.Detection
@@ -41,6 +52,7 @@ type Face struct {
 type FaceWrite struct {
 	X, Y, W, H float64
 	Score      float64
+	T          float64 // seconds into a video; 0 (stored as NULL) for a still
 	Vec        []float32
 }
 
@@ -105,7 +117,8 @@ type Grouping struct {
 }
 
 const faceCols = `f.id, f.item_id, i.relpath, i.type, COALESCE(i.offset_s,0),
-	COALESCE(f.person_id,0), COALESCE(p.name,''), f.x, f.y, f.w, f.h, COALESCE(f.score,0), f.vec`
+	COALESCE(f.person_id,0), COALESCE(p.name,''), f.x, f.y, f.w, f.h, COALESCE(f.score,0),
+	COALESCE(f.t,0), f.vec`
 
 const faceFrom = `FROM faces f
 	JOIN items i ON i.id = f.item_id
@@ -117,7 +130,7 @@ func scanFaces(rows *sql.Rows) ([]Face, error) {
 		var f Face
 		var b []byte
 		if err := rows.Scan(&f.ID, &f.ItemID, &f.Relpath, &f.Type, &f.Offset,
-			&f.PersonID, &f.PersonName, &f.X, &f.Y, &f.W, &f.H, &f.Score, &b); err != nil {
+			&f.PersonID, &f.PersonName, &f.X, &f.Y, &f.W, &f.H, &f.Score, &f.T, &b); err != nil {
 			return nil, err
 		}
 		f.Vec = decodeVec(b)
@@ -152,9 +165,15 @@ func (s *Store) SetFaces(ctx context.Context, relpath string, faces []FaceWrite)
 		if len(f.Vec) == 0 {
 			continue
 		}
+		// NULL rather than 0 for a still: the column means "found this many
+		// seconds in", and a photograph has no such number to report.
+		var t any
+		if f.T > 0 {
+			t = f.T
+		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO faces(item_id,person_id,x,y,w,h,score,dim,vec) VALUES(?,NULL,?,?,?,?,?,?,?)`,
-			id, f.X, f.Y, f.W, f.H, f.Score, len(f.Vec), encodeVec(f.Vec)); err != nil {
+			`INSERT INTO faces(item_id,person_id,x,y,w,h,score,t,dim,vec) VALUES(?,NULL,?,?,?,?,?,?,?,?)`,
+			id, f.X, f.Y, f.W, f.H, f.Score, t, len(f.Vec), encodeVec(f.Vec)); err != nil {
 			return err
 		}
 	}
@@ -240,11 +259,14 @@ func (s *Store) FaceByID(ctx context.Context, id int64) (Face, error) {
 	return faces[0], nil
 }
 
-// FacesForItem returns the faces found in one item, largest first (the biggest
-// face in a frame is usually its subject).
+// FacesForItem returns the faces found in one item: in the order they appear for
+// a video, and largest first within a frame (the biggest face in a frame is
+// usually its subject). Stills carry no timestamp, so for them this is the size
+// ordering alone.
 func (s *Store) FacesForItem(ctx context.Context, itemID int64) ([]Face, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+faceCols+` `+faceFrom+` WHERE f.item_id = ? ORDER BY f.w*f.h DESC, f.id`, itemID)
+		`SELECT `+faceCols+` `+faceFrom+`
+		 WHERE f.item_id = ? ORDER BY COALESCE(f.t,0), f.w*f.h DESC, f.id`, itemID)
 	if err != nil {
 		return nil, err
 	}
@@ -716,6 +738,38 @@ func ClusterOf(clusters []FaceCluster, faceID int64) (FaceCluster, bool) {
 		}
 	}
 	return FaceCluster{}, false
+}
+
+// GroupVectors groups embeddings by the same rule the People page groups faces
+// by, returning the input indices of each group in the order the groups were
+// formed. It is how the face worker answers "how many different people are in
+// this video" after sampling it at thirty points: the same question the People
+// page asks of the whole library, asked of one item's worth of detections, and
+// worth answering with the same code so the two can never disagree about what
+// "the same person" means.
+//
+// Empty vectors are left out — there is no direction to compare — so a caller
+// must not assume every index comes back.
+func GroupVectors(vecs [][]float32, threshold float64) [][]int {
+	faces := make([]Face, 0, len(vecs))
+	for i, v := range vecs {
+		if len(v) == 0 {
+			continue
+		}
+		// ID carries the input index (group only ever reads Vec), which is what
+		// maps the groups back to the caller's own list.
+		faces = append(faces, Face{ID: int64(i), Vec: v})
+	}
+	groups := group(faces, threshold)
+	out := make([][]int, 0, len(groups))
+	for _, g := range groups {
+		idx := make([]int, 0, len(g))
+		for _, f := range g {
+			idx = append(idx, int(f.ID))
+		}
+		out = append(out, idx)
+	}
+	return out
 }
 
 // group is greedy single-pass agglomeration: walk the faces in id order and put

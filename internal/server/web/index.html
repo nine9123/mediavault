@@ -406,6 +406,9 @@
   .facechips .fchip:hover img{border-color:var(--brass)}
   .facechips .fchip span{font-family:var(--mono);font-size:9px;letter-spacing:.03em;color:var(--bone-dim);max-width:56px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .facechips .fchip.unnamed span{color:var(--bone-faint)}
+  /* Where in a video this person was found. Clicking it seeks there, so it is
+     coloured like the other things on the page you can act on. */
+  .facechips .fchip span.ftime{color:var(--brass);cursor:pointer}
 </style>
 </head>
 <body>
@@ -2283,6 +2286,10 @@
 
   // Face chips for the item on screen: a crop each, clicking through to that
   // person's (or group's) items. Reads like the tag chips above it on purpose.
+  //
+  // A video is one chip per person rather than per sighting — it is sampled
+  // across its whole length and the repeats of one face are collapsed — so each
+  // chip can also say where that person is, and clicking the time seeks there.
   function renderItemFaces(rowEl, wrap, list) {
     wrap.innerHTML = "";
     if (!list.length) { rowEl.classList.add("hidden"); return; }
@@ -2302,6 +2309,19 @@
       var lb = document.createElement("span");
       lb.textContent = f.name || "unnamed";
       b.appendChild(lb);
+      if (f.t) {
+        var tm = document.createElement("span");
+        tm.className = "ftime";
+        tm.textContent = fmtDuration(f.t);
+        tm.title = "Jump to " + fmtDuration(f.t) + ", where this face was found";
+        tm.addEventListener("click", function (ev) {
+          var v = el.stage.querySelector("video");
+          if (!v) return; // nothing to seek; let the chip do its usual thing
+          ev.stopPropagation();
+          v.currentTime = f.t;
+        });
+        b.appendChild(tm);
+      }
       b.addEventListener("click", function () {
         closeViewer();
         showPerson(f.ref, false, f.name);

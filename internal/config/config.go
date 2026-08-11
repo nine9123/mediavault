@@ -92,6 +92,28 @@ type Config struct {
 	// captioning frame — a face 5% of the width of a 512px frame is 25px across,
 	// below what any detector will find.
 	FaceFramePx int
+	// FaceTiles cuts a large still into an NxN grid of overlapping tiles and
+	// detects on each of them as well as on the whole frame, so a face that is
+	// tiny in the whole photograph is a normal-sized face in its tile.
+	//
+	// It exists because FaceFramePx is not a resolution the detector honours so
+	// much as a budget it enforces: every service shrinks what it is given to
+	// what its model can afford, so sending a bigger frame finds nothing extra.
+	// Cutting the frame up instead spends the same budget several times over
+	// different parts of the picture, which is the only way to raise the
+	// resolution faces are actually looked for at. 0 or 1 turns it off; the cost
+	// is up to N*N extra detections on stills big enough to be worth it.
+	FaceTiles int
+	// FaceVideoEvery is how often a video is sampled for faces, in seconds. One
+	// frame per video finds whoever happened to be on screen at the poster
+	// offset and nobody else, which for anything longer than a few seconds is
+	// most of the people in it.
+	FaceVideoEvery float64
+	// FaceVideoFrames caps how many frames one video is sampled at, so a feature
+	// film costs a bounded number of detections rather than one per second of
+	// runtime. Short clips get FaceVideoEvery; long ones are spread evenly across
+	// the whole duration.
+	FaceVideoFrames int
 	// FaceMaxPerItem caps how many faces are stored per item, keeping the
 	// highest-scoring ones. A crowd shot can return dozens of low-quality
 	// detections that only add noise to clustering.
@@ -209,6 +231,9 @@ func Load() Config {
 		FaceURL:          env("FACE_URL", ""),
 		FaceMatch:        envFloat("FACE_MATCH", 0),
 		FaceFramePx:      envInt("FACE_FRAME_PX", 1280),
+		FaceTiles:        envInt("FACE_TILES", 2),
+		FaceVideoEvery:   envFloat("FACE_VIDEO_EVERY", 1),
+		FaceVideoFrames:  envInt("FACE_VIDEO_FRAMES", 20),
 		FaceMaxPerItem:   envInt("FACE_MAX_PER_ITEM", 20),
 		FaceWorkers:      envInt("FACE_WORKERS", 2),
 		FaceTimeout:      envDur("FACE_TIMEOUT", 3*time.Minute),
