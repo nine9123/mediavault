@@ -2,6 +2,9 @@ package media
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -11,20 +14,40 @@ import (
 	"mediavault/internal/model"
 )
 
-// The crop cache is keyed on (relpath, box) rather than on the face's database id
-// because ids are not stable across a cache rebuild: keying on the id would mean
-// re-cropping every face in the library after every rebuild to produce
+// The crop cache is keyed on (relpath, timestamp, box) rather than on the face's
+// database id because ids are not stable across a cache rebuild: keying on the id
+// would mean re-cropping every face in the library after every rebuild to produce
 // byte-identical files.
 func TestFaceCropNameIsStableAndBoxSpecific(t *testing.T) {
-	a := FaceCropName("holiday/img_01.jpg", 0.1, 0.2, 0.3, 0.4)
-	if a != FaceCropName("holiday/img_01.jpg", 0.1, 0.2, 0.3, 0.4) {
+	a := FaceCropName("holiday/img_01.jpg", 0, 0.1, 0.2, 0.3, 0.4)
+	if a != FaceCropName("holiday/img_01.jpg", 0, 0.1, 0.2, 0.3, 0.4) {
 		t.Error("same face produced two different names")
 	}
-	if a == FaceCropName("holiday/img_01.jpg", 0.5, 0.2, 0.3, 0.4) {
+	if a == FaceCropName("holiday/img_01.jpg", 0, 0.5, 0.2, 0.3, 0.4) {
 		t.Error("two faces in one frame collided on the same name")
 	}
-	if a == FaceCropName("holiday/img_02.jpg", 0.1, 0.2, 0.3, 0.4) {
+	if a == FaceCropName("holiday/img_02.jpg", 0, 0.1, 0.2, 0.3, 0.4) {
 		t.Error("the same box in two files collided on the same name")
+	}
+}
+
+// Two people standing in the same spot at different points of a video have the
+// same box, and cropping one at the other's timestamp would show the wrong face.
+func TestFaceCropNameSeparatesTimestampsButLeavesStillsAlone(t *testing.T) {
+	still := FaceCropName("clip.mp4", 0, 0.1, 0.2, 0.3, 0.4)
+	if at := FaceCropName("clip.mp4", 12.5, 0.1, 0.2, 0.3, 0.4); at == still {
+		t.Error("a face at 12.5s collided with the same box at the poster frame")
+	}
+	if a, b := FaceCropName("clip.mp4", 12.5, 0.1, 0.2, 0.3, 0.4),
+		FaceCropName("clip.mp4", 90, 0.1, 0.2, 0.3, 0.4); a == b {
+		t.Error("two timestamps of the same box collided")
+	}
+	// Faces with no timestamp keep the name earlier versions gave them, so an
+	// upgrade doesn't invalidate a library's worth of cached crops. Spelled out
+	// rather than compared against the function, which would pass either way.
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%.4f,%.4f,%.4f,%.4f", "clip.mp4", 0.1, 0.2, 0.3, 0.4)))
+	if want := hex.EncodeToString(sum[:8]) + ".jpg"; still != want {
+		t.Errorf("an untimed face is now called %s, invalidating every cached crop (was %s)", still, want)
 	}
 }
 

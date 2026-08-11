@@ -534,7 +534,7 @@ func (s *Server) handleFaceCrop(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	dst := media.FaceCropPath(s.cfg.FaceDir(), f.Relpath, f.X, f.Y, f.W, f.H)
+	dst := media.FaceCropPath(s.cfg.FaceDir(), f.Relpath, f.CropAt(), f.X, f.Y, f.W, f.H)
 	if _, err := os.Stat(dst); err != nil {
 		abs, ok := s.resolve(f.Relpath)
 		if !ok {
@@ -554,7 +554,7 @@ func (s *Server) handleFaceCrop(w http.ResponseWriter, r *http.Request) {
 			// Crop to a unique temp name and rename into place, so two requests for
 			// the same cover can't have one serve what the other is still writing.
 			tmp := fmt.Sprintf("%s.%d.tmp", dst, s.cropSeq.Add(1))
-			if err := media.FaceCrop(r.Context(), s.cfg, abs, f.Type, f.Offset, f.X, f.Y, f.W, f.H, tmp); err != nil {
+			if err := media.FaceCrop(r.Context(), s.cfg, abs, f.Type, f.CropAt(), f.X, f.Y, f.W, f.H, tmp); err != nil {
 				_ = os.Remove(tmp)
 				http.Error(w, "could not crop that face: "+err.Error(), http.StatusUnprocessableEntity)
 				return
@@ -714,14 +714,20 @@ func mixHash(a, b uint64) uint64 {
 // not personDTO: the counts on that would be about this single face, which reads
 // as information and isn't.
 type faceDTO struct {
-	Ref      string `json:"ref"`
-	Name     string `json:"name,omitempty"`
-	CoverURL string `json:"cover_url,omitempty"`
+	Ref      string  `json:"ref"`
+	Name     string  `json:"name,omitempty"`
+	CoverURL string  `json:"cover_url,omitempty"`
+	T        float64 `json:"t,omitempty"` // seconds into a video; absent for a still
 }
 
 // facesForItemDTO is the "who is in this?" list shown in the viewer's card. An
 // unnamed face links to the group it belongs to, so the card is also a way into
 // naming whoever is in front of you.
+//
+// For a video this is one entry per person rather than per sighting (see
+// internal/faces), each carrying the point they are seen clearest at — so the
+// list reads as "who is in this, and where to find them" rather than as the same
+// three people over and over.
 func (s *Server) facesForItemDTO(r *http.Request, itemID int64) []faceDTO {
 	if !s.facesOn() {
 		return nil
@@ -736,7 +742,7 @@ func (s *Server) facesForItemDTO(r *http.Request, itemID int64) []faceDTO {
 		if f.PersonID > 0 {
 			ref = personPrefix + strconv.FormatInt(f.PersonID, 10)
 		}
-		out = append(out, faceDTO{Ref: ref, Name: f.PersonName, CoverURL: faceURL(f.ID)})
+		out = append(out, faceDTO{Ref: ref, Name: f.PersonName, CoverURL: faceURL(f.ID), T: f.T})
 	}
 	return out
 }

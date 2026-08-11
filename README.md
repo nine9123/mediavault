@@ -112,9 +112,12 @@ docker compose up --build
 | `PREVIEW_MIN_DUR`| `5`     | Skip videos shorter than this (seconds)              |
 | `FACE_URL`      | *(empty)*| Face-recognition service (own container); empty disables the People page |
 | `FACE_MATCH`    | *(empty)*| Cosine threshold for "same person"; empty = use what the service advertises |
-| `FACE_FRAME_PX` | `1280`   | Frame size sent to the detector (bigger finds smaller faces) |
+| `FACE_FRAME_PX` | `1280`   | Frame size **one** detection sees (bigger finds smaller faces) |
+| `FACE_TILES`    | `2`      | Also detect on an NxN grid of tiles of a large still; `0` disables |
+| `FACE_VIDEO_EVERY` | `1`   | Sample a video's faces every N seconds                |
+| `FACE_VIDEO_FRAMES`| `20`  | …up to this many points, spread across the whole duration |
 | `FACE_MAX_PER_ITEM` | `20` | Keep at most this many faces per item (highest-scoring) |
-| `FACE_WORKERS`  | `2`      | Frames in flight: extracting the next one overlaps detecting this one |
+| `FACE_WORKERS`  | `2`      | Items in flight: extracting the next one overlaps detecting this one |
 | `FACE_TIMEOUT`  | `3m`     | Give up on one frame after this and move on (see People, below) |
 | `FFMPEG`        | `ffmpeg` | ffmpeg binary                                       |
 | `FFPROBE`       | `ffprobe`| ffprobe binary                                      |
@@ -623,13 +626,34 @@ service, or a hosted API without touching mediavault.
 
 How it works:
 
-- A background worker sends one frame per item to the service (the same
-  poster-frame offset the thumbnail uses, so a video is recognised on the frame
-  you see in the grid) and stores a box plus an embedding per face. It is the
-  same shape as captioning: slow, resumable, and harmless when the service is
-  down — the startup log says so and the page just stays empty. `FACE_WORKERS`
-  items are in flight at once, because extracting a frame (ffmpeg, over the
-  network mount) and detecting on it (the other container) are different waits.
+- A background worker turns each item into frames, sends them to the service and
+  stores a box plus an embedding per face. It is the same shape as captioning:
+  slow, resumable, and harmless when the service is down — the startup log says
+  so and the page just stays empty. `FACE_WORKERS` items are in flight at once,
+  because extracting frames (ffmpeg, over the network mount) and detecting on
+  them (the other container) are different waits.
+- **A still is looked at whole and then in pieces.** Every detector bounds the
+  pixels it will process, so in a 6000px group shot the people at the back are
+  twenty pixels across by the time it looks, and nothing finds them. So a large
+  photo is *also* cut into `FACE_TILES`x`FACE_TILES` overlapping tiles, each
+  detected on separately at full budget, and the results merged back by overlap
+  — the same faces at twice the resolution in each direction. That is four extra
+  detections per large photo at the default 2x2, which is the price of finding
+  the people at the back; `FACE_TILES=0` turns it off and gets the old speed and
+  the old misses. The whole-frame pass is unchanged either way, so a tile the
+  service refuses loses that corner and nothing else.
+- **A video is scrubbed, not sampled once.** One frame per video finds whoever
+  was on screen at second two, which in anything longer than a clip is most of
+  the people in it missed. So a video is sampled every `FACE_VIDEO_EVERY`
+  seconds, up to `FACE_VIDEO_FRAMES` points spread across its whole duration
+  (so a feature film costs a bounded number of detections, sampled sparsely
+  end to end rather than densely at the start).
+- **…and then collapsed to one entry per person.** The same face in thirty
+  frames is one person who was there, not thirty faces, so the detections from
+  one video are grouped by the same similarity rule the People page uses and
+  only the clearest shot of each person survives — carrying the timestamp it was
+  found at. That timestamp is where the face crop is cut from, and it appears on
+  the chip in the viewer's People row: click it to jump there in the video.
 - **Detection that stops before the end** is almost always one of two things,
   and the log says which. A frame that takes longer than `FACE_TIMEOUT` is
   skipped with a line naming the file — if that is most frames, the recognition

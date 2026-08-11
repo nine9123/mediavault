@@ -55,6 +55,23 @@ func addItem(t *testing.T, st *store.Store, rel string) {
 	}
 }
 
+// addVideo is addItem for something with a timeline: a duration to scrub and a
+// poster offset for anything that has no timestamp of its own.
+func addVideo(t *testing.T, st *store.Store, rel string, duration, offset float64) {
+	t.Helper()
+	now := time.Now()
+	err := st.WriteBatch(context.Background(), []store.ItemWrite{{
+		Item: model.Item{
+			Relpath: rel, Size: 4096, MTime: now, Type: model.MediaVideo,
+			Width: 1920, Height: 1080, Duration: duration, Offset: offset,
+			IndexedAt: now, SeenAt: now,
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func vec(a, b, c, d float64) []float32 {
 	n := math.Sqrt(a*a + b*b + c*c + d*d)
 	return []float32{float32(a / n), float32(b / n), float32(c / n), float32(d / n)}
@@ -505,5 +522,35 @@ func TestUnreadableItemsDoNotStopTheQueue(t *testing.T) {
 
 	if got := rec.Skipped(); got != total {
 		t.Errorf("the pass gave up on %d items, want all %d tried", got, total)
+	}
+}
+
+// A reference into a video has to name the moment as well as the box. Two people
+// filmed alternately — an interview, a video call — sit in the same place in the
+// frame, so resolving on the box alone would hand a name to the wrong one of them
+// on the pass after a cache rebuild.
+func TestResolvePicksTheRightSightingInAVideo(t *testing.T) {
+	speakers := []store.Face{
+		{ID: 1, X: 0.30, Y: 0.20, W: 0.20, H: 0.30, T: 10},
+		{ID: 2, X: 0.31, Y: 0.21, W: 0.20, H: 0.30, T: 40},
+	}
+	ref := func(t float64) sidecar.FaceRef {
+		return sidecar.FaceRef{Path: "interview.mp4", Box: [4]float64{0.30, 0.20, 0.20, 0.30}, T: t}
+	}
+	if got, ok := resolve(speakers, ref(40)); !ok || got.ID != 2 {
+		t.Errorf("the face at 40s resolved to %d (ok=%v), want face 2", got.ID, ok)
+	}
+	if got, ok := resolve(speakers, ref(10)); !ok || got.ID != 1 {
+		t.Errorf("the face at 10s resolved to %d (ok=%v), want face 1", got.ID, ok)
+	}
+	// A moment that no longer exists (the file was re-encoded, so it is sampled
+	// elsewhere) costs this person one example, not somebody else's identity.
+	if got, ok := resolve(speakers, ref(999)); ok {
+		t.Errorf("a reference to 999s resolved to face %d, want nothing", got.ID)
+	}
+	// Named before faces carried a timestamp: the box alone, as it always was.
+	legacy := sidecar.FaceRef{Path: "interview.mp4", Box: [4]float64{0.30, 0.20, 0.20, 0.30}}
+	if got, ok := resolve(speakers, legacy); !ok || got.ID != 1 {
+		t.Errorf("an untimed reference resolved to %d (ok=%v), want the best-matching box", got.ID, ok)
 	}
 }
