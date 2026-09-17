@@ -55,8 +55,3 @@ jobs:
         run: |
           docker push ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:${{ env.SHA_SHORT }}
           docker push ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:latest
-
-      - name: Trigger watchtower update
-        run: |
-          curl -sf -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
-            "http://${{ secrets.TRUENAS_LAN_IP }}/v1/update?scope=${{ env.WATCHTOWER_SCOPE }}"
