@@ -6,10 +6,9 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: 192.168.1.40:30008
+  REGISTRY: gitea.internal:30008
   IMAGE_NAME: nine9/mediavault
   FACEREC_IMAGE_NAME: nine9/facerec
-  WATCHTOWER_SCOPE: mediavault   # must match the watchtower.scope label on the app
 
 jobs:
   build-and-deploy:
