@@ -110,6 +110,11 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	seen := make(map[string]struct{}, len(index))
 	var seenMu sync.Mutex
 
+	// Image relpaths grouped by directory, collected on the same walk for the
+	// chain rebuild in step 6 — a second walk would list the whole tree over the
+	// network again just to find the same files.
+	chainDirs := map[string][]string{}
+
 	jobs := make(chan job, 256)
 	results := make(chan result, 256)
 
@@ -230,6 +235,14 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 		}
 		rel = filepath.ToSlash(rel)
 
+		// Chains look at the files present, not at what gets indexed, so this is
+		// recorded ahead of the size and settle checks below.
+		if typ != model.MediaVideo && typ != model.MediaAudio { // chains are image stories
+			if dir := filepath.ToSlash(filepath.Dir(rel)); dir != "." { // don't chain loose files at the root
+				chainDirs[dir] = append(chainDirs[dir], rel)
+			}
+		}
+
 		info, err := d.Info()
 		if err != nil {
 			return nil
@@ -313,9 +326,8 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	stats.Seen = len(seen)
 
 	// 6. Rebuild chains (folders + chain.json). Fully derived, so rebuilt each
-	//    scan. This is a second, stat-only walk; it could be folded into the
-	//    walk above later, but keeping it separate keeps the pipeline clean.
-	if err := s.buildChains(ctx); err != nil {
+	//    scan, from the image files the walk above collected.
+	if err := s.buildChains(ctx, chainDirs); err != nil {
 		log.Printf("scan: build chains: %v", err)
 	}
 
@@ -447,48 +459,15 @@ func (s *Scanner) wantsPreview(typ model.MediaType) bool {
 
 // buildChains derives reading-order chains from the filesystem: any directory
 // holding two or more images becomes a chain, ordered by filename. A chain.json
-// in the directory overrides the title and gives an explicit order.
-func (s *Scanner) buildChains(ctx context.Context) error {
-	byDir := map[string]*store.ChainDef{}
-
-	err := filepath.WalkDir(s.cfg.MediaRoot, func(abs string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		name := d.Name()
-		if strings.HasPrefix(name, ".") || sidecar.IsSidecar(name) {
-			return nil
-		}
-		typ, ok := s.cfg.MediaTypeFor(name)
-		if !ok || typ == model.MediaVideo || typ == model.MediaAudio {
-			return nil // chains are image stories
-		}
-		rel, err := filepath.Rel(s.cfg.MediaRoot, abs)
-		if err != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		dir := filepath.ToSlash(filepath.Dir(rel))
-		if dir == "." {
-			return nil // don't chain loose files at the root
-		}
-		def := byDir[dir]
-		if def == nil {
-			def = &store.ChainDef{Key: dir, Title: filepath.Base(dir), Kind: "folder", Source: dir}
-			byDir[dir] = def
-		}
-		def.Relpaths = append(def.Relpaths, rel)
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
+// in the directory overrides the title and gives an explicit order. byDir is
+// the image relpaths the scan's walk found, keyed by their directory.
+func (s *Scanner) buildChains(ctx context.Context, byDir map[string][]string) error {
 	var out []store.ChainDef
-	for _, def := range byDir {
-		if len(def.Relpaths) < 2 {
+	for dir, relpaths := range byDir {
+		if len(relpaths) < 2 {
 			continue // a single image isn't a chain
 		}
+		def := &store.ChainDef{Key: dir, Title: filepath.Base(dir), Kind: "folder", Source: dir, Relpaths: relpaths}
 		sort.Strings(def.Relpaths) // default order: by filename
 		if man, ok := sidecar.ReadChainManifest(filepath.Join(s.cfg.MediaRoot, def.Key)); ok {
 			if man.Title != "" {
@@ -548,6 +527,16 @@ func hashFileFull(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// hashBufs recycles hashFilePartial's read buffer: one per worker in flight,
+// rather than a fresh 64 KiB allocation for every file a scan hashes.
+var hashBufs = sync.Pool{New: func() any {
+	b := make([]byte, partialChunk)
+	return &b
+}}
+
+// partialChunk is how much hashFilePartial reads from each end of a file.
+const partialChunk = 64 * 1024
+
 // hashFilePartial fingerprints a file from its size plus its first and last
 // 64 KiB. It reads at most 128 KiB no matter how large the file is, so it stays
 // cheap over the network while still reliably matching / distinguishing real
@@ -560,7 +549,7 @@ func hashFilePartial(path string, size int64) (string, error) {
 	}
 	defer f.Close()
 
-	const chunk = 64 * 1024
+	const chunk = partialChunk
 	h := sha256.New()
 
 	// Fold in the size so different-length files can never collide.
@@ -568,7 +557,9 @@ func hashFilePartial(path string, size int64) (string, error) {
 	binary.LittleEndian.PutUint64(sizeBuf[:], uint64(size))
 	h.Write(sizeBuf[:])
 
-	buf := make([]byte, chunk)
+	bp := hashBufs.Get().(*[]byte)
+	defer hashBufs.Put(bp)
+	buf := *bp
 	n, err := io.ReadFull(f, buf)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return "", err

@@ -307,6 +307,11 @@ func (s *Store) WriteBatch(ctx context.Context, batch []ItemWrite) error {
 	}
 	defer tx.Rollback()
 
+	type cached struct {
+		id  int64
+		vec []float32
+	}
+	var vecs []cached
 	for _, w := range batch {
 		it := w.Item
 		var id int64
@@ -339,7 +344,7 @@ RETURNING id`,
 				id, len(w.Vector), encodeVec(w.Vector)); err != nil {
 				return err
 			}
-			s.cacheVec(id, w.Vector)
+			vecs = append(vecs, cached{id, w.Vector})
 		}
 
 		// Sidecar is the source of truth for manual tags: clear this item's
@@ -367,7 +372,15 @@ RETURNING id`,
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Only after the commit: a rolled-back batch must not leave vectors in the
+	// similarity cache that the table doesn't have.
+	for _, c := range vecs {
+		s.cacheVec(c.id, c.vec)
+	}
+	return nil
 }
 
 // MarkMissing flags files a scan no longer saw. Returns how many newly flipped
@@ -972,12 +985,18 @@ func decodeVec(b []byte) []float32 {
 	return v
 }
 
+// cacheVec adds a committed vector to the similarity cache, but only once that
+// cache has been loaded. Before then there is nothing to keep in step: the
+// first similarity search reads every vector from the table anyway, so holding
+// them in memory during a scan would only cost RAM (a whole library's worth on
+// the first scan) for a feature that may never be used this run. The caller
+// must have committed the row first, so a load that starts after this check
+// sees it in the table; one already running holds vecMu, and this waits for it.
 func (s *Store) cacheVec(id int64, v []float32) {
 	s.vecMu.Lock()
-	if s.vecs == nil {
-		s.vecs = make(map[int64][]float32)
+	if s.vecInit {
+		s.vecs[id] = v
 	}
-	s.vecs[id] = v
 	s.vecMu.Unlock()
 }
 
@@ -995,7 +1014,7 @@ func (s *Store) loadVecs(ctx context.Context) error {
 	m := make(map[int64][]float32)
 	for rows.Next() {
 		var id int64
-		var b []byte
+		var b sql.RawBytes // decodeVec copies, so no need for Scan's own copy too
 		if err := rows.Scan(&id, &b); err != nil {
 			return err
 		}
@@ -1003,9 +1022,6 @@ func (s *Store) loadVecs(ctx context.Context) error {
 	}
 	if err := rows.Err(); err != nil {
 		return err
-	}
-	for id, v := range s.vecs { // keep entries written before this load
-		m[id] = v
 	}
 	s.vecs = m
 	s.vecInit = true
@@ -1023,18 +1039,16 @@ func (s *Store) SimilarItems(ctx context.Context, relpath string, limit int) ([]
 		return nil, err
 	}
 
-	type cand struct {
-		id  int64
-		vec []float32
-	}
+	// Scored in place under the lock rather than copying the whole library's
+	// worth of candidates out first, and only the best limit are kept.
 	s.vecMu.Lock()
 	sv := s.vecs[seed.ID]
-	var cands []cand
+	var top topScores
 	if sv != nil {
-		cands = make([]cand, 0, len(s.vecs))
+		top = newTopScores(limit)
 		for id, v := range s.vecs {
 			if id != seed.ID {
-				cands = append(cands, cand{id, v})
+				top.offer(id, media.Cosine(sv, v))
 			}
 		}
 	}
@@ -1042,19 +1056,7 @@ func (s *Store) SimilarItems(ctx context.Context, relpath string, limit int) ([]
 	if sv == nil {
 		return nil, nil
 	}
-
-	type scored struct {
-		id    int64
-		score float64
-	}
-	all := make([]scored, 0, len(cands))
-	for _, c := range cands {
-		all = append(all, scored{c.id, media.Cosine(sv, c.vec)})
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i].score > all[j].score })
-	if len(all) > limit {
-		all = all[:limit]
-	}
+	all := top.sorted()
 
 	ids := make([]int64, len(all))
 	for i, a := range all {
@@ -1071,6 +1073,69 @@ func (s *Store) SimilarItems(ctx context.Context, relpath string, limit int) ([]
 		}
 	}
 	return out, nil
+}
+
+// scored is one similarity-search candidate.
+type scored struct {
+	id    int64
+	score float64
+}
+
+// topScores keeps the k highest-scoring candidates seen so far, as a min-heap on
+// score: the weakest kept candidate is at the root, so most of a library is
+// rejected with one comparison and memory stays at k entries rather than one per
+// item.
+type topScores struct {
+	k int
+	h []scored
+}
+
+func newTopScores(k int) topScores {
+	if k < 0 {
+		k = 0
+	}
+	return topScores{k: k, h: make([]scored, 0, k)}
+}
+
+func (t *topScores) offer(id int64, score float64) {
+	if len(t.h) < t.k {
+		t.h = append(t.h, scored{id, score})
+		// sift up
+		for i := len(t.h) - 1; i > 0; {
+			p := (i - 1) / 2
+			if t.h[p].score <= t.h[i].score {
+				break
+			}
+			t.h[p], t.h[i] = t.h[i], t.h[p]
+			i = p
+		}
+		return
+	}
+	if t.k == 0 || score <= t.h[0].score {
+		return
+	}
+	t.h[0] = scored{id, score}
+	// sift down
+	for i, n := 0, len(t.h); ; {
+		l, r, m := 2*i+1, 2*i+2, i
+		if l < n && t.h[l].score < t.h[m].score {
+			m = l
+		}
+		if r < n && t.h[r].score < t.h[m].score {
+			m = r
+		}
+		if m == i {
+			break
+		}
+		t.h[i], t.h[m] = t.h[m], t.h[i]
+		i = m
+	}
+}
+
+// sorted returns the kept candidates, best first.
+func (t *topScores) sorted() []scored {
+	sort.Slice(t.h, func(i, j int) bool { return t.h[i].score > t.h[j].score })
+	return t.h
 }
 
 // ItemsByIDs fetches present items by id (absent/missing ids omitted).
@@ -1169,12 +1234,13 @@ func (s *Store) UndescribedItems(ctx context.Context, limit int) ([]model.Item, 
 
 // ---- caption embeddings: semantic search (brute-force cosine) ----
 
+// cacheEmb adds a stored embedding to the search cache once it is loaded; see
+// cacheVec for why it is left alone before then.
 func (s *Store) cacheEmb(id int64, v []float32) {
 	s.embMu.Lock()
-	if s.embs == nil {
-		s.embs = make(map[int64][]float32)
+	if s.embInit {
+		s.embs[id] = v
 	}
-	s.embs[id] = v
 	s.embMu.Unlock()
 }
 
@@ -1192,7 +1258,7 @@ func (s *Store) loadEmbs(ctx context.Context) error {
 	m := make(map[int64][]float32)
 	for rows.Next() {
 		var id int64
-		var b []byte
+		var b sql.RawBytes // decodeVec copies, so no need for Scan's own copy too
 		if err := rows.Scan(&id, &b); err != nil {
 			return err
 		}
@@ -1200,9 +1266,6 @@ func (s *Store) loadEmbs(ctx context.Context) error {
 	}
 	if err := rows.Err(); err != nil {
 		return err
-	}
-	for id, v := range s.embs {
-		m[id] = v
 	}
 	s.embs = m
 	s.embInit = true
@@ -1268,26 +1331,18 @@ func (s *Store) SemanticSearch(ctx context.Context, qvec []float32, typ string, 
 			return nil, nil
 		}
 	}
-	type sc struct {
-		id    int64
-		score float64
-	}
+	top := newTopScores(limit)
 	s.embMu.Lock()
-	all := make([]sc, 0, len(s.embs))
 	for id, v := range s.embs {
 		if allow != nil && !allow[id] {
 			continue
 		}
 		if len(v) == len(qvec) {
-			all = append(all, sc{id, media.Cosine(qvec, v)})
+			top.offer(id, media.Cosine(qvec, v))
 		}
 	}
 	s.embMu.Unlock()
-	sort.Slice(all, func(i, j int) bool { return all[i].score > all[j].score })
-
-	if len(all) > limit {
-		all = all[:limit]
-	}
+	all := top.sorted()
 	ids := make([]int64, len(all))
 	for i, a := range all {
 		ids[i] = a.id
