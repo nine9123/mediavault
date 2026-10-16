@@ -43,7 +43,9 @@ type Scanner struct {
 	// thumbRetried remembers thumbless files already re-attempted this process
 	// run, so files that simply can't be thumbnailed (e.g. RAW) aren't re-probed
 	// on every periodic scan. Scans are single-flight, so the walk goroutine is
-	// the only accessor at a time.
+	// the only accessor at a time. After each complete walk it is cut down to the
+	// files that are still unchanged and still incomplete (see Run), so it is
+	// bounded by the library rather than growing for the life of the process.
 	thumbRetried map[string]struct{}
 }
 
@@ -114,6 +116,11 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	// chain rebuild in step 6 — a second walk would list the whole tree over the
 	// network again just to find the same files.
 	chainDirs := map[string][]string{}
+
+	// Files this walk found unchanged but still incomplete, i.e. the ones whose
+	// thumbRetried entry still means something. Replaces thumbRetried once the
+	// walk has covered the whole tree.
+	stillRetried := make(map[string]struct{})
 
 	jobs := make(chan job, 256)
 	results := make(chan result, 256)
@@ -281,6 +288,7 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 			if cur.ThumbReady && cur.HasVector && (cur.PreviewReady || !s.wantsPreview(typ)) {
 				return nil
 			}
+			stillRetried[rel] = struct{}{}
 			if _, tried := s.thumbRetried[rel]; tried {
 				return nil
 			}
@@ -321,6 +329,13 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 			log.Printf("scan: mark missing: %v", err)
 		} else {
 			stats.Missing = n
+		}
+		// Forget retries for files that are gone, have since completed, or have
+		// changed (a changed file is reprocessed anyway and earns a fresh retry).
+		// Only after a full walk: a partial one would forget files it never
+		// reached and re-probe them all next time.
+		if walkErr == nil {
+			s.thumbRetried = stillRetried
 		}
 	}
 	stats.Seen = len(seen)

@@ -857,16 +857,15 @@
     el.pvcap.addEventListener("change", function () { pvSetCap(el.pvcap.value, true); });
   })();
 
-  // A rebuilt thumbnail keeps the same URL — the filename is a hash of the
-  // relpath, not of the content — so the browser would happily keep serving the
-  // cached copy. Re-request the grid cell's image with a cache-busting param.
+  // Thumbnails are cached by the browser for as long as their URL is unchanged,
+  // and the server versions the URL whenever it rebuilds one. After a rebuild,
+  // point the grid cell's image at the item's new thumb_url.
   function bustThumb(item) {
-    var bust = "?v=" + Date.now();
     var idx = S.items.indexOf(item);
     if (idx >= 0) {
       var cell = el.grid.children[idx];
       var img = cell && cell.querySelector("img:not(.prev)");
-      if (img) img.src = item.thumb_url + bust;
+      if (img) img.src = item.thumb_url;
     }
   }
 
@@ -2093,6 +2092,7 @@
           });
         }).then(function (d) {
           target.offset = d.offset || 0;
+          if (d.thumb_url) target.thumb_url = d.thumb_url;
           if (S.viewList[S.viewIndex] === target) {
             offIn.value = target.offset ? String(target.offset) : "";
             say(offMsg, d.thumb_rebuilt ? "Saved. Thumbnail rebuilt." : "Saved, but no frame at that point.", !d.thumb_rebuilt);

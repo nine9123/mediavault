@@ -117,8 +117,9 @@ func (s *Server) Routes() http.Handler {
 
 	// Wrapping the finished mux — rather than checking inside each handler — is
 	// what makes this fail closed: a route added later is protected by default,
-	// and forgetting to add a check is not a possible mistake.
-	return s.requireAuth(mux)
+	// and forgetting to add a check is not a possible mistake. gzipJSON sits
+	// outside it and only ever touches application/json bodies; see gzipJSON.
+	return gzipJSON(s.requireAuth(mux))
 }
 
 // publicPaths are served without a session. The UI shell has to be, or there
@@ -356,7 +357,7 @@ func toDTO(it model.Item) itemDTO {
 		PreviewReady:  it.PreviewReady,
 		Views:         it.Views,
 		Description:   it.Description,
-		ThumbURL:      "/api/thumb/" + enc,
+		ThumbURL:      thumbURL(it, enc),
 		PreviewURL:    previewURL(it, enc),
 		RawURL:        "/api/raw/" + enc,
 	}
@@ -794,7 +795,8 @@ func (s *Server) handleSetOffset(w http.ResponseWriter, r *http.Request) {
 		log.Printf("offset: rethumbnail %s: %v", it.Relpath, err)
 		thumbOK = false
 	}
-	writeJSON(w, map[string]any{"offset": off, "thumb_rebuilt": thumbOK})
+	it.Offset = off
+	writeJSON(w, map[string]any{"offset": off, "thumb_rebuilt": thumbOK, "thumb_url": thumbURL(it, encRel(it.Relpath))})
 }
 
 // itemFromBody decodes a {"path": ...} body and resolves it to a known item.
@@ -888,6 +890,20 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "scan started"})
 }
 
+// thumbURL carries a version derived from everything that decides the
+// thumbnail's pixels: the file's last (re)index, which is when the scanner
+// rewrites it, and the poster offset, which handleSetOffset rewrites it for.
+// The on-disk name is a hash of the relpath alone, so without this the URL
+// would stay the same across a rebuild and a long browser cache would keep
+// showing the old frame. With it, handleThumb can let browsers cache for good.
+func thumbURL(it model.Item, enc string) string {
+	v := strconv.FormatInt(it.IndexedAt.Unix(), 36)
+	if it.Offset != 0 {
+		v += "-" + strconv.FormatFloat(it.Offset, 'f', -1, 64)
+	}
+	return "/api/thumb/" + enc + "?v=" + v
+}
+
 // previewURL is empty unless a preview exists, so the client can treat a
 // present URL as "safe to load" without a second readiness check.
 func previewURL(it model.Item, enc string) string {
@@ -913,8 +929,24 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 
 // handleThumb serves a cached thumbnail. The on-disk name is a hash of the
 // relpath, so it isn't attacker-controlled.
+//
+// A versioned URL (see thumbURL) names one rendition for good, so it is cached
+// without revalidation; the API hands out a new URL whenever the thumbnail is
+// rebuilt. An unversioned request may be for a file that has since changed, so
+// it is revalidated every time, as before. A missing thumbnail (not generated
+// yet) is answered before any caching header is set, so a 404 is never cached.
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, media.ThumbPath(s.cfg.ThumbDir(), r.PathValue("path")))
+	p := media.ThumbPath(s.cfg.ThumbDir(), r.PathValue("path"))
+	if fi, err := os.Stat(p); err != nil || fi.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	if r.URL.Query().Get("v") != "" {
+		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	http.ServeFile(w, r, p)
 }
 
 // handleRaw serves the original file. http.ServeFile handles Range requests, so
