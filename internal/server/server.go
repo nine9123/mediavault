@@ -4,6 +4,8 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"embed"
 	"encoding/json"
@@ -15,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -240,15 +243,61 @@ func isTLS(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
+// uiPage is the embedded UI shell, plain and gzipped.
+type uiPage struct{ plain, gz []byte }
+
+// indexPage builds the UI shell once. embed.FS.ReadFile returns a fresh copy on
+// every call, and the page is the size of the whole app, so reading it per
+// request was an allocation of that size per page load; compressing it once
+// also cuts what goes over the wire to a fraction.
+var indexPage = sync.OnceValues(func() (uiPage, error) {
+	b, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		return uiPage{}, err
+	}
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return uiPage{}, err
+	}
+	if _, err := zw.Write(b); err != nil {
+		return uiPage{}, err
+	}
+	if err := zw.Close(); err != nil {
+		return uiPage{}, err
+	}
+	return uiPage{plain: b, gz: buf.Bytes()}, nil
+})
+
 // handleIndex serves the embedded single-page UI.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	b, err := webFS.ReadFile("web/index.html")
+	page, err := indexPage()
 	if err != nil {
 		http.Error(w, "ui not found", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(b)
+	w.Header().Set("Vary", "Accept-Encoding")
+	if acceptsGzip(r) {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(page.gz)
+		return
+	}
+	_, _ = w.Write(page.plain)
+}
+
+// acceptsGzip reports whether the client's Accept-Encoding allows gzip (and
+// doesn't explicitly refuse it with q=0).
+func acceptsGzip(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		name, params, _ := strings.Cut(part, ";")
+		if !strings.EqualFold(strings.TrimSpace(name), "gzip") {
+			continue
+		}
+		q := strings.ReplaceAll(strings.TrimSpace(params), " ", "")
+		return q != "q=0" && q != "q=0.0" && q != "q=0.00" && q != "q=0.000"
+	}
+	return false
 }
 
 // captionFramePx matches the background describer's frame size, so an on-demand

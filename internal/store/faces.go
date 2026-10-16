@@ -116,24 +116,37 @@ type Grouping struct {
 	Merged  Merged
 }
 
-const faceCols = `f.id, f.item_id, i.relpath, i.type, COALESCE(i.offset_s,0),
+const faceCols = faceMetaCols + `, f.vec`
+
+// faceMetaCols is faceCols without the embedding, for lookups that only crop or
+// list faces: the vector is the bulk of a row, and reading and decoding it there
+// is wasted work (the People page asks for every cover's crop at once).
+const faceMetaCols = `f.id, f.item_id, i.relpath, i.type, COALESCE(i.offset_s,0),
 	COALESCE(f.person_id,0), COALESCE(p.name,''), f.x, f.y, f.w, f.h, COALESCE(f.score,0),
-	COALESCE(f.t,0), f.vec`
+	COALESCE(f.t,0)`
 
 const faceFrom = `FROM faces f
 	JOIN items i ON i.id = f.item_id
 	LEFT JOIN people p ON p.id = f.person_id`
 
-func scanFaces(rows *sql.Rows) ([]Face, error) {
+// scanFaces decodes rows selected with faceCols, or with faceMetaCols when
+// withVec is false (Vec is then left nil).
+func scanFaces(rows *sql.Rows, withVec bool) ([]Face, error) {
 	var out []Face
 	for rows.Next() {
 		var f Face
-		var b []byte
-		if err := rows.Scan(&f.ID, &f.ItemID, &f.Relpath, &f.Type, &f.Offset,
-			&f.PersonID, &f.PersonName, &f.X, &f.Y, &f.W, &f.H, &f.Score, &f.T, &b); err != nil {
+		var b sql.RawBytes // decodeVec copies, so no need for Scan's own copy too
+		dest := []any{&f.ID, &f.ItemID, &f.Relpath, &f.Type, &f.Offset,
+			&f.PersonID, &f.PersonName, &f.X, &f.Y, &f.W, &f.H, &f.Score, &f.T}
+		if withVec {
+			dest = append(dest, &b)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
-		f.Vec = decodeVec(b)
+		if withVec {
+			f.Vec = decodeVec(b)
+		}
 		out = append(out, f)
 	}
 	return out, rows.Err()
@@ -216,7 +229,7 @@ func (s *Store) AllFaces(ctx context.Context) ([]Face, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanFaces(rows)
+	return scanFaces(rows, true)
 }
 
 // FaceFingerprint summarizes everything the grouping is computed from: which
@@ -242,14 +255,14 @@ func (s *Store) FaceFingerprint(ctx context.Context) (FaceFingerprint, error) {
 	return fp, err
 }
 
-// FaceByID fetches one face (for the crop endpoint).
+// FaceByID fetches one face (for the crop endpoint), without its embedding.
 func (s *Store) FaceByID(ctx context.Context, id int64) (Face, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+faceCols+` `+faceFrom+` WHERE f.id = ?`, id)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+faceMetaCols+` `+faceFrom+` WHERE f.id = ?`, id)
 	if err != nil {
 		return Face{}, err
 	}
 	defer rows.Close()
-	faces, err := scanFaces(rows)
+	faces, err := scanFaces(rows, false)
 	if err != nil {
 		return Face{}, err
 	}
@@ -262,16 +275,16 @@ func (s *Store) FaceByID(ctx context.Context, id int64) (Face, error) {
 // FacesForItem returns the faces found in one item: in the order they appear for
 // a video, and largest first within a frame (the biggest face in a frame is
 // usually its subject). Stills carry no timestamp, so for them this is the size
-// ordering alone.
+// ordering alone. Embeddings are not loaded.
 func (s *Store) FacesForItem(ctx context.Context, itemID int64) ([]Face, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+faceCols+` `+faceFrom+`
+		`SELECT `+faceMetaCols+` `+faceFrom+`
 		 WHERE f.item_id = ? ORDER BY COALESCE(f.t,0), f.w*f.h DESC, f.id`, itemID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanFaces(rows)
+	return scanFaces(rows, false)
 }
 
 // FaceCounts reports detection progress for the status line: how many present
