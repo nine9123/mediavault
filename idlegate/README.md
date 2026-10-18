@@ -124,6 +124,29 @@ sleeping. Restarting or updating idlegate never stops or starts anything.
   [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) in
   between (`CONTAINERS=1`, `POST=1`) and set `DOCKER_HOST=tcp://socket-proxy:2375`.
 
+## What a gated service has to do
+
+idlegate stops a service with `docker stop` (SIGTERM, then SIGKILL after
+`stop_grace`) many times a day, so it must:
+
+- **Exit 0 on SIGTERM, within about 5 s.** A container that is SIGKILLed exits
+  137, and TrueNAS marks the whole app *Crashed* while idlegate has it asleep.
+  The app has to be PID 1 (exec-form `CMD`) or sit behind something that
+  forwards the signal. Python installs no SIGTERM handler by default, so a
+  Python service needs one — facerec's is `facerec/shutdown.py`.
+- **Be ready when its port opens**, or set `health=` to a path that answers 5xx
+  until it is. mediavault's is `/healthz`; it needs no API key.
+- **Never exit because a dependency is still starting.** idlegate starts the
+  containers in order but never waits for anything except the upstream.
+  mediavault retries facerec's `/health` with backoff and keeps undetected items
+  queued until it answers.
+- **Survive being stopped mid-task.** Scans, thumbnails and face detection are
+  stopped too; mediavault's writes are transactional and the next scan picks up
+  what was left.
+
+Check one with `time docker stop <name> && docker inspect -f '{{.State.ExitCode}}' <name>`:
+0, in well under 10 s.
+
 ## Develop
 
 Development happens in [nine9123/idlegate](https://github.com/nine9123/idlegate);

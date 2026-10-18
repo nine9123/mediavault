@@ -105,9 +105,18 @@ func main() {
 		Handler: api.Routes(),
 	}
 
+	// One budget for the whole shutdown, HTTP drain and scanner together.
+	// idlegate stops this container with `docker stop -t 10`: anything still
+	// running at 10 s is SIGKILLed, exits 137, and TrueNAS marks the app Crashed.
+	stopping := make(chan time.Time, 1)
+	httpDone := make(chan struct{})
 	go func() {
+		defer close(httpDone)
 		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		log.Println("received stop signal, shutting down")
+		deadline := time.Now().Add(shutdownBudget)
+		stopping <- deadline
+		shutCtx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 	}()
@@ -116,13 +125,26 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server: %v", err)
 	}
-	// The HTTP server has stopped; give an in-flight scan a moment to finish
-	// persisting its current batch before the deferred st.Close() runs. Writes
-	// are transactional, so blowing past this budget (SIGKILL) is still safe.
+	// The listener is closed; let open requests finish, and give an in-flight
+	// scan a moment to persist its current batch before the deferred st.Close()
+	// runs. Writes are transactional, so blowing past this budget (SIGKILL) is
+	// still safe: unfinished items are simply redone by the next scan.
+	budget, cancelBudget := context.WithDeadline(context.Background(), <-stopping)
+	defer cancelBudget()
+	select {
+	case <-httpDone:
+	case <-budget.Done():
+		log.Println("requests still open; closing them")
+	}
 	select {
 	case <-scanDone:
-	case <-time.After(8 * time.Second):
+	case <-budget.Done():
 		log.Println("scanner still busy; exiting anyway (writes are transactional)")
 	}
 	log.Println("shutdown complete")
 }
+
+// shutdownBudget is how long a stop may take, from the signal to exit 0. Well
+// inside idlegate's (and Docker's) default 10 s grace, so a slow disk can't
+// push it into a SIGKILL.
+const shutdownBudget = 4 * time.Second

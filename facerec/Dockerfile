@@ -25,7 +25,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /install /usr/local
-COPY app.py /app/app.py
+COPY app.py shutdown.py /app/
 
 # hog is CPU-friendly; set FACE_MODEL=cnn if you have cores to spare and want
 # better recall on small or turned faces.
@@ -41,4 +41,8 @@ ENV PORT=8000 \
 EXPOSE 8000
 # No media mount: mediavault sends the frame in the request body, so this
 # container never touches your library.
+
+# Exec form, so Python is PID 1 and receives docker stop's SIGTERM itself;
+# shutdown.py turns that into exit 0. A shell-form CMD would leave /bin/sh as
+# PID 1, which does not forward it.
 CMD ["python", "/app/app.py"]

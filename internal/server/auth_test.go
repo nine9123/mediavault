@@ -291,3 +291,14 @@ func jsonReq(method, path, body string) *http.Request {
 	r.URL, _ = url.Parse(path)
 	return r
 }
+
+// idlegate polls /healthz with no key after a wake. A 401 there would read as
+// "ready" to it (anything under 500 does), which is why /api/stats was no check.
+func TestHealthzIsPublicAndOK(t *testing.T) {
+	h := newTestServer(testKey).Routes()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/healthz without a key: status %d, want 200", rec.Code)
+	}
+}
