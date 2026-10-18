@@ -44,6 +44,7 @@ mediavault/
 │   ├── faces/                # face worker: detect, cluster, name (People page)
 │   └── server/               # minimal HTTP API
 ├── facerec/                  # the recognition service itself (separate container)
+├── idlegate/                 # docs for the optional scale-to-zero proxy (code: github.com/nine9123/idlegate)
 ├── Dockerfile                # multi-stage, CGO-free, ffmpeg in runtime
 ├── docker-compose.yml        # media :ro + writable data volume
 └── go.mod                    # only dep: modernc.org/sqlite (pure Go)

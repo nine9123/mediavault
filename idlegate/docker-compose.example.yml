@@ -1,0 +1,63 @@
+# idlegate in front of mediavault (and facerec), as a drop-in for the repo's
+# docker-compose.yml. The changes from that file are:
+#
+#   1. mediavault no longer publishes 8080 — idlegate does, and forwards to it
+#      over the compose network.
+#   2. Fixed container_name on everything idlegate starts/stops, because the
+#      Docker API wants a container name, and compose's generated ones
+#      (<project>-<service>-1) change with the directory/project name.
+#   3. restart: unless-stopped, NOT always. Docker never restarts a container
+#      that was stopped through the API, except that `always` brings it back on
+#      every daemon restart / host reboot. unless-stopped keeps a sleeping
+#      container asleep across reboots; the next request wakes it.
+#
+# Run one idlegate per host and give it a ROUTES line per service — there is no
+# need for one per project. See idlegate/README.md.
+services:
+  idlegate:
+    image: gitea.internal:30008/nine9/idlegate:latest   # or build: https://github.com/nine9123/idlegate.git
+    container_name: idlegate
+    restart: unless-stopped      # idlegate itself must always be up
+    # So the containers exist when idlegate checks them at startup (it exits on
+    # an unknown container name rather than failing on the first request).
+    depends_on: [mediavault, facerec]
+    ports:
+      - "8080:8080"
+    environment:
+      # LISTEN  UPSTREAM  CONTAINERS (start order; stopped in reverse)  [options]
+      ROUTES: |
+        :8080 http://mediavault:8080 facerec,mediavault idle=30m
+      # IDLE_TIMEOUT: "30m"   # default for routes without idle=
+      # START_TIMEOUT: "2m"
+      # STOP_GRACE: "10s"
+    volumes:
+      # Start/stop/inspect only — but the socket itself grants full control of
+      # Docker. To narrow that, put tecnativa/docker-socket-proxy in between
+      # (CONTAINERS=1 POST=1) and set DOCKER_HOST=tcp://socket-proxy:2375.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  mediavault:
+    build: .
+    container_name: mediavault
+    restart: unless-stopped
+    # no ports: — reached only through idlegate
+    environment:
+      SIDECAR_DIR: "/meta"
+      DERIVED_DIR: "/derived"
+      FACE_URL: "http://facerec:8000"
+      # ...the rest as in docker-compose.yml
+    volumes:
+      - /mnt/nas/media:/media:ro
+      - mediavault-data:/data
+      - mediavault-metadata:/meta
+      - mediavault-derived:/derived
+
+  facerec:
+    build: ./facerec
+    container_name: facerec
+    restart: unless-stopped
+
+volumes:
+  mediavault-data:
+  mediavault-metadata:
+  mediavault-derived:
