@@ -15,7 +15,7 @@
 # need for one per project. See idlegate/README.md.
 services:
   idlegate:
-    build: ./idlegate            # or image: <your-registry>/idlegate:latest
+    image: gitea.internal:30008/nine9/idlegate:latest   # or build: https://github.com/nine9123/idlegate.git
     container_name: idlegate
     restart: unless-stopped      # idlegate itself must always be up
     # So the containers exist when idlegate checks them at startup (it exits on

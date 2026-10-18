@@ -10,9 +10,28 @@ that sits in front of your containers as a reverse proxy:
   serves that same request. The browser just sees one slow page load.
 
 It knows nothing about any particular app, so one idlegate can guard every
-container on a host. It is standard-library Go only, with no dependencies, and
-lives in its own module so you can copy this directory into any project (or its
-own repo).
+container on a host. It is standard-library Go only, with no dependencies.
+
+idlegate is its own project now: the code, tests and image build live in
+[nine9123/idlegate](https://github.com/nine9123/idlegate). This directory only
+keeps the notes and the compose example for running it in front of mediavault.
+
+## Install
+
+Every push to idlegate's `main` builds the image and pushes it to the Gitea
+registry, tagged `latest` and with the first 8 characters of the commit:
+
+```yaml
+image: gitea.internal:30008/nine9/idlegate:latest
+```
+
+To build it yourself instead:
+
+```sh
+docker build -t idlegate https://github.com/nine9123/idlegate.git
+# or, for a bare binary:
+go install github.com/nine9123/idlegate@latest
+```
 
 ## Why a proxy that stops containers, and not something else
 
@@ -107,12 +126,5 @@ sleeping. Restarting or updating idlegate never stops or starts anything.
 
 ## Develop
 
-```sh
-cd idlegate
-go vet ./... && go test -race ./...
-docker build -t idlegate .
-```
-
-The tests run against a fake Docker API whose "containers" really open and close
-listeners. They cover waking, idling, concurrent wakes, in-flight requests,
-external stops and TCP routes.
+Development happens in [nine9123/idlegate](https://github.com/nine9123/idlegate);
+see its README for building and running the tests.
