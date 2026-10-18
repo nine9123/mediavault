@@ -140,9 +140,12 @@ faces: on — recognition service at http://facerec:8000
 faces: service reachable — model "dlib-resnet-v1/hog", 128-dim embeddings, matching at cosine >= 0.82
 ```
 
-`faces: NOT reachable` instead means the two containers aren't on one network
-(see above) or the image never started; everything else in mediavault carries on
-regardless, and the People page just stays empty until it resolves.
+A few `faces: NOT reachable … retrying in 1s` lines right after a start are
+normal: facerec takes a few seconds longer to load its model, and mediavault
+keeps retrying (backing off to every 30 s) until it answers. If they never stop,
+the two containers aren't on one network (see above) or the image never started;
+everything else in mediavault carries on regardless, and the People page just
+stays empty until it resolves.
 
 ### Updating
 
@@ -163,9 +166,21 @@ POST /detect     body: JPEG bytes, Content-Type: image/jpeg
   4xx  this frame is unusable  -> mediavault skips the item
   5xx  the service is unwell   -> mediavault backs off and retries later
 
-GET /health
+GET /health      (or /healthz)
   200 {"status":"ok","model":"...","dim":128,"match":0.82}
 ```
+
+mediavault retries `/health` with backoff (1 s up to 30 s) until it answers, so
+a service that is still loading its model is waited for rather than given up on.
+Bind the port only once the model has loaded, or answer 503 until then.
+
+- **Stopping** must exit 0 within 5 s of SIGTERM (and SIGINT). idlegate stops
+  this container whenever the library goes idle; a container killed after
+  Docker's 10 s grace exits 137, and TrueNAS then shows the whole app as
+  *Crashed*. Here `shutdown.py` handles it, and `test_shutdown.py` checks it:
+  `python facerec/test_shutdown.py` locally (dlib is stubbed if missing), or
+  `docker run --rm -i --entrypoint python <image> - < facerec/test_shutdown.py`
+  against a built image, as CI does.
 
 - `box` is `[x, y, w, h]` as **fractions of the frame**, not pixels. mediavault
   downscales the frame it sends (`FACE_FRAME_PX`) but crops faces from the

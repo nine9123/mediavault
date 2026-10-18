@@ -460,3 +460,47 @@ func times(in []found) []float64 {
 	}
 	return out
 }
+
+// Behind idlegate, facerec and mediavault wake together and facerec is the slow
+// one, so the first health checks fail. The worker must keep asking rather than
+// give up, and learn the threshold once the service answers.
+func TestAwaitServiceRetriesUntilTheServiceIsUp(t *testing.T) {
+	defer func(lo, hi time.Duration) { healthRetryMin, healthRetryMax = lo, hi }(healthRetryMin, healthRetryMax)
+	healthRetryMin, healthRetryMax = time.Millisecond, 4*time.Millisecond
+
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls <= 3 {
+			http.Error(w, "loading", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "model": "stub", "dim": 3, "match": 0.7})
+	}))
+	t.Cleanup(srv.Close)
+
+	_, _, r := setup(t)
+	r.cfg.FaceURL, r.cfg.FaceMatch = srv.URL, 0
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !r.awaitService(ctx) {
+		t.Fatal("awaitService gave up while the service was starting")
+	}
+	if calls != 4 {
+		t.Errorf("health checks: %d, want 4", calls)
+	}
+	if got := r.Match(); got != 0.7 {
+		t.Errorf("match threshold %.2f, want the advertised 0.70", got)
+	}
+}
+
+func TestAwaitServiceStopsOnShutdown(t *testing.T) {
+	_, _, r := setup(t)
+	r.cfg.FaceURL = "http://127.0.0.1:1" // nothing listens here
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if r.awaitService(ctx) {
+		t.Fatal("awaitService reported the service up after shutdown")
+	}
+}

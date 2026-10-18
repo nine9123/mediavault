@@ -25,8 +25,11 @@ services:
       - "8080:8080"
     environment:
       # LISTEN  UPSTREAM  CONTAINERS (start order; stopped in reverse)  [options]
+      # health=/healthz: mediavault's unauthenticated readiness check. Don't
+      # use an /api/ path here — those 401 without a key, and idlegate counts
+      # anything under 500 as ready.
       ROUTES: |
-        :8080 http://mediavault:8080 facerec,mediavault idle=30m
+        :8080 http://mediavault:8080 facerec,mediavault idle=30m health=/healthz
       # IDLE_TIMEOUT: "30m"   # default for routes without idle=
       # START_TIMEOUT: "2m"
       # STOP_GRACE: "10s"
@@ -56,6 +59,8 @@ services:
     build: ./facerec
     container_name: facerec
     restart: unless-stopped
+    # No entrypoint: override. The image exits 0 on SIGTERM by itself; a shell
+    # wrapper here would only hide it if that ever broke.
 
 volumes:
   mediavault-data:

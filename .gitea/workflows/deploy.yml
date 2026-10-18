@@ -50,6 +50,15 @@ jobs:
             -t ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:latest \
             facerec/
 
+      - name: Test facerec exits 0 on SIGTERM
+        run: |
+          # idlegate stops facerec with docker stop; without a SIGTERM handler it
+          # is SIGKILLed, exits 137, and TrueNAS shows the app as Crashed. Run
+          # against the image just built, so the real model load is covered too.
+          docker run --rm -i --entrypoint python \
+            ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:${{ env.SHA_SHORT }} \
+            - < facerec/test_shutdown.py
+
       - name: Push facerec image
         run: |
           docker push ${{ env.REGISTRY }}/${{ env.FACEREC_IMAGE_NAME }}:${{ env.SHA_SHORT }}

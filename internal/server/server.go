@@ -115,6 +115,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/auth", s.handleLogin)
 	mux.HandleFunc("DELETE /api/auth", s.handleLogout)
 
+	// Readiness for idlegate's health= check; see handleHealthz.
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+
 	// Wrapping the finished mux — rather than checking inside each handler — is
 	// what makes this fail closed: a route added later is protected by default,
 	// and forgetting to add a check is not a possible mistake. gzipJSON sits
@@ -124,8 +127,9 @@ func (s *Server) Routes() http.Handler {
 
 // publicPaths are served without a session. The UI shell has to be, or there
 // would be nowhere to type the key; it contains no library data, just markup.
+// /healthz is too: idlegate sends no key, and it says nothing about the library.
 func publicPaths(p string) bool {
-	return p == "/" || p == "/api/auth"
+	return p == "/" || p == "/api/auth" || p == "/healthz"
 }
 
 // requireAuth rejects unauthenticated requests to everything except publicPaths.
@@ -170,6 +174,18 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		"enabled": s.auth.Enabled(),
 		"authed":  !s.auth.Enabled() || s.authed(r),
 	})
+}
+
+// handleHealthz is what idlegate polls after waking this container, before it
+// forwards the request that woke it. main only starts listening once config is
+// loaded and the database is open and migrated, so a server that can answer at
+// all is ready to serve the UI. It deliberately doesn't wait for the catch-up
+// scan or look at facerec: the UI works while those are busy or down, and this
+// has to stay cheap.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 // handleLogin exchanges the API key for a session cookie.

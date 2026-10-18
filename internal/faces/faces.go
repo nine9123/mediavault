@@ -146,12 +146,8 @@ func (r *Recognizer) learnMatch(v float64) {
 // periodically — which doubles as backoff when the service is unreachable.
 func (r *Recognizer) Run(ctx context.Context) {
 	log.Printf("faces: on — recognition service at %s", r.cfg.FaceURL)
-	if info, err := face.Health(ctx, r.cfg); err != nil {
-		log.Printf("faces: NOT reachable at %s: %v — the People page stays empty until this resolves", r.cfg.FaceURL, err)
-	} else {
-		r.learnMatch(info.Match)
-		log.Printf("faces: service reachable — model %q, %d-dim embeddings, matching at cosine >= %.2f",
-			info.Model, info.Dim, r.Match())
+	if !r.awaitService(ctx) {
+		return
 	}
 
 	t := time.NewTicker(30 * time.Second)
@@ -164,6 +160,45 @@ func (r *Recognizer) Run(ctx context.Context) {
 		case <-t.C:
 			r.pass(ctx)
 		}
+	}
+}
+
+// Backoff between health checks while the service is unreachable. Variables so
+// tests needn't wait out real seconds.
+var (
+	healthRetryMin = time.Second
+	healthRetryMax = 30 * time.Second
+)
+
+// awaitService blocks until the recognition service answers its health check,
+// retrying with backoff (1 s, 2 s, 4 s, ... capped at healthRetryMax), and
+// reports false only if ctx ends first.
+//
+// Behind idlegate this is the normal start, not an outage: facerec and this
+// container are started together on the first request after a sleep, and facerec
+// takes seconds longer to load its model. Checking once and moving on would
+// leave the service's advertised match threshold unlearned until the next
+// restart. Detection waits too — every frame sent before then would only fail.
+func (r *Recognizer) awaitService(ctx context.Context) bool {
+	wait := healthRetryMin
+	for {
+		info, err := face.Health(ctx, r.cfg)
+		if err == nil {
+			r.learnMatch(info.Match)
+			log.Printf("faces: service reachable — model %q, %d-dim embeddings, matching at cosine >= %.2f",
+				info.Model, info.Dim, r.Match())
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		log.Printf("faces: NOT reachable at %s: %v — retrying in %s", r.cfg.FaceURL, err, wait)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, healthRetryMax)
 	}
 }
 

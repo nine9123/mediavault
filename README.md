@@ -246,6 +246,8 @@ with TLS.
   item and overwrites its caption (also refreshes the caption embedding)
 - `PUT  /api/offset` — `{ "path": "...", "offset": 12.5 }`; sets the poster-frame
   offset for a video and rebuilds its thumbnail. `null` restores the default
+- `GET  /healthz` — `200 ok` once the server is listening (unauthenticated; for
+  idlegate's `health=` check, see `idlegate/README.md`)
 - `GET  /api/auth` — whether a key is required and whether this client has a
   session (unauthenticated; reveals nothing about the library)
 - `POST /api/auth` — `{ "key": "..." }`; sets the session cookie

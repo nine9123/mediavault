@@ -9,7 +9,7 @@ reimplementing this file and nothing else:
       -> {"model": "...", "dim": 128, "match": 0.82, "faces": [
              {"box": [x, y, w, h], "score": 1.0, "embedding": [...]}]}
 
-    GET /health
+    GET /health   (also /healthz)
       -> {"status": "ok", "model": "...", "dim": 128, "match": 0.82}
 
 Two things about the contract are load-bearing:
@@ -22,6 +22,10 @@ Two things about the contract are load-bearing:
     embeddings the same person. mediavault uses it unless FACE_MATCH overrides
     it, because the right value is a property of the model: dlib and ArcFace sit
     a factor of two apart.
+
+It also has to be safe to stop at any moment: idlegate stops this container when
+the library has been idle for a while, by SIGTERM, and expects exit code 0 within
+a few seconds. shutdown.py does that; keep it installed first thing.
 
 This implementation uses dlib via face_recognition: CPU-only, no model download
 at runtime, and good enough for a personal library.
@@ -58,16 +62,32 @@ Environment:
                                  of the frame; their embeddings are mostly noise
 """
 
-import json
-import os
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from io import BytesIO
+# First, before the model loads: a SIGTERM during the slow import below must
+# still exit 0. See shutdown.py.
+import shutdown
 
-import face_recognition
-import numpy as np
-from PIL import Image
+shutdown.install()
+
+import json  # noqa: E402 (after the signal handler, on purpose)
+import logging  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
+from io import BytesIO  # noqa: E402
+
+# face_recognition loads dlib's detector and descriptor weights at import time,
+# so by the time main() binds the port the service can answer /detect. That is
+# the readiness idlegate and mediavault rely on: a connection that succeeds is a
+# service that is ready.
+import face_recognition  # noqa: E402
+import numpy as np  # noqa: E402
+from PIL import Image  # noqa: E402
+
+# shutdown.py logs through logging; send it to stdout in the same shape as the
+# rest of this file's output.
+logging.basicConfig(level=logging.INFO, format="facerec: %(message)s", stream=sys.stdout)
 
 PORT = int(os.environ.get("PORT", "8000"))
 MODEL = os.environ.get("FACE_MODEL", "hog").strip().lower()
@@ -206,7 +226,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 (http.server's naming)
-        if self.path.rstrip("/") in ("/health", ""):
+        # /healthz is the name idlegate's health= and other services expect.
+        if self.path.rstrip("/") in ("/health", "/healthz", ""):
             self._json(200, {"status": "ok", "model": MODEL_NAME, "dim": DIM, "match": MATCH})
         else:
             self._json(404, {"error": "not found"})
