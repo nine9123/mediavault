@@ -62,3 +62,34 @@ func TestIndexServedGzippedWhenAccepted(t *testing.T) {
 		}
 	}
 }
+
+// The icons are linked from the page and fetched for bookmarks without the
+// session cookie, so they must be served, with the right type, even when an
+// API key is set.
+func TestIconsServedWithoutSession(t *testing.T) {
+	h := newTestServer(testKey).Routes()
+	page, err := webFS.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, ct := range icons {
+		if !bytes.Contains(page, []byte(`href="/`+name+`"`)) {
+			t.Errorf("index.html does not link /%s", name)
+		}
+		want, err := webFS.ReadFile("web/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/"+name, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("/%s: status %d, want 200", name, rec.Code)
+		}
+		if got := rec.Header().Get("Content-Type"); got != ct {
+			t.Errorf("/%s: Content-Type %q, want %q", name, got, ct)
+		}
+		if !bytes.Equal(rec.Body.Bytes(), want) {
+			t.Errorf("/%s: body differs from the embedded file", name)
+		}
+	}
+}
