@@ -118,6 +118,11 @@ func (s *Server) Routes() http.Handler {
 	// Readiness for idlegate's health= check; see handleHealthz.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
+	// Icons for tabs, bookmarks and home-screen shortcuts; see handleIcon.
+	for name := range icons {
+		mux.HandleFunc("GET /"+name, handleIcon)
+	}
+
 	// Wrapping the finished mux — rather than checking inside each handler — is
 	// what makes this fail closed: a route added later is protected by default,
 	// and forgetting to add a check is not a possible mistake. gzipJSON sits
@@ -128,8 +133,10 @@ func (s *Server) Routes() http.Handler {
 // publicPaths are served without a session. The UI shell has to be, or there
 // would be nowhere to type the key; it contains no library data, just markup.
 // /healthz is too: idlegate sends no key, and it says nothing about the library.
+// So are the icons: browsers fetch them for bookmarks without the session cookie.
 func publicPaths(p string) bool {
-	return p == "/" || p == "/api/auth" || p == "/healthz"
+	_, icon := icons[strings.TrimPrefix(p, "/")]
+	return p == "/" || p == "/api/auth" || p == "/healthz" || icon
 }
 
 // requireAuth rejects unauthenticated requests to everything except publicPaths.
@@ -301,6 +308,29 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = w.Write(page.plain)
+}
+
+// icons are the embedded favicon files, by name, with their content types.
+// favicon.svg is the source; the .ico and .png are rasterised from it for
+// browsers that don't take SVG icons, and for iOS home-screen bookmarks.
+var icons = map[string]string{
+	"favicon.svg":          "image/svg+xml",
+	"favicon.ico":          "image/x-icon",
+	"apple-touch-icon.png": "image/png",
+}
+
+// handleIcon serves one of the icons. They only change with a deploy, so let
+// browsers keep them for a day.
+func handleIcon(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/")
+	b, err := webFS.ReadFile("web/" + name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", icons[name])
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(b)
 }
 
 // acceptsGzip reports whether the client's Accept-Encoding allows gzip (and
