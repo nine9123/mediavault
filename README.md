@@ -1,12 +1,15 @@
 # mediavault
 
 A bespoke, self-hosted media library for a personal collection of images,
-gifs/webms, and video living on a NAS. Single static Go binary + ffmpeg. No
-auth, single user, built to run as a TrueNAS custom app.
+gifs/webms, audio, and video living on a NAS. Single static Go binary + ffmpeg.
+Single user, with an optional shared API key (see *Access control*), built to
+run as a TrueNAS custom app.
 
-This repo is a **scaffold**: the indexing pipeline, storage layer, schema, and a
-minimal HTTP API are real and wired together. The web UI and the optional AI
-tagger are not included yet (see *What's stubbed* below).
+The indexer, storage layer, HTTP API, and a single-page web UI (grid, viewer,
+tag editor, search, People page) are all in the binary — the UI is embedded and
+served at `/`. Captioning/semantic search (via Ollama) and face recognition (via
+the `facerec/` container) are optional add-ons. What isn't built yet is listed
+under *What's stubbed* below.
 
 ## The one idea to keep in mind
 
@@ -40,11 +43,17 @@ mediavault/
 │   ├── media/                # ffprobe (probe) + ffmpeg (thumbnail) + mime
 │   ├── sidecar/              # read/write sidecars + chain.json
 │   ├── scan/                 # THE worker pool (walk → workers → single writer)
+│   ├── auth/                 # API_KEY sessions: signed cookie tokens, rate limit
+│   ├── transcode/            # on-demand background transcodes into DERIVED_DIR
+│   ├── ollama/               # client for the optional Ollama server
+│   ├── describe/             # caption + embedding worker (natural-language search)
 │   ├── face/                 # client for the optional recognition service
 │   ├── faces/                # face worker: detect, cluster, name (People page)
-│   └── server/               # minimal HTTP API
+│   └── server/               # HTTP API + the embedded single-page UI (web/)
 ├── facerec/                  # the recognition service itself (separate container)
 ├── idlegate/                 # docs for the optional scale-to-zero proxy (code: github.com/nine9123/idlegate)
+├── scripts/transcode.sh      # batch-convert unplayable media into DERIVED_DIR
+├── .gitea/workflows/         # CI: build + push both images
 ├── Dockerfile                # multi-stage, CGO-free, ffmpeg in runtime
 ├── docker-compose.yml        # media :ro + writable data volume
 └── go.mod                    # only dep: modernc.org/sqlite (pure Go)
@@ -76,12 +85,12 @@ walk (1 goroutine)                  stat only; (size,mtime) change-detection
 ## Run
 
 ```bash
-# 1. Pin dependencies (needs network once; generates go.sum).
+# 1. Resolve dependencies (needs network once; writes go.sum — see *Notes* below).
 go mod tidy
 
 # 2a. Locally:
 MEDIA_ROOT=/path/to/media DATA_DIR=./data go run ./cmd/server
-#     → http://localhost:8080/api/items
+#     → http://localhost:8080/          (the UI; the JSON API is under /api/)
 
 # 2b. Or in Docker (edit the media mount in docker-compose.yml first):
 docker compose up --build
@@ -122,6 +131,9 @@ docker compose up --build
 | `FACE_TIMEOUT`  | `3m`     | Give up on one frame after this and move on (see People, below) |
 | `FFMPEG`        | `ffmpeg` | ffmpeg binary                                       |
 | `FFPROBE`       | `ffprobe`| ffprobe binary                                      |
+
+`DERIVED_DIR` (in-browser playback) and the `OLLAMA_*` variables (captions and
+semantic search) are documented in their own sections below.
 
 ### Animated video previews
 
@@ -236,14 +248,24 @@ with TLS.
 
 - `GET  /api/items?limit=&before=&after=` — list items newest-first; `before=<id>`
   pages older, `after=<id>` fetches newer (used to live-stream during a scan)
-- `GET  /api/search?q=&limit=` — FTS5 search over path + tags
+- `GET  /api/search?q=&limit=` — FTS5 search over path, tags and captions, plus
+  semantic matches when an embedding model is configured; accepts `type:` filters
+- `GET  /api/random?q=` — one random item, optionally from a search's matches
+- `GET  /api/recommend?path=&limit=` — "More like this" (tag overlap + views)
+- `GET  /api/similar?path=&limit=` — "Looks similar" (perceptual signature)
+- `POST /api/view?path=` — count a view
 - `GET  /api/item?path=` — one item plus its tags (manual + ai)
 - `PUT  /api/tags` — `{ "path": "...", "tags": ["a", "artist:b"] }`; writes the
   sidecar and syncs the DB immediately (no rescan needed)
+- `GET  /api/tags/top?limit=` — most-used tags (the tag editor's quick-add chips)
+- `POST /api/transcode?path=` — queue an on-demand transcode into `DERIVED_DIR`;
+  `GET /api/transcode?path=` polls its status without starting one
 - `GET  /api/preview/<relpath>` — cached animated preview (video only; the
   `preview_url` field in an item is empty until one exists)
 - `POST /api/caption` — `{ "path": "..." }`; re-runs the vision model for that one
   item and overwrites its caption (also refreshes the caption embedding)
+- `POST /api/captions/reset` / `POST /api/embeddings/reset` — see *Regenerating
+  captions*
 - `PUT  /api/offset` — `{ "path": "...", "offset": 12.5 }`; sets the poster-frame
   offset for a video and rebuilds its thumbnail. `null` restores the default
 - `GET  /healthz` — `200 ok` once the server is listening (unauthenticated; for
@@ -320,11 +342,14 @@ in the folder to override:
 Files not listed in `order` are appended after the listed ones. Chains are
 fully derived from the filesystem and rebuilt on every scan.
 
+Chains are indexed into the DB but not exposed yet: there is no chain endpoint
+and no reader in the UI (see *What's stubbed*).
+
 ## What's stubbed / next steps
 
-- **No web UI yet.** The API is the seam; a SPA (grid, viewer, tag editor, and
-  the chain/comic reader) plugs in on top. Your existing Go comic reader's
-  paging maps onto `GET /api/items` for a chain's ordered members.
+- **No chain/comic reader.** Chains are computed and stored on every scan, but
+  no API route or UI view reads them yet. The next step is an endpoint returning
+  a chain's ordered members and a paged reader in the UI.
 - **No AI tagger.** By design it's a *separate, optional* service: a small
   Python container (e.g. WD14/CLIP via ONNX) that reads an image and writes
   `source='ai'` tags (with confidence) — the schema already distinguishes AI
@@ -333,13 +358,14 @@ fully derived from the filesystem and rebuilt on every scan.
   aren't yet picked up by the cheap change-detector. Options: include the
   sidecar's mtime in the change key, or add a lightweight tag-only sync pass.
 
-## Notes / honesty
+## Notes
 
-This scaffold was formatted with `gofmt`; the pure-Go packages type-check, but
-it was **not** fully compiled in the environment it was written in (no Go
-toolchain, and the module proxy was blocked, so the SQLite driver couldn't be
-fetched). Run `go mod tidy && go build ./...` to finish wiring it up. The only
-external dependency is `modernc.org/sqlite`.
+The repo deliberately ships **without `go.sum`**, and `go.mod` doesn't pin
+`modernc.org/sqlite` (the only external dependency): `go mod tidy` resolves a
+current version, and the Docker build runs it for you. So a plain `go build`
+in a fresh clone fails until you run `go mod tidy && go build ./...` once (with
+network). `.claude-task/tools/gocheck.sh` builds, vets and tests in a scratch
+copy so the generated `go.sum` doesn't end up in the working tree.
 
 ## Making everything playable in the browser
 
@@ -573,11 +599,11 @@ matches what's *in* the media, and each caption shows in the viewer panel.
 | `OLLAMA_MODEL` | `llava` | Vision model (must be pulled on the Ollama host). |
 | `OLLAMA_PROMPT` | (built-in) | Captioning instruction. |
 
-This is **keyword** matching over rich captions. For *semantic* matching (query
-"puppy by the ocean" finding a caption that says "dog on the beach"), the next
-step is to also embed captions + the query with an Ollama embedding model
-(e.g. `nomic-embed-text`) and rank by cosine — reusing the vector search already
-in place. Ask and I'll add it.
+On its own this is **keyword** matching over rich captions. For *semantic*
+matching (query "puppy by the ocean" finding a caption that says "dog on the
+beach"), captions + the query are also embedded with an Ollama embedding model
+(e.g. `nomic-embed-text`) and ranked by cosine — reusing the vector search already
+in place. That is what `OLLAMA_EMBED_MODEL` does — see the next section.
 
 
 ## Semantic search (optional, adds to captions)
@@ -745,8 +771,9 @@ only** (keeps captions, recomputes embeddings — for when you change
 resets and climbs again. Equivalent API calls:
 
 ```bash
-curl -X POST http://your-host:8090/api/captions/reset     # captions + embeddings
-curl -X POST http://your-host:8090/api/embeddings/reset   # embeddings only
+curl -X POST http://your-host:8080/api/captions/reset     # captions + embeddings
+curl -X POST http://your-host:8080/api/embeddings/reset   # embeddings only
+# with API_KEY set, add: -H "X-API-Key: $API_KEY"
 ```
 
 This is far lighter than deleting the database, which would also wipe
