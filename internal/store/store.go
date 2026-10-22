@@ -463,6 +463,67 @@ func (s *Store) ReplaceAllChains(ctx context.Context, defs []ChainDef) error {
 	return tx.Commit()
 }
 
+// ChainPlace is where one item sits in its chain: the chain, the item's
+// 0-based page within it, and how many pages there are. Pages are counted over
+// present items only, matching what ChainByKey returns.
+type ChainPlace struct {
+	Chain    model.Chain
+	Position int
+	Count    int
+}
+
+// ChainByKey returns a chain and its present members in reading order.
+// sql.ErrNoRows if there is no chain with that key.
+func (s *Store) ChainByKey(ctx context.Context, key string) (model.Chain, []model.Item, error) {
+	var c model.Chain
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id,key,title,kind,source FROM chains WHERE key=?`, key).
+		Scan(&c.ID, &c.Key, &c.Title, &c.Kind, &c.Source)
+	if err != nil {
+		return model.Chain{}, nil, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+prefixCols("i")+` FROM chain_items ci JOIN items i ON i.id = ci.item_id
+		 WHERE ci.chain_id = ? AND i.missing_since IS NULL
+		 ORDER BY ci.position`, c.ID)
+	if err != nil {
+		return model.Chain{}, nil, err
+	}
+	defer rows.Close()
+	items, err := scanItems(rows)
+	return c, items, err
+}
+
+// ChainOf reports which chain an item belongs to, if any. Chains are keyed by
+// folder, so an item is in at most one; found is false when it is in none.
+func (s *Store) ChainOf(ctx context.Context, relpath string) (place ChainPlace, found bool, err error) {
+	var pos int
+	c := &place.Chain
+	err = s.db.QueryRowContext(ctx,
+		`SELECT c.id,c.key,c.title,c.kind,c.source,ci.position
+		 FROM items i JOIN chain_items ci ON ci.item_id = i.id JOIN chains c ON c.id = ci.chain_id
+		 WHERE i.relpath = ? AND i.missing_since IS NULL
+		 ORDER BY c.key LIMIT 1`, relpath).
+		Scan(&c.ID, &c.Key, &c.Title, &c.Kind, &c.Source, &pos)
+	if err == sql.ErrNoRows {
+		return ChainPlace{}, false, nil
+	}
+	if err != nil {
+		return ChainPlace{}, false, err
+	}
+	// Stored positions can have gaps where a member has since gone missing, so
+	// the page number is a count of the present members before this one.
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(ci.position < ?),0)
+		 FROM chain_items ci JOIN items i ON i.id = ci.item_id
+		 WHERE ci.chain_id = ? AND i.missing_since IS NULL`, pos, c.ID).
+		Scan(&place.Count, &place.Position)
+	if err != nil {
+		return ChainPlace{}, false, err
+	}
+	return place, true, nil
+}
+
 // RecordScanRun stores one row of scan telemetry.
 func (s *Store) RecordScanRun(ctx context.Context, st model.ScanStats) error {
 	_, err := s.db.ExecContext(ctx,

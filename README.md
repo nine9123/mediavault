@@ -342,14 +342,23 @@ in the folder to override:
 Files not listed in `order` are appended after the listed ones. Chains are
 fully derived from the filesystem and rebuilt on every scan.
 
-Chains are indexed into the DB but not exposed yet: there is no chain endpoint
-and no reader in the UI (see *What's stubbed*).
+**Reading one.** Open any page of a chain and the viewer's card shows a *Chain*
+row ("The Descent · page 3 of 12") with **Read from here** / **From the start**.
+That switches the viewer into a paged reader over the chain's members in order:
+a page counter under the image, the next page fetched ahead, and a click on the
+page turns it (left third = back). The arrow keys and Autoplay work as anywhere
+else. There's no chain browser yet; you get to a chain via one of its pages.
+
+**API.** `GET /api/chain?key=<key>` returns `{chain, items}` with `items` in
+reading order (same item shape as `/api/items`). `?path=<relpath>` looks the
+chain up from one of its members and adds `chain.position`, that item's 0-based
+page. `/api/item` includes the same `chain` summary when the item is in one.
+Pages are counted over present files, so a missing page leaves no gap.
 
 ## What's stubbed / next steps
 
-- **No chain/comic reader.** Chains are computed and stored on every scan, but
-  no API route or UI view reads them yet. The next step is an endpoint returning
-  a chain's ordered members and a paged reader in the UI.
+- **No chain browser.** Chains can be read (see *Chains*), but only by opening
+  one of their pages first; there is no list of all chains to pick from.
 - **No AI tagger.** By design it's a *separate, optional* service: a small
   Python container (e.g. WD14/CLIP via ONNX) that reads an image and writes
   `source='ai'` tags (with confidence) — the schema already distinguishes AI

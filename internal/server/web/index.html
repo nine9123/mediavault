@@ -365,6 +365,10 @@
   .offrow .offctl{display:flex;align-items:center;gap:6px;margin-top:4px;flex-wrap:wrap}
   .offrow input[type=number]{width:5.5em;font-family:var(--mono);font-size:.8rem;color:var(--bone);background:var(--ink-raised);border:1px solid var(--ink-line);border-radius:2px;padding:5px 6px}
   .offrow .hint{font-family:var(--mono);font-size:10px;color:var(--bone-faint);margin-top:5px;line-height:1.5}
+  /* Chain reader: which page of which story, under the image. */
+  .pageno{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);z-index:6;max-width:calc(100% - 120px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:var(--mono);font-size:.72rem;letter-spacing:.03em;color:var(--bone-dim);background:rgba(20,18,16,.72);border:1px solid var(--ink-line);border-radius:2px;padding:.3rem .65rem;pointer-events:none}
+  .pageno b{color:var(--brass);font-weight:600}
+  .chainrow .chainbtns{display:flex;gap:6px;flex-wrap:wrap}
   .vtools{position:absolute;top:12px;left:12px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;z-index:6;max-width:calc(100% - 90px)}
   .vnum{display:flex;align-items:center;gap:2px;font-family:var(--mono);font-size:.72rem;letter-spacing:.03em;color:var(--bone-dim);background:rgba(20,18,16,.72);border:1px solid var(--ink-line);border-radius:2px;padding:.3rem .55rem;-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);user-select:none}
   .vnum input{width:3.2rem;background:transparent;border:none;border-bottom:1px solid var(--ink-line-2);color:var(--bone);font-family:var(--mono);font-size:.72rem;text-align:center;padding:0 2px}
@@ -496,6 +500,7 @@
         <label class="vtoggle" id="looplabel" title="Repeat the current video/track instead of stopping at the end"><input type="checkbox" id="loop"> Loop</label>
       </div>
       <button class="close" id="close" aria-label="Close">&times;</button>
+      <div class="pageno hidden" id="pageno" aria-live="polite"></div>
     </div>
     <aside class="card" id="card"></aside>
   </div>
@@ -521,7 +526,8 @@
     viewIndex: -1,
     viewerOpen: false,
     viewList: null,     // items the viewer is paging through
-    viewKind: "grid",   // "grid" (the loaded grid) | "queue" (random/recommend)
+    viewKind: "grid",   // "grid" (the loaded grid) | "queue" (random/recommend) | "chain" (a story, paged in order)
+    chain: null,        // for a chain: { key, title, count } from /api/chain
     viewMore: null,     // for a queue: fn -> Promise<item|null> to extend on next
     autoNext: false,    // auto-advance when a video/track ends
     autoSecs: 5,        // seconds to show each image before auto-advancing
@@ -562,6 +568,7 @@
     prev: document.getElementById("prev"),
     next: document.getElementById("next"),
     close: document.getElementById("close"),
+    pageno: document.getElementById("pageno"),
     vrandom: document.getElementById("vrandom"),
     autonext: document.getElementById("autonext"),
     autosecs: document.getElementById("autosecs"),
@@ -1071,7 +1078,7 @@
     // Check the queue we're already in first. Going Back through a shuffle
     // session should return to that item *within the session*, keeping the list
     // and the arrows intact — refetching it as a lone item would strand you.
-    if (S.viewerOpen && S.viewKind === "queue") {
+    if (S.viewerOpen && S.viewKind !== "grid") {
       for (var j = 0; j < S.viewList.length; j++) {
         if (S.viewList[j].relpath === rel) { showAt(j, true); return; }
       }
@@ -1762,7 +1769,7 @@
   function openViewer(index, noHist) {
     if (index < 0 || index >= S.items.length) return;
     var wasOpen = S.viewerOpen;
-    S.viewKind = "grid"; S.viewList = S.items; S.viewMore = null;
+    S.viewKind = "grid"; S.viewList = S.items; S.viewMore = null; S.chain = null;
     if (!noHist) { if (wasOpen) replItem(S.items[index].relpath); else pushItem(S.items[index].relpath); }
     showViewer(); showAt(index, true);
   }
@@ -1773,9 +1780,25 @@
     if (!list || !list.length) return;
     var idx = index || 0;
     var wasOpen = S.viewerOpen;
-    S.viewKind = "queue"; S.viewList = list; S.viewMore = moreFn || null;
+    S.viewKind = "queue"; S.viewList = list; S.viewMore = moreFn || null; S.chain = null;
     if (!noHist) { if (wasOpen) replItem(list[idx].relpath); else pushItem(list[idx].relpath); }
     showViewer(); showAt(idx, true);
+  }
+
+  // Open a chain (a folder or chain.json story) as a paged reader: the viewer
+  // walks its members in reading order, says which page it is on, and a click on
+  // the page turns it. key is the chain's key; page is where to start (0-based).
+  function openChain(key, page) {
+    return api("/api/chain?key=" + encodeURIComponent(key)).then(function (d) {
+      var list = d.items || [];
+      if (!list.length) return;
+      var idx = Math.min(Math.max(page || 0, 0), list.length - 1);
+      var wasOpen = S.viewerOpen;
+      S.viewKind = "chain"; S.viewList = list; S.viewMore = null;
+      S.chain = d.chain || { key: key, title: key, count: list.length };
+      if (wasOpen) replItem(list[idx].relpath); else pushItem(list[idx].relpath);
+      showViewer(); showAt(idx, true);
+    });
   }
 
   // The browser's default controls don't remember volume between elements: each
@@ -1931,8 +1954,32 @@
       media.src = item.raw_url;
       media.alt = baseName(item.relpath);
       media.addEventListener("error", function () { showUnplayable(item, media); });
+      if (S.viewKind === "chain") {
+        // Reading: a click on the left third of the page goes back, anywhere
+        // else turns it — the arrows still work, but they're small on a phone.
+        media.style.cursor = "pointer";
+        media.addEventListener("click", function (e) {
+          e.stopPropagation();
+          var r = media.getBoundingClientRect();
+          navigate(e.clientX - r.left < r.width / 3 ? -1 : 1);
+        });
+      }
     }
     el.stage.insertBefore(media, el.stage.firstChild);
+
+    // Page counter, and the next page fetched ahead so turning to it is instant.
+    if (S.viewKind === "chain" && S.chain) {
+      el.pageno.innerHTML = "";
+      var pn = document.createElement("b");
+      pn.textContent = (S.viewIndex + 1) + " / " + S.viewList.length;
+      el.pageno.appendChild(pn);
+      el.pageno.appendChild(document.createTextNode("  \u00b7  " + S.chain.title));
+      el.pageno.classList.remove("hidden");
+      var ahead = S.viewList[S.viewIndex + 1];
+      if (ahead && (ahead.type === "image" || ahead.type === "animated")) new Image().src = ahead.raw_url;
+    } else {
+      el.pageno.classList.add("hidden");
+    }
 
     el.prev.style.visibility = S.viewIndex > 0 ? "visible" : "hidden";
     var hasNext;
@@ -1977,6 +2024,11 @@
     facesRow.appendChild(fk);
     facesRow.appendChild(fwrap);
     el.card.appendChild(facesRow);
+    // Which chain (story) this is a page of, with a way into the reader. Hidden
+    // until the item fetch below says it's in one.
+    var chainRow = document.createElement("div");
+    chainRow.className = "row chainrow hidden";
+    el.card.appendChild(chainRow);
     // Description (AI caption). Always shown so you can judge quality; the text
     // is refreshed from the live item fetch below, because the grid copy may
     // predate captioning and be stale/empty.
@@ -2236,6 +2288,7 @@
       if (S.viewList[S.viewIndex] !== item) return; // user moved on
       if (d.item) setDesc(d.item.description);
       renderItemFaces(facesRow, fwrap, d.faces || []);
+      renderItemChain(chainRow, d.chain);
       (d.tags || []).forEach(function (t) {
         if (t.source === "ai") ai.push({ namespace: t.namespace, name: t.name });
         else manual.push(tagStr(t));
@@ -2286,6 +2339,34 @@
     stripSection("More like this (tags)",
       "/api/recommend?path=" + encodeURIComponent(item.relpath) + "&limit=12",
       function () { return (manual.length + ai.length) ? "No tag-based matches yet." : "Add tags to get recommendations."; });
+  }
+
+  // The card's "Chain" row: the story's title and this item's page, plus buttons
+  // to read it from here or from the start. Already reading it, "from here" is
+  // where you are, so only the jump back to page one is offered.
+  function renderItemChain(rowEl, ch) {
+    rowEl.innerHTML = "";
+    if (!ch || !ch.count) { rowEl.classList.add("hidden"); return; }
+    rowEl.classList.remove("hidden");
+    var page = ch.position || 0;
+    var k = document.createElement("div"); k.className = "k"; k.textContent = "Chain";
+    var v = document.createElement("div"); v.className = "v";
+    v.textContent = ch.title + "  \u00b7  page " + (page + 1) + " of " + ch.count;
+    rowEl.appendChild(k); rowEl.appendChild(v);
+    var btns = document.createElement("div"); btns.className = "chainbtns";
+    var reading = S.viewKind === "chain" && S.chain && S.chain.key === ch.key;
+    function btn(label, at) {
+      var b = document.createElement("button");
+      b.className = "cardbtn"; b.type = "button"; b.textContent = label;
+      b.addEventListener("click", function () {
+        b.disabled = true;
+        openChain(ch.key, at).catch(function () { b.disabled = false; });
+      });
+      btns.appendChild(b);
+    }
+    if (!reading) btn("Read from here", page);
+    if (page > 0) btn("From the start", 0);
+    if (btns.childNodes.length) rowEl.appendChild(btns);
   }
 
   // Face chips for the item on screen: a crop each, clicking through to that
