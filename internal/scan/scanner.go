@@ -1,6 +1,7 @@
 // Package scan owns the indexing pipeline. Its shape is deliberate:
 //
 //	walk (1 goroutine)                 -- stat-only; cheap change-detection
+//	                                      (media file, and its sidecar)
 //	   -> jobs chan
 //	      -> workers (N goroutines)    -- read file + ffmpeg; NEVER touch the DB
 //	         -> results chan
@@ -16,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -61,6 +63,13 @@ type job struct {
 	info    os.FileInfo
 	typ     model.MediaType
 	updated bool // true if it already existed (changed), false if brand-new
+
+	// sidecarOnly: the media file is unchanged but its sidecar isn't, so only
+	// the tags need re-syncing — unless the poster offset moved too, which
+	// changes the thumbnail and signature (see process). offset is the one the
+	// index holds, to tell.
+	sidecarOnly bool
+	offset      float64
 }
 
 // result is what a worker produces for the writer.
@@ -72,6 +81,17 @@ type result struct {
 	thumbErr string // non-empty if a thumbnail was attempted and failed
 	prevErr  string // non-empty if an animated preview was attempted and failed
 	partial  bool   // probe failed in a way that means "truncated/incomplete file"
+}
+
+// sidecarMTime returns the sidecar's mtime in unix ns, or 0 if there is none.
+// Nanoseconds rather than the media key's seconds: a sidecar is small and gets
+// rewritten quickly, and two saves in the same second must still differ.
+func (s *Scanner) sidecarMTime(relpath string) int64 {
+	fi, err := os.Stat(s.cfg.SidecarPath(relpath))
+	if err != nil {
+		return 0 // absent (or unreadable, which a read would report anyway)
+	}
+	return fi.ModTime().UnixNano()
 }
 
 // Scan runs one full pass. Overlapping calls are skipped (the periodic ticker
@@ -99,6 +119,7 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	var partial int
 	var partialSample string
 	var unsettled int
+	var resynced int
 
 	var unsettledMu sync.Mutex
 
@@ -179,7 +200,9 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 					stats.Errors++
 					continue
 				}
-				if r.updated {
+				if r.write.TagsOnly {
+					resynced++
+				} else if r.updated {
 					stats.Updated++
 				} else {
 					stats.Added++
@@ -278,6 +301,7 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 
 		// Cheap change-detection: (size, mtime). No bytes read.
 		cur, existed := index[rel]
+		sidecarOnly := false
 		if existed && cur.Size == info.Size() && cur.MTime == info.ModTime().Unix() {
 			// Unchanged. Skip once it has both a thumbnail and a signature;
 			// otherwise reprocess once this run to backfill whatever's missing
@@ -285,19 +309,28 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 			// A video that predates the preview feature has a thumbnail and a
 			// vector but no preview, so previews have to count toward "done"
 			// here or they'd never backfill on an existing index.
-			if cur.ThumbReady && cur.HasVector && (cur.PreviewReady || !s.wantsPreview(typ)) {
-				return nil
+			retry := false
+			if !(cur.ThumbReady && cur.HasVector && (cur.PreviewReady || !s.wantsPreview(typ))) {
+				stillRetried[rel] = struct{}{}
+				if _, tried := s.thumbRetried[rel]; !tried {
+					s.thumbRetried[rel] = struct{}{}
+					retry = true // reprocess once to backfill the thumbnail and/or vector
+				}
 			}
-			stillRetried[rel] = struct{}{}
-			if _, tried := s.thumbRetried[rel]; tried {
-				return nil
+			// The media key can't see a sidecar edited by hand, so the sidecar
+			// has its own: one more stat, and still no bytes read. A full
+			// reprocess (retry) reads the sidecar anyway.
+			if !retry {
+				if s.sidecarMTime(rel) == cur.SidecarMTime {
+					return nil
+				}
+				sidecarOnly = true
 			}
-			s.thumbRetried[rel] = struct{}{}
-			// fall through: reprocess once to backfill the thumbnail and/or vector
 		}
 
 		select {
-		case jobs <- job{abs: abs, relpath: rel, info: info, typ: typ, updated: existed}:
+		case jobs <- job{abs: abs, relpath: rel, info: info, typ: typ, updated: existed,
+			sidecarOnly: sidecarOnly, offset: cur.Offset}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -353,6 +386,9 @@ func (s *Scanner) Scan(ctx context.Context) (model.ScanStats, error) {
 	if prevFails > 0 {
 		log.Printf("scan: %d video(s) had no animated preview; e.g. %s", prevFails, prevSample)
 	}
+	if resynced > 0 {
+		log.Printf("scan: re-synced tags from %d edited sidecar(s)", resynced)
+	}
 	if unsettled > 0 {
 		log.Printf("scan: %d new file(s) skipped as still being written; will pick them up next scan", unsettled)
 	}
@@ -385,11 +421,30 @@ func (s *Scanner) process(ctx context.Context, j job) result {
 	// decides WHICH frame becomes the thumbnail, the vision-model input, and the
 	// perceptual signature. Reading it afterwards would silently ignore the
 	// offset on the scan that first sees it.
-	if sc, ok, err := sidecar.Read(s.cfg.SidecarPath(j.relpath)); err != nil {
+	//
+	// Stat before reading, so an edit landing in between leaves an older mtime
+	// on record and the next scan picks the edit up, rather than the reverse.
+	res.write.SidecarMTime = s.sidecarMTime(j.relpath)
+	sc, ok, err := sidecar.Read(s.cfg.SidecarPath(j.relpath))
+	if err != nil {
+		if j.sidecarOnly {
+			// Keep the tags the index has; leaving the mtime unrecorded means
+			// the fixed file is read again next scan.
+			res.err = fmt.Errorf("sidecar: %w", err)
+			return res
+		}
 		log.Printf("scan: sidecar %s: %v", j.relpath, err)
 	} else if ok {
 		res.write.ManualTags = sc.Tags()
 		item.Offset = sc.Offset
+	}
+	// Only the sidecar changed. Tags are all that need syncing unless the
+	// poster offset moved too: that picks a different frame for the thumbnail
+	// and signature, so it gets the full reprocess below.
+	if j.sidecarOnly && item.Offset == j.offset {
+		res.write.Item = model.Item{Relpath: j.relpath}
+		res.write.TagsOnly = true
+		return res
 	}
 
 	// Probe is best-effort: a file we can't read metadata for (partial download,

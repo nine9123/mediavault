@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS items (
     views         INTEGER NOT NULL DEFAULT 0, -- times opened in the viewer (popularity signal)
     description   TEXT,                        -- AI caption (optional); indexed into items_fts
     faces_done    INTEGER NOT NULL DEFAULT 0, -- 0/1; face detection has run (0 faces is a valid result)
+    sidecar_mtime INTEGER NOT NULL DEFAULT 0, -- unix ns of the sidecar last synced; 0 = none
     indexed_at    INTEGER NOT NULL,           -- unix s
     seen_at       INTEGER NOT NULL,           -- unix s; last scan that saw this file
     missing_since INTEGER                     -- set when a scan stops seeing it (soft delete)
