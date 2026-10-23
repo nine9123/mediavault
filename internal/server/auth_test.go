@@ -302,3 +302,138 @@ func TestHealthzIsPublicAndOK(t *testing.T) {
 		t.Fatalf("/healthz without a key: status %d, want 200", rec.Code)
 	}
 }
+
+// A key in a header is a guess too. Without a limit on it, any /api/ route would
+// be an unthrottled way around the login form's limit.
+func TestHeaderKeyGuessesAreRateLimited(t *testing.T) {
+	s := newTestServer(testKey)
+	h, reached := sentinel()
+	guarded := s.requireAuth(h)
+	var got429 bool
+	for i := 0; i < 20; i++ {
+		r := httptest.NewRequest("GET", "/api/items", nil)
+		r.Header.Set("X-API-Key", "guess")
+		rec := httptest.NewRecorder()
+		guarded.ServeHTTP(rec, r)
+		if rec.Code == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+	}
+	if !got429 {
+		t.Fatal("repeated wrong header keys were never rate limited")
+	}
+	// Throttled means the key isn't even checked, right or wrong.
+	*reached = false
+	r := httptest.NewRequest("GET", "/api/items", nil)
+	r.Header.Set("X-API-Key", testKey)
+	rec := httptest.NewRecorder()
+	guarded.ServeHTTP(rec, r)
+	if rec.Code != http.StatusTooManyRequests || *reached {
+		t.Errorf("throttled client with the right key: status %d reached=%v, want 429 and blocked", rec.Code, *reached)
+	}
+	// ...and the login form shares the same budget.
+	rec = httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, jsonReq("POST", "/api/auth", `{"key":"`+testKey+`"}`))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("login after header guesses: status %d, want 429", rec.Code)
+	}
+}
+
+// A script with the right key must not run itself into the limit.
+func TestCorrectHeaderKeyNeverThrottles(t *testing.T) {
+	s := newTestServer(testKey)
+	h, _ := sentinel()
+	guarded := s.requireAuth(h)
+	for i := 0; i < 50; i++ {
+		r := httptest.NewRequest("GET", "/api/items", nil)
+		r.Header.Set("X-API-Key", testKey)
+		rec := httptest.NewRecorder()
+		guarded.ServeHTTP(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d with the correct key: status %d", i+1, rec.Code)
+		}
+	}
+}
+
+func TestCrossSiteWritesRefused(t *testing.T) {
+	h, reached := sentinel()
+	guarded := rejectCrossSite(h)
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+		want    bool // refused?
+	}{
+		{"cross-site fetch", map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"}, true},
+		// Another app on the same NAS, different port: same-site, still not us.
+		{"same-site other port", map[string]string{"Sec-Fetch-Site": "same-site", "Origin": "http://example.com:9000"}, true},
+		{"same-origin UI", map[string]string{"Sec-Fetch-Site": "same-origin", "Origin": "http://example.com"}, false},
+		{"old browser, foreign Origin", map[string]string{"Origin": "http://evil.example"}, true},
+		{"old browser, null Origin", map[string]string{"Origin": "null"}, true},
+		{"old browser, own Origin", map[string]string{"Origin": "http://example.com"}, false},
+		{"curl, no browser headers", nil, false},
+	} {
+		*reached = false
+		r := httptest.NewRequest("POST", "/api/scan", nil) // Host: example.com
+		for k, v := range tc.headers {
+			r.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		guarded.ServeHTTP(rec, r)
+		if refused := rec.Code == http.StatusForbidden && !*reached; refused != tc.want {
+			t.Errorf("%s: status %d, refused=%v want %v", tc.name, rec.Code, refused, tc.want)
+		}
+	}
+}
+
+// The guard has to be on the real handler chain, and in front of auth: it must
+// hold with no API_KEY too, where there is no cookie for SameSite to withhold.
+func TestCrossSiteGuardIsWired(t *testing.T) {
+	for _, key := range []string{testKey, ""} {
+		r := httptest.NewRequest("DELETE", "/api/auth", nil)
+		r.Header.Set("Sec-Fetch-Site", "cross-site")
+		rec := httptest.NewRecorder()
+		newTestServer(key).Routes().ServeHTTP(rec, r)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("key=%q: cross-site DELETE status %d, want 403", key, rec.Code)
+		}
+	}
+}
+
+// Reads stay open to cross-site navigation (a bookmarked /api/raw link, an
+// <img> tag): nothing changes on a GET, and blocking them would break those.
+func TestCrossSiteReadsPass(t *testing.T) {
+	r := httptest.NewRequest("GET", "/healthz", nil)
+	r.Header.Set("Sec-Fetch-Site", "cross-site")
+	rec := httptest.NewRecorder()
+	newTestServer(testKey).Routes().ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Errorf("cross-site GET: status %d, want 200", rec.Code)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	for _, path := range []string{"/", "/api/items", "/api/auth", "/healthz"} {
+		rec := httptest.NewRecorder()
+		newTestServer(testKey).Routes().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		for k, want := range map[string]string{
+			"X-Content-Type-Options":  "nosniff",
+			"X-Frame-Options":         "DENY",
+			"Content-Security-Policy": "frame-ancestors 'none'",
+			"Referrer-Policy":         "no-referrer",
+		} {
+			if got := rec.Header().Get(k); got != want {
+				t.Errorf("%s: %s = %q, want %q", path, k, got, want)
+			}
+		}
+	}
+}
+
+func TestLoginBodyIsCapped(t *testing.T) {
+	rec := httptest.NewRecorder()
+	body := `{"key":"` + strings.Repeat("a", 64<<10) + `"}`
+	newTestServer(testKey).Routes().ServeHTTP(rec, jsonReq("POST", "/api/auth", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("64 KiB login body: status %d, want 400", rec.Code)
+	}
+}

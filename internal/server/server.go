@@ -127,7 +127,9 @@ func (s *Server) Routes() http.Handler {
 	// what makes this fail closed: a route added later is protected by default,
 	// and forgetting to add a check is not a possible mistake. gzipJSON sits
 	// outside it and only ever touches application/json bodies; see gzipJSON.
-	return gzipJSON(s.requireAuth(mux))
+	// securityHeaders and rejectCrossSite run before auth, so a forged
+	// cross-site write is refused whether or not it carries a session.
+	return gzipJSON(securityHeaders(rejectCrossSite(s.requireAuth(mux))))
 }
 
 // publicPaths are served without a session. The UI shell has to be, or there
@@ -148,7 +150,13 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if s.authed(r) {
+		ok, throttled := s.authed(r)
+		if throttled {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "too many attempts — wait a minute and try again", http.StatusTooManyRequests)
+			return
+		}
+		if ok {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -160,14 +168,92 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 }
 
 // authed reports whether a request carries a valid session or key.
-func (s *Server) authed(r *http.Request) bool {
-	if k := auth.KeyFromRequest(r); k != "" && s.auth.VerifyKey(k) {
-		return true
+//
+// A key in a header is a guess like any typed into the login form, so it goes
+// through the same per-client limit: without that, any /api/ route would be an
+// unthrottled oracle for brute-forcing the key, and the login limit would only
+// slow down attackers polite enough to use the login form. throttled reports
+// that the client is over the limit and the key was not checked at all.
+//
+// Session cookies are not counted: a token is an HMAC under the key, and forging
+// one is not something more attempts help with.
+func (s *Server) authed(r *http.Request) (ok, throttled bool) {
+	if k := auth.KeyFromRequest(r); k != "" {
+		client := auth.Client(r)
+		if !s.auth.Attempt(client, time.Now()) {
+			return false, true
+		}
+		if s.auth.VerifyKey(k) {
+			s.auth.RecordSuccess(client)
+			return true, false
+		}
+		log.Printf("auth: wrong API key in request header from %s", client)
 	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
-		return s.auth.VerifyToken(c.Value, time.Now())
+		return s.auth.VerifyToken(c.Value, time.Now()), false
 	}
-	return false
+	return false, false
+}
+
+// securityHeaders sets the response headers every route wants.
+//
+//   - nosniff: media is served with a type chosen from its extension; the browser
+//     must not second-guess that and render, say, a mislabelled file as HTML.
+//   - frame-ancestors/X-Frame-Options: nobody else's page may embed this one, or
+//     it could overlay the UI and trick a click on Forget or Merge.
+//   - no-referrer: media paths are often descriptive, and the UI has no reason to
+//     tell any other site which item was open when a link was followed.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// rejectCrossSite refuses state-changing requests that a browser sent on behalf
+// of some other site (CSRF). SameSite=Lax on the session cookie already keeps it
+// off cross-site POSTs, but "site" ignores the port: any other app on the same
+// NAS, on any port, counts as same-site and would get the cookie attached. And
+// with API_KEY unset there is no cookie to withhold in the first place.
+//
+// The browser says where a request came from in Sec-Fetch-Site (every current
+// browser sends it); only "same-origin", or "none" for something the user did
+// directly, is accepted. Older browsers that lack it are checked on Origin
+// against Host instead. A request with neither header did not come from a
+// browser — curl, scripts — and CSRF is not a thing there, so it passes.
+// GET/HEAD/OPTIONS pass: no route changes anything on a read.
+func rejectCrossSite(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			next.ServeHTTP(w, r)
+			return
+		}
+		if crossSite(r) {
+			http.Error(w, "cross-origin request refused", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func crossSite(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+		return site != "same-origin" && site != "none"
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return true // includes "null", which sandboxed and file:// pages send
+	}
+	return !strings.EqualFold(u.Host, r.Host)
 }
 
 const sessionCookie = "mv_session"
@@ -177,9 +263,10 @@ const sessionCookie = "mv_session"
 // a key is required, never anything about the library.
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	authed, _ := s.authed(r)
 	writeJSON(w, map[string]any{
 		"enabled": s.auth.Enabled(),
-		"authed":  !s.auth.Enabled() || s.authed(r),
+		"authed":  !s.auth.Enabled() || authed,
 	})
 }
 
@@ -204,19 +291,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	client := auth.Client(r)
 	now := time.Now()
-	if !s.auth.AllowAttempt(client, now) {
+	if !s.auth.Attempt(client, now) {
 		http.Error(w, "too many attempts — wait a minute and try again", http.StatusTooManyRequests)
 		return
 	}
 	var req struct {
 		Key string `json:"key"`
 	}
+	// The body is a key and nothing else; a few KB is generous, and the cap
+	// stops an unauthenticated client from making the server buffer more.
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 	if !s.auth.VerifyKey(strings.TrimSpace(req.Key)) {
-		s.auth.RecordFailure(client, now)
 		log.Printf("auth: failed login from %s", client)
 		http.Error(w, "wrong key", http.StatusUnauthorized)
 		return
@@ -997,8 +1086,15 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 
 // handleRaw serves the original file. http.ServeFile handles Range requests, so
 // video seeking works out of the box. The path is contained within MediaRoot.
+//
+// The files are the user's own, but not necessarily safe to render on this
+// origin: an SVG can carry <script>, and opening /api/raw/x.svg in a tab would
+// run it with the session cookie attached. The sandbox CSP gives such a document
+// a unique opaque origin and no script, which costs nothing for <img>/<video>
+// embedding (a CSP on a subresource response doesn't apply to it there).
 func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request) {
 	rel := r.PathValue("path")
+	w.Header().Set("Content-Security-Policy", "sandbox; frame-ancestors 'none'")
 	// Prefer a browser-friendly derived copy when one exists (transcoded video
 	// or image preview written by scripts/transcode.sh).
 	if p, ok := s.derivedFor(rel); ok {
