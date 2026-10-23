@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
 	"net/http"
@@ -87,6 +89,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/transcode", s.handleTranscode)
 	mux.HandleFunc("GET /api/transcode", s.handleTranscodeStatus)
 	mux.HandleFunc("GET /api/item", s.handleItemDetail)
+	mux.HandleFunc("GET /api/chain", s.handleChain)
 	mux.HandleFunc("PUT /api/tags", s.handleSetTags)
 	mux.HandleFunc("POST /api/caption", s.handleRecaption)
 	mux.HandleFunc("PUT /api/offset", s.handleSetOffset)
@@ -649,7 +652,73 @@ func (s *Server) handleItemDetail(w http.ResponseWriter, r *http.Request) {
 	if f := s.facesForItemDTO(r, it.ID); len(f) > 0 {
 		resp["faces"] = f
 	}
+	// Which story it is a page of, so the card can offer to read it. Omitted when
+	// it is in none, which is most video and anything loose at the root.
+	if place, ok, err := s.store.ChainOf(r.Context(), it.Relpath); err == nil && ok {
+		resp["chain"] = toChainDTO(place.Chain, place.Count, &place.Position)
+	}
 	writeJSON(w, resp)
+}
+
+// chainDTO is the JSON shape of a chain. Position is the requested item's
+// 0-based page, present only when the request named an item.
+type chainDTO struct {
+	Key      string `json:"key"`
+	Title    string `json:"title"`
+	Kind     string `json:"kind"`
+	Count    int    `json:"count"`
+	Position *int   `json:"position,omitempty"`
+}
+
+func toChainDTO(c model.Chain, count int, pos *int) chainDTO {
+	return chainDTO{Key: c.Key, Title: c.Title, Kind: c.Kind, Count: count, Position: pos}
+}
+
+// handleChain returns a chain's members in reading order, for the paged reader.
+// Address it by ?key= (the chain's key, as /api/item reports it) or by ?path=
+// (any member item, which also sets position to that item's page).
+func (s *Server) handleChain(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	key, rel := strings.TrimSpace(q.Get("key")), strings.TrimSpace(q.Get("path"))
+	if key == "" && rel != "" {
+		place, ok, err := s.store.ChainOf(r.Context(), rel)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "not in a chain", http.StatusNotFound)
+			return
+		}
+		key = place.Chain.Key
+	}
+	if key == "" {
+		http.Error(w, "missing key or path", http.StatusBadRequest)
+		return
+	}
+	c, items, err := s.store.ChainByKey(r.Context(), key)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var pos *int
+	if rel != "" {
+		for i, it := range items {
+			if it.Relpath == rel {
+				pos = &i
+				break
+			}
+		}
+	}
+	dtos := make([]itemDTO, 0, len(items))
+	for _, it := range items {
+		dtos = append(dtos, toDTO(it))
+	}
+	writeJSON(w, map[string]any{"chain": toChainDTO(c, len(items), pos), "items": dtos, "count": len(dtos)})
 }
 
 // handleSetTags writes an item's manual tags to its sidecar (the durable source
