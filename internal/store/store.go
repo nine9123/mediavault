@@ -638,14 +638,15 @@ func rebuildItemFTS(ctx context.Context, tx *sql.Tx, itemID int64, relpath strin
 // ftsQuery turns free text into a safe FTS5 MATCH string. It tokenises on any
 // non-alphanumeric character — matching how the content is indexed — so a
 // namespaced tag typed literally (e.g. "artist:jane") becomes two prefix terms
-// and never trips FTS5's column-filter syntax. Returns "" when there are no
-// searchable tokens.
+// and never trips FTS5's column-filter syntax. Each token is double-quoted so
+// a word FTS5 would otherwise read as an operator (AND, OR, NOT, NEAR) stays a
+// plain search term. Returns "" when there are no searchable tokens.
 func ftsQuery(q string) string {
 	var tokens []string
 	var b strings.Builder
 	flush := func() {
 		if b.Len() > 0 {
-			tokens = append(tokens, b.String()+"*")
+			tokens = append(tokens, `"`+b.String()+`"*`)
 			b.Reset()
 		}
 	}
