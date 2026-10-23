@@ -11,6 +11,18 @@ served at `/`. Captioning/semantic search (via Ollama) and face recognition (via
 the `facerec/` container) are optional add-ons. What isn't built yet is listed
 under *What's stubbed* below.
 
+![The grid: every item as a thumbnail, newest first](docs/screenshots/grid.jpg)
+
+![The viewer, with the tag editor and "Looks similar"](docs/screenshots/viewer.jpg)
+
+![A type:video search: animated previews play right in the grid](docs/screenshots/video-filter.jpg)
+
+![The API key prompt](docs/screenshots/login.png)
+
+<sub>Screenshots are of a synthetic library (generated landscapes and ffmpeg test
+patterns), not anyone's real media. Top to bottom: the grid, the viewer, a
+`type:video` search, and the prompt shown when `API_KEY` is set.</sub>
+
 ## The one idea to keep in mind
 
 There are three tiers of data, and they are strictly separated:
@@ -51,6 +63,7 @@ mediavault/
 │   ├── faces/                # face worker: detect, cluster, name (People page)
 │   └── server/               # HTTP API + the embedded single-page UI (web/)
 ├── facerec/                  # the recognition service itself (separate container)
+├── docs/screenshots/         # the images in this README
 ├── idlegate/                 # docs for the optional scale-to-zero proxy (code: github.com/nine9123/idlegate)
 ├── scripts/transcode.sh      # batch-convert unplayable media into DERIVED_DIR
 ├── .gitea/workflows/         # CI: build + push both images
@@ -95,6 +108,50 @@ MEDIA_ROOT=/path/to/media DATA_DIR=./data go run ./cmd/server
 # 2b. Or in Docker (edit the media mount in docker-compose.yml first):
 docker compose up --build
 ```
+
+## Benchmarks
+
+What it costs to leave running. Measured on 2026-10-23 with the binary built
+exactly as the Dockerfile builds it (`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`),
+default settings (`SCAN_WORKERS=6`, `HASH_MODE=partial`, WebP previews), auth on.
+The library was synthetic: 4,293 files — 4,280 JPEG/PNG images (1–4 MP), 8 H.264
+videos of 25–60 s, 5 MP3s — on local disk, in a Linux container on a 16-core
+arm64 machine with ffmpeg 5.1. Memory is the process's resident set from
+`/proc/<pid>/status`; CPU is from `/proc/<pid>/stat`, with ffmpeg counted
+separately because it runs as child processes.
+
+| State                                   | mediavault itself                         | ffmpeg children        |
+|-----------------------------------------|-------------------------------------------|------------------------|
+| Just started, empty index               | 17 MB RSS                                 | —                      |
+| **Idle** (index built, no requests), 3 min | **21 MB RSS, 0.01 s CPU** (≈0.006% of one core) | none            |
+| First scan of 4,293 files (6 m 19 s)    | 24 MB peak RSS, 13 s CPU (≈3% of one core) | ≈1,110 s CPU (≈3 cores, 6 workers) |
+| Periodic rescan, nothing changed        | 0.42 s wall clock — it's a `stat` per file | none                  |
+| Serving: 200 × `/api/items?limit=200`   | p50 1.0 ms, p95 1.5 ms                    | —                      |
+| Serving: 200 × `/api/search?q=coast`    | p50 1.8 ms, p95 2.2 ms                    | —                      |
+| 300 thumbnails, 16 in parallel          | 0.33 s total; peak RSS 25 MB              | —                      |
+
+On disk: the binary is 11.6 MB; the cache for those 4,293 files was 33 MB
+(`index.db` + WAL 15 MB, thumbnails 18 MB, previews 0.3 MB).
+
+How to read it:
+
+- **Idle is effectively free.** Between scans nothing runs: no polling loop, no
+  background indexing, 16 OS threads parked. The periodic rescan is a directory
+  walk and a `stat` per file — under half a second here, and over SMB it is
+  dominated by round trips, not CPU.
+- **The expensive part is ffmpeg, once per file.** Thumbnails, posters and
+  animated previews are cut on the first scan and cached; a rescan doesn't touch
+  them again. `SCAN_WORKERS` caps how many ffmpeg processes run at once, so it is
+  also the knob for how hard a first scan leans on the NAS.
+- Over SMB a first scan is slower than this (network reads, not CPU), and real
+  photos are bigger than these, so expect more ffmpeg time per file. The idle
+  numbers don't change. Captioning (Ollama) and faces (`facerec`) are separate
+  services and aren't counted here; with them off, as here, they cost nothing.
+
+To reproduce: start the binary against a library, then sample
+`grep -E 'VmRSS|VmHWM' /proc/$(pidof mediavault)/status` and fields 14–17 of
+`/proc/$(pidof mediavault)/stat` (utime, stime, and the children's cutime,
+cstime, in clock ticks) once a second.
 
 ## Config (env vars)
 
@@ -237,7 +294,24 @@ requests.)
   curl -H "X-API-Key: $API_KEY" http://nas:8080/api/stats
   ```
 - Ten wrong keys per minute per client gets a `429`, so the key can't be quietly
-  brute-forced over the network.
+  brute-forced over the network. That budget is shared by the login form and by
+  keys sent in `X-API-Key`/`Authorization` headers on any route, so there is no
+  unthrottled side door; a correct key resets it. IPv6 clients are counted per
+  /64, since one host can pick any address in its /64.
+- Writes (`POST`/`PUT`/`DELETE`) that a browser makes on behalf of another site
+  are refused with `403`, judged from `Sec-Fetch-Site` (or `Origin` on browsers
+  too old to send it). `SameSite=Lax` alone doesn't cover this: another app on
+  the same NAS, on a different port, counts as the same site. This applies with
+  `API_KEY` unset too. Requests from curl and scripts send neither header and are
+  unaffected.
+- Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options:
+  DENY` / `frame-ancestors 'none'` (no other page can frame the UI and trick a
+  click) and `Referrer-Policy: no-referrer`. Original files from `/api/raw/` are
+  also served with `Content-Security-Policy: sandbox`, so opening, say, an SVG
+  from the library in its own tab can't run script as the app.
+- Use a long random key. The startup log warns when `API_KEY` is shorter than 16
+  characters: the session cookie is an HMAC under the key, so anyone holding a
+  cookie can guess at a short key offline, where no rate limit applies.
 
 This is a lock on the front door, not transport security: over plain HTTP the key
 and your media still cross the network in the clear. On a home LAN that is usually

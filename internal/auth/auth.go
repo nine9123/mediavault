@@ -117,10 +117,16 @@ type window struct {
 	start time.Time
 }
 
-// AllowAttempt reports whether this client may try a key right now. Guessing a
-// key over a LAN is otherwise unlimited and silent; ten tries a minute makes it
-// useless without inconveniencing anyone typing their own key.
-func (a *Auth) AllowAttempt(client string, now time.Time) bool {
+// Attempt reports whether this client may try a key right now, and if so counts
+// the try against it. Guessing a key over a LAN is otherwise unlimited and
+// silent; ten tries a minute makes it useless without inconveniencing anyone
+// typing their own key.
+//
+// The check and the count are one locked step on purpose. Checking first and
+// counting only once the key turned out wrong would let a client fire a burst of
+// parallel guesses that all pass the check before any of them is counted. A
+// correct key clears the count again (RecordSuccess), so only failures add up.
+func (a *Auth) Attempt(client string, now time.Time) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	w := a.attempts[client]
@@ -128,22 +134,14 @@ func (a *Auth) AllowAttempt(client string, now time.Time) bool {
 		if len(a.attempts) >= maxTrackedIP {
 			a.pruneLocked(now)
 		}
-		a.attempts[client] = &window{start: now}
+		a.attempts[client] = &window{count: 1, start: now}
 		return true
 	}
-	return w.count < maxAttempts
-}
-
-// RecordFailure counts a bad key against this client.
-func (a *Auth) RecordFailure(client string, now time.Time) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	w := a.attempts[client]
-	if w == nil || now.Sub(w.start) > attemptWin {
-		a.attempts[client] = &window{count: 1, start: now}
-		return
+	if w.count >= maxAttempts {
+		return false
 	}
 	w.count++
+	return true
 }
 
 // RecordSuccess clears a client's failure count.
@@ -166,12 +164,20 @@ func (a *Auth) pruneLocked(now time.Time) {
 // so trusting it would let one client mint unlimited buckets and defeat the
 // limit entirely. Behind a reverse proxy this groups all users together, which
 // is the safe direction to be wrong in.
+//
+// IPv6 peers are grouped by their /64. A single host is normally handed a whole
+// /64 and can pick any address in it, so keying on the full address would give
+// one attacker 2^64 fresh buckets.
 func Client(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
 	}
-	return host
+	ip := net.ParseIP(host)
+	if ip == nil || ip.To4() != nil {
+		return host
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // KeyFromRequest pulls a presented key out of the request: "X-API-Key", or an
@@ -200,5 +206,14 @@ func (a *Auth) Describe() string {
 	if !a.Enabled() {
 		return "auth: DISABLED (API_KEY not set) — anyone who can reach this port can browse your library"
 	}
-	return fmt.Sprintf("auth: enabled (API_KEY set, sessions last %s)", a.ttl)
+	msg := fmt.Sprintf("auth: enabled (API_KEY set, sessions last %s)", a.ttl)
+	if len(a.key) < MinKeyLen {
+		msg += fmt.Sprintf(" — WARNING: API_KEY is only %d characters; use at least %d (e.g. `openssl rand -base64 24`)", len(a.key), MinKeyLen)
+	}
+	return msg
 }
+
+// MinKeyLen is the shortest API_KEY that doesn't draw a startup warning. The rate
+// limit slows online guessing, but a short or dictionary key is still the weak
+// point, and a stolen session cookie can be brute-forced offline against it.
+const MinKeyLen = 16
