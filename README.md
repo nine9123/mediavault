@@ -71,6 +71,11 @@ walk (1 goroutine)                  stat only; (size,mtime) change-detection
 
 - **Change-detection is a `stat`**, never a read: `(relpath, size, mtime)`.
   Unchanged files are skipped entirely, so a rescan reads ~0 bytes over SMB.
+- **Sidecars have their own key.** Each unchanged file's sidecar is `stat`ed
+  too; if its mtime differs from the last one synced (it was edited by hand,
+  created, or deleted), only the manual tags are re-read and re-synced — no
+  ffmpeg. The exception is an edit that moves the poster `offset`, which picks
+  a different frame and so reprocesses the file.
 - **One writer goroutine** owns all DB writes → no `SQLITE_BUSY`, and writes
   batch into transactions. Workers only read/thumbnail.
 - **Soft delete with a mount guard.** Vanished files get a `missing_since`
@@ -354,9 +359,6 @@ and no reader in the UI (see *What's stubbed*).
   Python container (e.g. WD14/CLIP via ONNX) that reads an image and writes
   `source='ai'` tags (with confidence) — the schema already distinguishes AI
   suggestions from manual confirmations. The core app works with zero AI.
-- **Sidecar-only edits** (editing a `.json` without touching the media file)
-  aren't yet picked up by the cheap change-detector. Options: include the
-  sidecar's mtime in the change key, or add a lightweight tag-only sync pass.
 
 ## Notes
 

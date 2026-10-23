@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -55,6 +56,15 @@ type ItemWrite struct {
 	Item       model.Item
 	ManualTags []model.Tag // sidecar-derived; synced as this item's manual tags
 	Vector     []float32   // perceptual signature; nil to leave unchanged
+
+	// SidecarMTime is the sidecar's mtime (unix ns, 0 if there is none) as of
+	// the read that produced ManualTags, so the next scan can tell whether the
+	// sidecar has been edited since.
+	SidecarMTime int64
+	// TagsOnly syncs ManualTags and SidecarMTime onto an already-indexed item
+	// and leaves everything else about it alone: the sidecar changed, the media
+	// file didn't. Only Item.Relpath is read.
+	TagsOnly bool
 }
 
 // ChainDef is a fully-resolved chain the scanner asks us to (re)create.
@@ -71,6 +81,8 @@ type IndexRow struct {
 	ThumbReady   bool
 	PreviewReady bool
 	HasVector    bool
+	Offset       float64 // poster offset as last read from the sidecar
+	SidecarMTime int64   // unix ns of the sidecar last synced; 0 = none
 }
 
 // Open connects, sets pragmas per-connection (via DSN so every pooled conn
@@ -225,6 +237,15 @@ func (s *Store) ensureColumns() error {
 		`CREATE INDEX IF NOT EXISTS idx_face_group_merge ON face_group_merge(merge_id)`); err != nil {
 		return fmt.Errorf("index face_group_merge: %w", err)
 	}
+	hasSc, err := s.hasColumn("items", "sidecar_mtime")
+	if err != nil {
+		return err
+	}
+	if !hasSc {
+		if _, err := s.db.Exec(`ALTER TABLE items ADD COLUMN sidecar_mtime INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add items.sidecar_mtime: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -272,7 +293,8 @@ func (s *Store) dropAll() error {
 func (s *Store) LoadIndex(ctx context.Context) (map[string]IndexRow, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT relpath,id,size,mtime,thumb_ready,preview_ready,
-		        (SELECT 1 FROM item_vectors v WHERE v.item_id=items.id)
+		        (SELECT 1 FROM item_vectors v WHERE v.item_id=items.id),
+		        COALESCE(offset_s,0),sidecar_mtime
 		 FROM items WHERE missing_since IS NULL`)
 	if err != nil {
 		return nil, err
@@ -284,7 +306,7 @@ func (s *Store) LoadIndex(ctx context.Context) (map[string]IndexRow, error) {
 		var r IndexRow
 		var thumb, prev int64
 		var hasVec sql.NullInt64
-		if err := rows.Scan(&rp, &r.ID, &r.Size, &r.MTime, &thumb, &prev, &hasVec); err != nil {
+		if err := rows.Scan(&rp, &r.ID, &r.Size, &r.MTime, &thumb, &prev, &hasVec, &r.Offset, &r.SidecarMTime); err != nil {
 			return nil, err
 		}
 		r.ThumbReady = thumb != 0
@@ -315,10 +337,25 @@ func (s *Store) WriteBatch(ctx context.Context, batch []ItemWrite) error {
 	for _, w := range batch {
 		it := w.Item
 		var id int64
+		if w.TagsOnly {
+			err := tx.QueryRowContext(ctx,
+				`UPDATE items SET sidecar_mtime=? WHERE relpath=? RETURNING id`,
+				w.SidecarMTime, it.Relpath).Scan(&id)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // gone since the walk saw it; nothing to tag
+			}
+			if err != nil {
+				return fmt.Errorf("sync tags %s: %w", it.Relpath, err)
+			}
+			if err := syncManualTags(ctx, tx, id, it.Relpath, w.ManualTags); err != nil {
+				return err
+			}
+			continue
+		}
 		err := tx.QueryRowContext(ctx, `
 INSERT INTO items
-  (relpath,size,mtime,content_hash,type,mime,width,height,duration,offset_s,thumb_ready,preview_ready,indexed_at,seen_at,missing_since)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
+  (relpath,size,mtime,content_hash,type,mime,width,height,duration,offset_s,thumb_ready,preview_ready,indexed_at,seen_at,sidecar_mtime,missing_since)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)
 ON CONFLICT(relpath) DO UPDATE SET
   size=excluded.size, mtime=excluded.mtime,
   content_hash=COALESCE(excluded.content_hash, items.content_hash),
@@ -327,11 +364,11 @@ ON CONFLICT(relpath) DO UPDATE SET
   offset_s=excluded.offset_s,
   thumb_ready=excluded.thumb_ready, preview_ready=excluded.preview_ready,
   indexed_at=excluded.indexed_at,
-  seen_at=excluded.seen_at, missing_since=NULL
+  seen_at=excluded.seen_at, sidecar_mtime=excluded.sidecar_mtime, missing_since=NULL
 RETURNING id`,
 			it.Relpath, it.Size, it.MTime.Unix(), nullStr(it.ContentHash),
 			string(it.Type), it.MIME, it.Width, it.Height, it.Duration, nullFloat(it.Offset),
-			b2i(it.ThumbReady), b2i(it.PreviewReady), it.IndexedAt.Unix(), it.SeenAt.Unix(),
+			b2i(it.ThumbReady), b2i(it.PreviewReady), it.IndexedAt.Unix(), it.SeenAt.Unix(), w.SidecarMTime,
 		).Scan(&id)
 		if err != nil {
 			return fmt.Errorf("upsert %s: %w", it.Relpath, err)
@@ -347,28 +384,7 @@ RETURNING id`,
 			vecs = append(vecs, cached{id, w.Vector})
 		}
 
-		// Sidecar is the source of truth for manual tags: clear this item's
-		// manual tags and re-add from the sidecar. AI tags are left untouched.
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM item_tags WHERE item_id=? AND source='manual'`, id); err != nil {
-			return err
-		}
-		for _, t := range w.ManualTags {
-			tagID, err := upsertTag(ctx, tx, t)
-			if err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx,
-				`INSERT OR IGNORE INTO item_tags(item_id,tag_id,source) VALUES(?,?, 'manual')`,
-				id, tagID); err != nil {
-				return err
-			}
-		}
-
-		// Keep FTS in sync from ALL of the item's tags (manual + any ai), so
-		// search finds either kind. FTS5 has no upsert; rebuildItemFTS does
-		// delete+insert.
-		if err := rebuildItemFTS(ctx, tx, id, it.Relpath); err != nil {
+		if err := syncManualTags(ctx, tx, id, it.Relpath, w.ManualTags); err != nil {
 			return err
 		}
 	}
@@ -381,6 +397,31 @@ RETURNING id`,
 		s.cacheVec(c.id, c.vec)
 	}
 	return nil
+}
+
+// syncManualTags makes tags the item's complete set of manual tags and
+// refreshes its FTS row. The sidecar is the source of truth for manual tags, so
+// the old set is cleared rather than merged into; AI tags are left untouched.
+func syncManualTags(ctx context.Context, tx *sql.Tx, id int64, relpath string, tags []model.Tag) error {
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM item_tags WHERE item_id=? AND source='manual'`, id); err != nil {
+		return err
+	}
+	for _, t := range tags {
+		tagID, err := upsertTag(ctx, tx, t)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO item_tags(item_id,tag_id,source) VALUES(?,?, 'manual')`,
+			id, tagID); err != nil {
+			return err
+		}
+	}
+	// Keep FTS in sync from ALL of the item's tags (manual + any ai), so
+	// search finds either kind. FTS5 has no upsert; rebuildItemFTS does
+	// delete+insert.
+	return rebuildItemFTS(ctx, tx, id, relpath)
 }
 
 // MarkMissing flags files a scan no longer saw. Returns how many newly flipped
