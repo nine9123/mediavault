@@ -1808,6 +1808,40 @@
     el.stage.querySelectorAll("img, video, audio, .audio, .unplayable, .converting").forEach(function (n) { n.remove(); });
   }
 
+  // An error from a <video>/<audio> that has already decoded data is not a
+  // format problem: the browser just played it. It is the connection. A paused
+  // stream's request sits idle until something (a proxy, the NAS, the browser)
+  // drops it, and the fetch on resume then fails with MEDIA_ERR_NETWORK. Sending
+  // that to tryConvert would swap a playable file for "Converting…" (or, for an
+  // already-converted copy, "won't play"), so reload the same source instead and
+  // put the position and play/pause state back. Anything else, or a source that
+  // still won't load after a few tries, still goes to tryConvert.
+  function onMediaError(item, n, node) {
+    var played = false, fails = 0, resume = null; // resume: {at, paused} while reloading
+    n.addEventListener("loadeddata", function () { played = true; fails = 0; });
+    n.addEventListener("loadedmetadata", function () {
+      if (!resume) return;
+      var r = resume; resume = null;
+      if (r.at) n.currentTime = r.at;
+      if (!r.paused) { var p = n.play(); if (p && p.catch) p.catch(function () {}); }
+    });
+    n.addEventListener("error", function () {
+      var err = n.error;
+      // While reloading, a source that can't be fetched at all reports
+      // MEDIA_ERR_SRC_NOT_SUPPORTED, so only the first error is judged by code.
+      var network = resume || (err && err.code === err.MEDIA_ERR_NETWORK);
+      if (!played || !network || fails >= 5) { tryConvert(item, node); return; }
+      // A failed reload has lost the position already; keep the first one.
+      if (!resume) resume = { at: n.currentTime, paused: n.paused };
+      fails++;
+      setTimeout(function () {
+        if (!n.isConnected || S.viewList[S.viewIndex] !== item) return; // navigated away
+        n.autoplay = !resume.paused; // or a reload would start a paused video playing
+        n.load();
+      }, Math.min(1000 * Math.pow(2, fails - 1), 10000));
+    });
+  }
+
   // On a playback error, ask the server to transcode this file into a
   // browser-friendly copy, show a progress state, and swap it in when ready.
   function tryConvert(item, node) {
@@ -1900,7 +1934,7 @@
       media.playsInline = true;
       media.preload = "metadata";
       applyMediaPrefs(media);
-      media.addEventListener("error", function () { tryConvert(item, media); });
+      onMediaError(item, media, media);
       media.addEventListener("ended", onMediaEnded);
     } else if (item.type === "audio") {
       media = document.createElement("div");
@@ -1923,7 +1957,7 @@
       audio.autoplay = true;
       audio.preload = "metadata";
       applyMediaPrefs(audio);
-      audio.addEventListener("error", function () { tryConvert(item, media); });
+      onMediaError(item, audio, media);
       audio.addEventListener("ended", onMediaEnded);
       media.appendChild(audio);
     } else {
